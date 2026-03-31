@@ -45,5 +45,5 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONPATH=/app/src
 
-# Default command - runs proxy with the correct PYTHONPATH
-CMD ["python", "src/proxy_app/main.py", "--port", "8000"]
+# Default command - host is explicit, port comes from PORT env (falls back to 8000 in main.py)
+CMD ["python", "src/proxy_app/main.py", "--host", "0.0.0.0"]
