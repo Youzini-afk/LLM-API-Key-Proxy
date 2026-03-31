@@ -682,18 +682,12 @@ app.add_middleware(
 # --- WebUI Static Files ---
 _webui_dir = Path(__file__).parent / "webui"
 if _webui_dir.is_dir():
-    app.mount("/webui/css", StaticFiles(directory=_webui_dir / "css"), name="webui_css")
-    app.mount("/webui/js", StaticFiles(directory=_webui_dir / "js"), name="webui_js")
-
-    @app.get("/webui")
-    @app.get("/webui/")
+    @app.get("/")
     async def serve_webui():
-        """Serve the WebUI control panel."""
+        """Serve the WebUI control panel at root."""
         return FileResponse(_webui_dir / "index.html")
 
-    logging.info(f"📊 WebUI available at http://{{args.host}}:{{args.port}}/webui/")
-
-    @app.post("/webui/auth-test")
+    @app.post("/auth-test")
     async def webui_auth_test(request: Request):
         """Debug endpoint to diagnose auth issues. Returns key hints without exposing full keys."""
         body = await request.json() if request.headers.get("content-type") == "application/json" else {}
@@ -721,6 +715,12 @@ if _webui_dir.is_dir():
             "auth_header_hint": auth_hint,
             "proxy_key_set": bool(PROXY_API_KEY),
         }
+
+    logging.info(f"📊 WebUI available at http://{{args.host}}:{{args.port}}/")
+
+    # Mount static files AFTER explicit routes so routes take precedence
+    app.mount("/css", StaticFiles(directory=_webui_dir / "css"), name="webui_css")
+    app.mount("/js", StaticFiles(directory=_webui_dir / "js"), name="webui_js")
 
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
@@ -1373,7 +1373,7 @@ async def embeddings(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/")
+@app.get("/health")
 def read_root():
     return {"Status": "API Key Proxy is running"}
 

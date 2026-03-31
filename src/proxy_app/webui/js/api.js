@@ -89,7 +89,7 @@ class ProxyAPI {
       if (e instanceof APIError && e.status === 401) {
         // Call debug endpoint to get key comparison info
         try {
-          const debugResp = await fetch(`${this.baseUrl}/webui/auth-test`, {
+          const debugResp = await fetch(`${this.baseUrl}/auth-test`, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
