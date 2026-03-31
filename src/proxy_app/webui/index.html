@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LLM Proxy 控制面板</title>
+  <meta name="description" content="LLM API Key Proxy 管理仪表盘 — 多渠道多 Key 路由监控">
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+  <!-- Styles -->
+  <link rel="stylesheet" href="/webui/css/tokens.css">
+  <link rel="stylesheet" href="/webui/css/layout.css">
+  <link rel="stylesheet" href="/webui/css/components.css">
+
+  <!-- Favicon -->
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+</head>
+<body>
+  <div id="app-root">
+    <!-- Loading state before JS loads -->
+    <div style="display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:16px">
+      <div style="width:40px;height:40px;border:3px solid #23262e;border-top-color:#85adff;border-radius:50%;animation:spin 0.8s linear infinite"></div>
+      <span style="color:#aaaab3;font-family:Inter,sans-serif;font-size:14px">正在加载控制面板...</span>
+      <style>@keyframes spin{to{transform:rotate(360deg)}}</style>
+    </div>
+  </div>
+
+  <div id="toast-container" class="toast-container"></div>
+
+  <!-- App Script -->
+  <script type="module" src="/webui/js/app.js"></script>
+</body>
+</html>

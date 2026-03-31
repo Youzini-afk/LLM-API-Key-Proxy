@@ -113,7 +113,8 @@ with _console.status("[dim]Loading FastAPI framework...", spinner="dots"):
     from contextlib import asynccontextmanager
     from fastapi import FastAPI, Request, HTTPException, Depends
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import StreamingResponse, JSONResponse
+    from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
+    from fastapi.staticfiles import StaticFiles
     from fastapi.security import APIKeyHeader
 
 print("  → Loading core dependencies...")
@@ -1691,6 +1692,23 @@ async def cost_estimate(request: Request, _=Depends(verify_api_key)):
     except Exception as e:
         logging.error(f"Cost estimate failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- WebUI Dashboard ---
+WEBUI_DIR = Path(__file__).parent / "webui"
+
+
+@app.get("/dashboard")
+@app.get("/dashboard/{path:path}")
+async def serve_dashboard(path: str = ""):
+    """Serve the WebUI SPA. All sub-routes return index.html for client-side hash routing."""
+    return FileResponse(WEBUI_DIR / "index.html")
+
+
+# Mount static files for the WebUI (CSS, JS, assets)
+if WEBUI_DIR.exists():
+    app.mount("/webui", StaticFiles(directory=str(WEBUI_DIR)), name="webui")
+    logging.info(f"📊 WebUI dashboard available at http://{{args.host}}:{{args.port}}/dashboard")
 
 
 if __name__ == "__main__":
