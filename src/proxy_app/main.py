@@ -1685,37 +1685,50 @@ if __name__ == "__main__":
     else:
         # Check if onboarding is needed
         if needs_onboarding():
-            # Import console from rich for better messaging
-            from rich.console import Console
-            from rich.panel import Panel
+            # In non-interactive environments (Docker, CI), skip interactive onboarding
+            if not sys.stdin.isatty() or os.getenv("SKIP_OAUTH_INIT_CHECK"):
+                from rotator_library.credential_tool import ensure_env_defaults
 
-            console = Console()
-
-            # Show clear explanatory message
-            show_onboarding_message()
-
-            # Launch credential tool automatically
-            from rotator_library.credential_tool import ensure_env_defaults
-
-            ensure_env_defaults()
-            load_dotenv(ENV_FILE, override=True)
-            run_credential_tool()
-
-            # After credential tool exits, reload and re-check
-            load_dotenv(ENV_FILE, override=True)
-            # Re-read PROXY_API_KEY from environment
-            PROXY_API_KEY = os.getenv("PROXY_API_KEY")
-
-            # Verify onboarding is complete
-            if needs_onboarding():
-                console.print("\n[bold red]❌ Configuration incomplete.[/bold red]")
-                console.print(
-                    "The proxy still cannot start. Please ensure PROXY_API_KEY is set in .env\n"
-                )
-                sys.exit(1)
+                ensure_env_defaults()
+                load_dotenv(ENV_FILE, override=True)
+                PROXY_API_KEY = os.getenv("PROXY_API_KEY")
+                if not ENV_FILE.is_file():
+                    print("WARNING: No .env file found and running in non-interactive mode.")
+                    print("Please mount a .env file via Docker volume: -v ./.env:/app/.env")
+                    print("Starting proxy anyway...")
+                # Fall through to start the server
             else:
-                console.print("\n[bold green]✅ Configuration complete![/bold green]")
-                console.print("\nStarting proxy server...\n")
+                # Interactive mode - show onboarding message
+                from rich.console import Console
+                from rich.panel import Panel
+
+                console = Console()
+
+                # Show clear explanatory message
+                show_onboarding_message()
+
+                # Launch credential tool automatically
+                from rotator_library.credential_tool import ensure_env_defaults
+
+                ensure_env_defaults()
+                load_dotenv(ENV_FILE, override=True)
+                run_credential_tool()
+
+                # After credential tool exits, reload and re-check
+                load_dotenv(ENV_FILE, override=True)
+                # Re-read PROXY_API_KEY from environment
+                PROXY_API_KEY = os.getenv("PROXY_API_KEY")
+
+                # Verify onboarding is complete
+                if needs_onboarding():
+                    console.print("\n[bold red]❌ Configuration incomplete.[/bold red]")
+                    console.print(
+                        "The proxy still cannot start. Please ensure PROXY_API_KEY is set in .env\n"
+                    )
+                    sys.exit(1)
+                else:
+                    console.print("\n[bold green]✅ Configuration complete![/bold green]")
+                    console.print("\nStarting proxy server...\n")
 
         import uvicorn
 
