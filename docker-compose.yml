@@ -1,6 +1,8 @@
 services:
   llm-proxy:
-    image: ghcr.io/mirrowel/llm-api-key-proxy:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: llm-api-proxy
     restart: unless-stopped
     logging:
