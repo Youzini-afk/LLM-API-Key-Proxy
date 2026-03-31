@@ -693,6 +693,35 @@ if _webui_dir.is_dir():
 
     logging.info(f"📊 WebUI available at http://{{args.host}}:{{args.port}}/webui/")
 
+    @app.post("/webui/auth-test")
+    async def webui_auth_test(request: Request):
+        """Debug endpoint to diagnose auth issues. Returns key hints without exposing full keys."""
+        body = await request.json() if request.headers.get("content-type") == "application/json" else {}
+        client_key = body.get("key", "")
+
+        # What the server has
+        server_key = PROXY_API_KEY or ""
+        server_hint = f"{server_key[:3]}...{server_key[-3:]}" if len(server_key) > 6 else f"(len={len(server_key)})"
+
+        # What the client sent
+        client_hint = f"{client_key[:3]}...{client_key[-3:]}" if len(client_key) > 6 else f"(len={len(client_key)})"
+
+        # Actual header the client would send
+        auth_header = request.headers.get("Authorization", "")
+        auth_hint = f"{auth_header[:10]}...{auth_header[-3:]}" if len(auth_header) > 13 else auth_header
+
+        match = client_key == server_key
+
+        return {
+            "match": match,
+            "server_key_hint": server_hint,
+            "server_key_len": len(server_key),
+            "client_key_hint": client_hint,
+            "client_key_len": len(client_key),
+            "auth_header_hint": auth_hint,
+            "proxy_key_set": bool(PROXY_API_KEY),
+        }
+
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
 
@@ -1806,7 +1835,7 @@ if __name__ == "__main__":
 
                 ensure_env_defaults()
                 load_dotenv(ENV_FILE, override=True)
-                PROXY_API_KEY = os.getenv("PROXY_API_KEY")
+                PROXY_API_KEY = (os.getenv("PROXY_API_KEY") or "").strip().strip("'\"") or None
                 if not ENV_FILE.is_file():
                     print("WARNING: No .env file found and running in non-interactive mode.")
                     print("Please mount a .env file via Docker volume: -v ./.env:/app/.env")
@@ -1832,7 +1861,7 @@ if __name__ == "__main__":
                 # After credential tool exits, reload and re-check
                 load_dotenv(ENV_FILE, override=True)
                 # Re-read PROXY_API_KEY from environment
-                PROXY_API_KEY = os.getenv("PROXY_API_KEY")
+                PROXY_API_KEY = (os.getenv("PROXY_API_KEY") or "").strip().strip("'\"") or None
 
                 # Verify onboarding is complete
                 if needs_onboarding():

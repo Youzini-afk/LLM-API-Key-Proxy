@@ -87,6 +87,24 @@ class ProxyAPI {
       return { ok: true };
     } catch (e) {
       if (e instanceof APIError && e.status === 401) {
+        // Call debug endpoint to get key comparison info
+        try {
+          const debugResp = await fetch(`${this.baseUrl}/webui/auth-test`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...(this.apiKey ? { 'Authorization': `Bearer ${this.apiKey}` } : {}),
+            },
+            body: JSON.stringify({ key: this.apiKey }),
+          });
+          if (debugResp.ok) {
+            const info = await debugResp.json();
+            const detail = `服务端密钥: ${info.server_key_hint} (长度${info.server_key_len})\n` +
+              `你输入的: ${info.client_key_hint} (长度${info.client_key_len})\n` +
+              `匹配: ${info.match ? '✓' : '✗'}`;
+            return { ok: false, status: 401, detail };
+          }
+        } catch (_) { /* debug endpoint not available, fall through */ }
         return { ok: false, status: 401, detail: '密钥无效或不匹配' };
       }
       if (e instanceof APIError) {
