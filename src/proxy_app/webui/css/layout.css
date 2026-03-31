@@ -41,7 +41,8 @@
 /* --- Page Structure --- */
 .page {
   animation: fade-in var(--transition-normal);
-  max-width: 1400px;
+  width: 100%;
+  max-width: none;
 }
 
 .page-title {
