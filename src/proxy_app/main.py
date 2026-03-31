@@ -124,6 +124,15 @@ with _console.status("[dim]Loading core dependencies...", spinner="dots"):
     import json
     from typing import AsyncGenerator, Any, List, Optional, Union
     from pydantic import BaseModel, ConfigDict, Field
+    from proxy_app.admin_schemas import (
+        ChannelCreateRequest,
+        ChannelUpdateRequest,
+        KeyCreateRequest,
+        KeyUpdateRequest,
+        VirtualModelCreateRequest,
+        VirtualModelUpdateRequest,
+    )
+    from proxy_app.admin_service import admin_service
 
     # --- Early Log Level Configuration ---
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
@@ -366,6 +375,8 @@ if ENABLE_REQUEST_LOGGING:
 if ENABLE_RAW_LOGGING:
     logging.info("Raw I/O logging is enabled (proxy boundary, unmodified HTTP data).")
 PROXY_API_KEY = (os.getenv("PROXY_API_KEY") or "").strip().strip("'\"") or None
+ADMIN_API_KEY = (os.getenv("ADMIN_API_KEY") or "").strip().strip("'\"") or None
+
 # Note: PROXY_API_KEY validation moved to server startup to allow credential tool to run first
 
 # Discover API keys from environment variables
@@ -713,6 +724,20 @@ async def verify_api_key(auth: str = Depends(api_key_header)):
         return auth
     if not auth or auth != f"Bearer {PROXY_API_KEY}":
         raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+    return auth
+
+
+async def verify_admin_api_key(auth: str = Depends(api_key_header)):
+    """Dependency to verify admin API key for /admin/* endpoints."""
+    # Priority: ADMIN_API_KEY -> PROXY_API_KEY -> open if both not set
+    effective = ADMIN_API_KEY or PROXY_API_KEY
+    if not effective:
+        return auth
+    if not auth or auth != f"Bearer {effective}":
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing Admin API Key",
+        )
     return auth
 
 
@@ -1585,6 +1610,176 @@ async def refresh_quota_stats(
     except Exception as e:
         logging.error(f"Failed to refresh quota stats: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# --- Admin Management APIs ---
+@app.get("/admin/config")
+async def admin_get_config(_=Depends(verify_admin_api_key)):
+    return admin_service.get_config_masked()
+
+
+@app.post("/admin/config/validate")
+async def admin_validate_config(_=Depends(verify_admin_api_key)):
+    cfg = admin_service.get_config()
+    return admin_service.validate_config(cfg)
+
+
+@app.post("/admin/config/apply")
+async def admin_apply_config(_=Depends(verify_admin_api_key)):
+    cfg = admin_service.get_config()
+    result = admin_service.validate_config(cfg)
+    if not result.ok:
+        raise HTTPException(status_code=400, detail={"errors": result.errors})
+    return admin_service.apply_runtime_overlay()
+
+
+@app.get("/admin/channels")
+async def admin_list_channels(_=Depends(verify_admin_api_key)):
+    return {"channels": admin_service.list_channels()}
+
+
+@app.post("/admin/channels")
+async def admin_create_channel(
+    body: ChannelCreateRequest,
+    _=Depends(verify_admin_api_key),
+):
+    try:
+        data = admin_service.create_channel(body)
+        return {"ok": True, "config": data}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.put("/admin/channels/{channel_id}")
+async def admin_update_channel(
+    channel_id: str,
+    body: ChannelUpdateRequest,
+    _=Depends(verify_admin_api_key),
+):
+    try:
+        data = admin_service.update_channel(channel_id, body)
+        return {"ok": True, "config": data}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/admin/channels/{channel_id}")
+async def admin_delete_channel(channel_id: str, _=Depends(verify_admin_api_key)):
+    try:
+        data = admin_service.delete_channel(channel_id)
+        return {"ok": True, "config": data}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/admin/channels/{channel_id}/keys")
+async def admin_add_channel_key(
+    channel_id: str,
+    body: KeyCreateRequest,
+    _=Depends(verify_admin_api_key),
+):
+    try:
+        data = admin_service.add_key(channel_id, body)
+        return {"ok": True, "config": data}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.put("/admin/channels/{channel_id}/keys/{key_id}")
+async def admin_update_channel_key(
+    channel_id: str,
+    key_id: str,
+    body: KeyUpdateRequest,
+    _=Depends(verify_admin_api_key),
+):
+    try:
+        data = admin_service.update_key(channel_id, key_id, body)
+        return {"ok": True, "config": data}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/admin/channels/{channel_id}/keys/{key_id}")
+async def admin_delete_channel_key(
+    channel_id: str,
+    key_id: str,
+    _=Depends(verify_admin_api_key),
+):
+    try:
+        data = admin_service.delete_key(channel_id, key_id)
+        return {"ok": True, "config": data}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/admin/channels/{channel_id}/test")
+async def admin_test_channel(channel_id: str, _=Depends(verify_admin_api_key)):
+    cfg = admin_service.get_config()
+    channel = next((c for c in cfg.channels if c.id == channel_id), None)
+    if not channel:
+        raise HTTPException(status_code=404, detail=f"Channel '{channel_id}' not found")
+
+    enabled_keys = [k for k in channel.api_keys if k.enabled]
+    if not enabled_keys:
+        return {"ok": False, "message": "No enabled key in this channel"}
+
+    return {
+        "ok": True,
+        "message": "Channel looks valid",
+        "channel": channel_id,
+        "enabled_keys": len(enabled_keys),
+        "models": list(channel.models.keys()),
+    }
+
+
+@app.get("/admin/virtual-models")
+async def admin_list_virtual_models(_=Depends(verify_admin_api_key)):
+    return {"virtual_models": admin_service.list_virtual_models()}
+
+
+@app.post("/admin/virtual-models")
+async def admin_create_virtual_model(
+    body: VirtualModelCreateRequest,
+    _=Depends(verify_admin_api_key),
+):
+    try:
+        data = admin_service.create_or_update_virtual_model(body.name, body.config)
+        return {"ok": True, "config": data}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.put("/admin/virtual-models/{name}")
+async def admin_update_virtual_model(
+    name: str,
+    body: VirtualModelUpdateRequest,
+    _=Depends(verify_admin_api_key),
+):
+    try:
+        data = admin_service.create_or_update_virtual_model(name, body)
+        return {"ok": True, "config": data}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/admin/virtual-models/{name}")
+async def admin_delete_virtual_model(name: str, _=Depends(verify_admin_api_key)):
+    try:
+        data = admin_service.delete_virtual_model(name)
+        return {"ok": True, "config": data}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/admin/runtime/reload")
+async def admin_runtime_reload(_=Depends(verify_admin_api_key)):
+    return admin_service.apply_runtime_overlay()
+
+
+@app.get("/admin/runtime/status")
+async def admin_runtime_status(_=Depends(verify_admin_api_key)):
+    return admin_service.get_runtime_status()
+
+
 
 
 @app.post("/v1/token-count")

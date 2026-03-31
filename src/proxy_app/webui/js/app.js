@@ -163,29 +163,71 @@ class App {
   }
 
   renderSettings(container) {
-    clearChildren(container);
-    const keyDisplay = api.getApiKey()
-      ? `${api.getApiKey().slice(0, 4)}••••${api.getApiKey().slice(-4)}`
-      : '未设置';
+    const render = async () => {
+      clearChildren(container);
+      const keyDisplay = api.getApiKey()
+        ? `${api.getApiKey().slice(0, 4)}••••${api.getApiKey().slice(-4)}`
+        : '未设置';
 
-    container.innerHTML = `
-      <div class="page-header">
-        <h2 class="page-title">设置</h2>
-      </div>
-      <div class="card" style="max-width:480px">
-        <div class="card-body">
-          <div style="margin-bottom:16px">
-            <span class="text-muted">当前密钥：</span>
-            <code style="background:var(--surface-2);padding:4px 8px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:13px">${keyDisplay}</code>
-          </div>
-          <button class="btn btn-danger" id="logout-btn">退出登录</button>
+      let runtime = null;
+      let validate = null;
+      try {
+        runtime = await api.getRuntimeStatus();
+      } catch (e) {
+        runtime = { message: `获取运行时状态失败: ${e.message}` };
+      }
+
+      container.innerHTML = `
+        <div class="page-header">
+          <h2 class="page-title">设置 / 运行时管理</h2>
         </div>
-      </div>
-    `;
+        <div class="card" style="max-width:760px">
+          <div class="card-body">
+            <div style="margin-bottom:12px">
+              <span class="text-muted">当前密钥：</span>
+              <code style="background:var(--surface-2);padding:4px 8px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:13px">${keyDisplay}</code>
+            </div>
+            <div style="margin-bottom:8px"><span class="text-muted">配置版本：</span> <strong>${runtime?.config_version ?? '-'}</strong></div>
+            <div style="margin-bottom:8px"><span class="text-muted">最后更新：</span> <code>${runtime?.updated_at ?? '-'}</code></div>
+            <div style="margin-bottom:8px"><span class="text-muted">最后重载：</span> <code>${runtime?.last_reload_at ?? '-'}</code></div>
+            <div style="margin-bottom:16px"><span class="text-muted">状态：</span> ${runtime?.message ?? '-'}</div>
 
-    const logoutBtn = container.querySelector('#logout-btn');
-    logoutBtn.addEventListener('click', () => {
-      api.logout();
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn btn-ghost" id="admin-validate-btn">校验配置</button>
+              <button class="btn btn-primary" id="admin-reload-btn">重载运行时</button>
+              <button class="btn btn-danger" id="logout-btn">退出登录</button>
+            </div>
+            <pre id="settings-output" style="margin-top:12px;background:var(--surface-container);padding:12px;border-radius:8px;white-space:pre-wrap">${runtime ? JSON.stringify(runtime, null, 2) : ''}</pre>
+          </div>
+        </div>
+      `;
+
+      container.querySelector('#logout-btn')?.addEventListener('click', () => api.logout());
+      container.querySelector('#admin-validate-btn')?.addEventListener('click', async () => {
+        try {
+          const v = await api.validateAdminConfig();
+          container.querySelector('#settings-output').textContent = JSON.stringify(v, null, 2);
+          if (v.ok) showToast('配置校验通过', 'success');
+          else showToast('配置校验失败', 'error');
+        } catch (e) {
+          showToast(`校验失败: ${e.message}`, 'error');
+        }
+      });
+
+      container.querySelector('#admin-reload-btn')?.addEventListener('click', async () => {
+        try {
+          const r = await api.reloadRuntime();
+          container.querySelector('#settings-output').textContent = JSON.stringify(r, null, 2);
+          showToast('运行时重载完成', 'success');
+          await render();
+        } catch (e) {
+          showToast(`重载失败: ${e.message}`, 'error');
+        }
+      });
+    };
+
+    render().catch((e) => {
+      container.innerHTML = `<div class="page-error"><h3>设置页面加载失败</h3><p class="text-muted">${e.message}</p></div>`;
     });
   }
 }

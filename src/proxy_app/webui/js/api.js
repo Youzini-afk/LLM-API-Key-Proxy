@@ -36,7 +36,12 @@ class ProxyAPI {
       const text = await resp.text().catch(() => resp.statusText);
       throw new APIError(resp.status, text);
     }
-    return resp.json();
+
+    const ct = resp.headers.get('content-type') || '';
+    if (ct.includes('application/json')) {
+      return resp.json();
+    }
+    return resp.text();
   }
 
   // --- Endpoints ---
@@ -74,6 +79,103 @@ class ProxyAPI {
 
   async getModelInfoStats() {
     return this.request('/v1/model-info/stats');
+  }
+
+  // ---------------------
+  // Admin APIs
+  // ---------------------
+  async getAdminConfig() {
+    return this.request('/admin/config');
+  }
+
+  async validateAdminConfig() {
+    return this.request('/admin/config/validate', { method: 'POST' });
+  }
+
+  async applyAdminConfig() {
+    return this.request('/admin/config/apply', { method: 'POST' });
+  }
+
+  async getChannels() {
+    return this.request('/admin/channels');
+  }
+
+  async createChannel(payload) {
+    return this.request('/admin/channels', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  }
+
+  async updateChannel(channelId, payload) {
+    return this.request(`/admin/channels/${encodeURIComponent(channelId)}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    });
+  }
+
+  async deleteChannel(channelId) {
+    return this.request(`/admin/channels/${encodeURIComponent(channelId)}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async addChannelKey(channelId, payload) {
+    return this.request(`/admin/channels/${encodeURIComponent(channelId)}/keys`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  }
+
+  async updateChannelKey(channelId, keyId, payload) {
+    return this.request(`/admin/channels/${encodeURIComponent(channelId)}/keys/${encodeURIComponent(keyId)}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    });
+  }
+
+  async deleteChannelKey(channelId, keyId) {
+    return this.request(`/admin/channels/${encodeURIComponent(channelId)}/keys/${encodeURIComponent(keyId)}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async testChannel(channelId) {
+    return this.request(`/admin/channels/${encodeURIComponent(channelId)}/test`, {
+      method: 'POST',
+    });
+  }
+
+  async getVirtualModels() {
+    return this.request('/admin/virtual-models');
+  }
+
+  async createVirtualModel(payload) {
+    return this.request('/admin/virtual-models', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  }
+
+  async updateVirtualModel(name, payload) {
+    return this.request(`/admin/virtual-models/${encodeURIComponent(name)}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    });
+  }
+
+  async deleteVirtualModel(name) {
+    return this.request(`/admin/virtual-models/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async reloadRuntime() {
+    return this.request('/admin/runtime/reload', { method: 'POST' });
+  }
+
+  async getRuntimeStatus() {
+    return this.request('/admin/runtime/status');
   }
 
   /**
@@ -117,4 +219,3 @@ class APIError extends Error {
 // Singleton
 export const api = new ProxyAPI();
 export { APIError };
-
