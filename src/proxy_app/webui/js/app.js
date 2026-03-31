@@ -45,11 +45,7 @@ class App {
     renderSidebar(sidebarEl);
     appRoot.appendChild(sidebarEl);
 
-    // Main area
-    const mainArea = document.createElement('div');
-    mainArea.className = 'app-main';
-
-    // Header
+    // Header (direct grid child)
     const headerEl = document.createElement('div');
     headerEl.className = 'app-header';
     renderHeader(headerEl, {
@@ -59,15 +55,13 @@ class App {
         this.startAutoRefresh();
       },
     });
-    mainArea.appendChild(headerEl);
+    appRoot.appendChild(headerEl);
 
-    // Content
+    // Content (direct grid child)
     const contentEl = document.createElement('div');
     contentEl.className = 'app-content';
     contentEl.id = 'page-content';
-    mainArea.appendChild(contentEl);
-
-    appRoot.appendChild(mainArea);
+    appRoot.appendChild(contentEl);
   }
 
   async navigate() {
