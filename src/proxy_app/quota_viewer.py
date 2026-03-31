@@ -61,6 +61,8 @@ from rich.text import Text
 
 from .quota_viewer_config import QuotaViewerConfig
 
+from proxy_app.i18n import t
+
 
 def clear_screen():
     """Clear the terminal screen."""
@@ -594,12 +596,12 @@ class QuotaViewer:
         self.console.print(
             Panel(
                 Text.from_markup(
-                    "[bold red]Connection Error[/bold red]\n\n"
+                    "[bold red]连接错误[/bold red]\n\n"
                     f"Remote: [bold]{remote_name}[/bold] ({connection_display})\n"
-                    f"Error: {self.last_error or 'Unknown error'}\n\n"
-                    "[bold]This tool requires the proxy to be running.[/bold]\n"
-                    "Start the proxy first, or configure a different remote.\n\n"
-                    "[dim]Tip: Select option 1 from the main menu to run the proxy.[/dim]"
+                    f"错误: {self.last_error or '未知错误'}\n\n"
+                    "[bold]此工具需要代理服务器正在运行。[/bold]\n"
+                    "请先启动代理服务器，或配置其他远程服务器。\n\n"
+                    "[dim]提示: 从主菜单选择选项 1 启动代理服务器。[/dim]"
                 ),
                 border_style="red",
                 expand=False,
@@ -609,14 +611,14 @@ class QuotaViewer:
         self.console.print()
         self.console.print("━" * 78)
         self.console.print()
-        self.console.print("   S. Switch to a different remote")
-        self.console.print("   M. Manage remotes (add/edit/delete)")
-        self.console.print("   R. Retry connection")
-        self.console.print("   B. Back to main menu")
+        self.console.print("   " + t("qv_switch_remote_menu"))
+        self.console.print("   " + t("qv_manage_remotes_menu"))
+        self.console.print("   " + t("qv_retry"))
+        self.console.print("   " + t("qv_back"))
         self.console.print()
         self.console.print("━" * 78)
 
-        choice = Prompt.ask("Select option", default="B").strip().lower()
+        choice = Prompt.ask(t("select_option"), default="B").strip().lower()
 
         if choice in ("s", "m", "r", "b"):
             return choice
@@ -651,34 +653,34 @@ class QuotaViewer:
 
         # View mode indicator
         if self.view_mode == "global":
-            view_label = "[magenta]📊 Global/Lifetime[/magenta]"
+            view_label = t("qv_global_label")
         else:
-            view_label = "[cyan]📈 Current Period[/cyan]"
+            view_label = t("qv_current_label")
 
         self.console.print("━" * 78)
         self.console.print(
-            f"[bold cyan]📈 Quota & Usage Statistics[/bold cyan]  |  {view_label}"
+            f"[bold cyan]📈 配额与使用统计[/bold cyan]  |  {view_label}"
         )
         self.console.print("━" * 78)
         self.console.print(
-            f"Connected to: [bold]{remote_name}[/bold] ({connection_display}) "
+            f"已连接: [bold]{remote_name}[/bold] ({connection_display}) "
             f"[green]✅[/green] | {data_age}"
         )
         self.console.print()
 
         if not self.cached_stats:
-            self.console.print("[yellow]No data available. Press R to reload.[/yellow]")
+            self.console.print(t("qv_no_data"))
         else:
             # Build provider table
             table = Table(
                 box=None, show_header=True, header_style="bold", padding=(0, 1)
             )
-            table.add_column("Provider", style="cyan", min_width=10)
-            table.add_column("Creds", justify="center", min_width=5)
-            table.add_column("Quota Status", min_width=28)
-            table.add_column("Requests", justify="right", min_width=8)
-            table.add_column("Tokens (in/out)", min_width=20)
-            table.add_column("Cost", justify="right", min_width=6)
+            table.add_column(t("qv_col_provider"), style="cyan", min_width=10)
+            table.add_column(t("qv_col_creds"), justify="center", min_width=5)
+            table.add_column(t("qv_col_quota_status"), min_width=28)
+            table.add_column(t("qv_col_requests"), justify="right", min_width=8)
+            table.add_column(t("qv_col_tokens"), min_width=20)
+            table.add_column(t("qv_col_cost"), justify="right", min_width=6)
 
             providers = self.cached_stats.get("providers", {})
             provider_list = list(providers.keys())
@@ -837,14 +839,14 @@ class QuotaViewer:
         provider_list = list(providers.keys())
 
         for idx, provider in enumerate(provider_list, 1):
-            self.console.print(f"   {idx}. View [cyan]{provider}[/cyan] details")
+            self.console.print(f"   {idx}. 查看 [cyan]{provider}[/cyan] 详情")
 
         self.console.print()
-        self.console.print("   G. Toggle view mode (current/global)")
-        self.console.print("   R. Reload all stats (re-read from proxy)")
-        self.console.print("   S. Switch remote")
-        self.console.print("   M. Manage remotes")
-        self.console.print("   B. Back to main menu")
+        self.console.print("   " + t("qv_toggle_view"))
+        self.console.print("   " + t("qv_reload_stats"))
+        self.console.print("   " + t("qv_switch_remote"))
+        self.console.print("   " + t("qv_manage_remotes"))
+        self.console.print("   " + t("qv_back"))
         self.console.print()
         self.console.print("━" * 78)
 
@@ -852,7 +854,7 @@ class QuotaViewer:
         valid_choices = [str(i) for i in range(1, len(provider_list) + 1)]
         valid_choices.extend(["r", "R", "s", "S", "m", "M", "b", "B", "g", "G"])
 
-        choice = Prompt.ask("Select option", default="").strip()
+        choice = Prompt.ask(t("select_option"), default="").strip()
 
         if choice.lower() == "b":
             self.running = False
@@ -880,19 +882,19 @@ class QuotaViewer:
 
             # View mode indicator
             if self.view_mode == "global":
-                view_label = "[magenta]Global/Lifetime[/magenta]"
+                view_label = "[magenta]全局/累计[/magenta]"
             else:
-                view_label = "[cyan]Current Period[/cyan]"
+                view_label = "[cyan]当前周期[/cyan]"
 
             self.console.print("━" * 78)
             self.console.print(
-                f"[bold cyan]📊 {provider.title()} - Detailed Stats[/bold cyan]  |  {view_label}"
+                f"[bold cyan]📊 {provider.title()} - 详细统计[/bold cyan]  |  {view_label}"
             )
             self.console.print("━" * 78)
             self.console.print()
 
             if not self.cached_stats:
-                self.console.print("[yellow]No data available.[/yellow]")
+                self.console.print("[yellow]无数据可用。[/yellow]")
             else:
                 prov_stats = self.cached_stats.get("providers", {}).get(provider, {})
                 credentials = prov_stats.get("credentials", [])
@@ -902,7 +904,7 @@ class QuotaViewer:
 
                 if not credentials:
                     self.console.print(
-                        "[dim]No credentials configured for this provider.[/dim]"
+                        t("qv_no_creds_for_provider")
                     )
                 else:
                     for idx, cred in enumerate(credentials, 1):
@@ -912,9 +914,9 @@ class QuotaViewer:
             # Menu
             self.console.print("━" * 78)
             self.console.print()
-            self.console.print("   G.  Toggle view mode (current/global)")
-            self.console.print("   R.  Reload stats (from proxy cache)")
-            self.console.print("   RA. Reload all stats")
+            self.console.print("   " + t("qv_toggle_view_detail"))
+            self.console.print("   " + t("qv_reload_cache"))
+            self.console.print("   " + t("qv_reload_all"))
 
             # Force refresh options (only for providers that support it)
             has_quota_groups = bool(
@@ -927,7 +929,7 @@ class QuotaViewer:
             if has_quota_groups:
                 self.console.print()
                 self.console.print(
-                    f"   F.  [yellow]Force refresh ALL {provider} quotas from API[/yellow]"
+                    t("qv_force_refresh", provider=provider)
                 )
                 credentials = (
                     self.cached_stats.get("providers", {})
@@ -942,15 +944,15 @@ class QuotaViewer:
                     identifier = cred.get("identifier", f"credential {idx}")
                     email = cred.get("email", identifier)
                     self.console.print(
-                        f"   F{idx}. Force refresh [{idx}] only ({email})"
+                        t("qv_force_refresh_single", idx=idx, email=email)
                     )
 
             self.console.print()
-            self.console.print("   B.  Back to summary")
+            self.console.print("   " + t("qv_back_summary"))
             self.console.print()
             self.console.print("━" * 78)
 
-            choice = Prompt.ask("Select option", default="B").strip().upper()
+            choice = Prompt.ask(t("select_option"), default="B").strip().upper()
 
             if choice == "B":
                 break
@@ -1037,14 +1039,14 @@ class QuotaViewer:
 
         # Status indicator
         if status == "exhausted":
-            status_icon = "[red]⛔ Exhausted[/red]"
+            status_icon = t("qv_exhausted")
         elif status == "cooldown" or has_cooldown:
             if key_cooldown:
-                status_icon = f"[yellow]⚠️ Cooldown ({format_cooldown(int(key_cooldown))})[/yellow]"
+                status_icon = t("qv_cooldown", time=format_cooldown(int(key_cooldown)))
             else:
-                status_icon = "[yellow]⚠️ Cooldown[/yellow]"
+                status_icon = t("qv_cooldown_short")
         else:
-            status_icon = "[green]✅ Active[/green]"
+            status_icon = t("qv_active")
 
         # Header line
         display_name = email if email else identifier
@@ -1223,20 +1225,20 @@ class QuotaViewer:
         clear_screen()
 
         self.console.print("━" * 78)
-        self.console.print("[bold cyan]🔄 Switch Remote[/bold cyan]")
+        self.console.print("[bold cyan]🔄 切换远程服务器[/bold cyan]")
         self.console.print("━" * 78)
         self.console.print()
 
         current_name = self.current_remote.get("name") if self.current_remote else None
-        self.console.print(f"Current: [bold]{current_name}[/bold]")
+        self.console.print(f"当前: [bold]{current_name}[/bold]")
         self.console.print()
-        self.console.print("Available remotes:")
+        self.console.print("可用的远程服务器:")
 
         remotes = self.config.get_remotes()
         remote_status: List[Tuple[Dict, bool, str]] = []
 
         # Check status of all remotes
-        with self.console.status("[dim]Checking remote status...", spinner="dots"):
+        with self.console.status("[dim]正在检查远程状态...", spinner="dots"):
             for remote in remotes:
                 is_online, status_msg = self.check_connection(remote)
                 remote_status.append((remote, is_online, status_msg))
@@ -1255,10 +1257,10 @@ class QuotaViewer:
                 connection_display = host
 
             is_current = name == current_name
-            current_marker = " (current)" if is_current else ""
+            current_marker = " (当前)" if is_current else ""
 
             if is_online:
-                status_icon = "[green]✅ Online[/green]"
+                status_icon = "[green]✅ 在线[/green]"
             else:
                 status_icon = f"[red]⚠️ {status_msg}[/red]"
 
@@ -1271,7 +1273,7 @@ class QuotaViewer:
         self.console.print()
 
         choice = Prompt.ask(
-            f"Select remote (1-{len(remotes)}) or B to go back", default="B"
+            t("qv_select_remote", count=len(remotes)), default="B"
         ).strip()
 
         if choice.lower() == "b":
@@ -1284,7 +1286,7 @@ class QuotaViewer:
             self.cached_stats = None  # Clear cache
 
             # Try to fetch stats from new remote
-            with self.console.status("[bold]Connecting...", spinner="dots"):
+            with self.console.status("[bold]正在连接...", spinner="dots"):
                 stats = self.fetch_stats()
                 if stats is None:
                     # Try with API key from .env for Local
@@ -1298,16 +1300,16 @@ class QuotaViewer:
                 self.show_api_key_prompt()
 
     def show_api_key_prompt(self):
-        """Prompt for API key when authentication fails."""
+        """认证失败时提示输入 API 密钥。"""
         self.console.print()
         self.console.print(
-            "[yellow]Authentication required or connection failed.[/yellow]"
+            t("qv_auth_required")
         )
-        self.console.print(f"Error: {self.last_error}")
+        self.console.print(f"错误: {self.last_error}")
         self.console.print()
 
         api_key = Prompt.ask(
-            "Enter API key (or press Enter to cancel)", default=""
+            t("qv_enter_api_key"), default=""
         ).strip()
 
         if api_key:
@@ -1316,13 +1318,13 @@ class QuotaViewer:
             self.config.update_remote(self.current_remote["name"], api_key=api_key)
 
             # Try again
-            with self.console.status("[bold]Reconnecting...", spinner="dots"):
+            with self.console.status("[bold]正在重新连接...", spinner="dots"):
                 if self.fetch_stats() is None:
-                    self.console.print(f"[red]Still failed: {self.last_error}[/red]")
-                    Prompt.ask("Press Enter to continue", default="")
+                    self.console.print(t("qv_still_failed", error=self.last_error))
+                    Prompt.ask(t("qv_press_enter"), default="")
         else:
-            self.console.print("[dim]Cancelled.[/dim]")
-            Prompt.ask("Press Enter to continue", default="")
+            self.console.print(t("cancelled"))
+            Prompt.ask(t("qv_press_enter"), default="")
 
     def show_manage_remotes_screen(self):
         """Display remote management screen."""
@@ -1330,7 +1332,7 @@ class QuotaViewer:
             clear_screen()
 
             self.console.print("━" * 78)
-            self.console.print("[bold cyan]⚙️ Manage Remotes[/bold cyan]")
+            self.console.print("[bold cyan]⚙️ 管理远程服务器[/bold cyan]")
             self.console.print("━" * 78)
             self.console.print()
 
@@ -1338,10 +1340,10 @@ class QuotaViewer:
 
             table = Table(box=None, show_header=True, header_style="bold")
             table.add_column("#", style="dim", width=3)
-            table.add_column("Name", min_width=16)
-            table.add_column("Host", min_width=24)
-            table.add_column("Port", justify="right", width=6)
-            table.add_column("Default", width=8)
+            table.add_column("名称", min_width=16)
+            table.add_column("主机", min_width=24)
+            table.add_column("端口", justify="right", width=6)
+            table.add_column("默认", width=8)
 
             for idx, remote in enumerate(remotes, 1):
                 is_default = "★" if remote.get("is_default") else ""
@@ -1358,15 +1360,15 @@ class QuotaViewer:
             self.console.print()
             self.console.print("━" * 78)
             self.console.print()
-            self.console.print("   A. Add new remote")
-            self.console.print("   E. Edit remote (enter number, e.g., E1)")
-            self.console.print("   D. Delete remote (enter number, e.g., D1)")
-            self.console.print("   S. Set default remote")
-            self.console.print("   B. Back")
+            self.console.print("   " + t("qv_add_remote"))
+            self.console.print("   " + t("qv_edit_remote"))
+            self.console.print("   " + t("qv_delete_remote"))
+            self.console.print("   " + t("qv_set_default"))
+            self.console.print("   " + t("qv_back_manage"))
             self.console.print()
             self.console.print("━" * 78)
 
-            choice = Prompt.ask("Select option", default="B").strip().upper()
+            choice = Prompt.ask(t("select_option"), default="B").strip().upper()
 
             if choice == "B":
                 break

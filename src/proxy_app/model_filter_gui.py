@@ -30,13 +30,15 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional, Callable, Set
 from dotenv import load_dotenv, set_key, unset_key
 
+from proxy_app.i18n import t
+
 
 # ════════════════════════════════════════════════════════════════════════════════
 # CONSTANTS & CONFIGURATION
 # ════════════════════════════════════════════════════════════════════════════════
 
 # Window settings
-WINDOW_TITLE = "Model Filter Configuration"
+WINDOW_TITLE = "模型过滤器配置"
 WINDOW_DEFAULT_SIZE = "1000x750"
 WINDOW_MIN_WIDTH = 600
 WINDOW_MIN_HEIGHT = 400
@@ -824,7 +826,7 @@ class HelpWindow(ctk.CTkToplevel):
 
         close_btn = ctk.CTkButton(
             btn_frame,
-            text="Got it!",
+            text=t("fg_got_it"),
             font=(FONT_FAMILY, FONT_SIZE_NORMAL, "bold"),
             fg_color=ACCENT_BLUE,
             hover_color="#3a8aee",
@@ -848,136 +850,36 @@ class HelpWindow(ctk.CTkToplevel):
         text_widget = self.text_box._textbox
 
         # Title
-        text_widget.insert("end", "📖 Model Filtering Guide\n", "title")
+        text_widget.insert("end", t("fg_help_title") + "\n", "title")
 
-        # Sections with emojis
         sections = [
             (
-                "🎯 Overview",
-                """Model filtering allows you to control which models are available through your proxy for each provider.
-
-• Use the IGNORE list to block specific models
-• Use the WHITELIST to ensure specific models are always available
-• Whitelist ALWAYS takes priority over Ignore""",
+                t("fg_help_overview_title"),
+                t("fg_help_overview"),
             ),
             (
-                "⚖️ Filtering Priority",
-                """When a model is checked, the following order is used:
-
-1. WHITELIST CHECK
-   If the model matches any whitelist pattern → AVAILABLE
-   (Whitelist overrides everything else)
-
-2. IGNORE CHECK  
-   If the model matches any ignore pattern → BLOCKED
-
-3. DEFAULT
-   If no patterns match → AVAILABLE""",
+                t("fg_help_priority_title"),
+                t("fg_help_priority"),
             ),
             (
-                "✏️ Pattern Syntax",
-                """Full glob/wildcard patterns are supported:
-
-EXACT MATCH
-  Pattern: gpt-4
-  Matches: only "gpt-4", nothing else
-   
-PREFIX WILDCARD  
-  Pattern: gpt-4*
-  Matches: "gpt-4", "gpt-4-turbo", "gpt-4-preview", etc.
-
-SUFFIX WILDCARD
-  Pattern: *-preview
-  Matches: "gpt-4-preview", "o1-preview", etc.
-
-CONTAINS WILDCARD
-  Pattern: *-preview*
-  Matches: anything containing "-preview"
-
-MATCH ALL
-  Pattern: *
-  Matches: every model for this provider
-
-SINGLE CHARACTER
-  Pattern: gpt-?
-  Matches: "gpt-4", "gpt-5", etc. (any single char)
-
-CHARACTER SET
-  Pattern: gpt-[45]*
-  Matches: "gpt-4", "gpt-4-turbo", "gpt-5", etc.""",
+                t("fg_help_syntax_title"),
+                t("fg_help_syntax"),
             ),
             (
-                "💡 Common Patterns",
-                """BLOCK ALL, ALLOW SPECIFIC:
-  Ignore:    *
-  Whitelist: gpt-4o, gpt-4o-mini
-  Result:    Only gpt-4o and gpt-4o-mini available
-
-BLOCK PREVIEW MODELS:
-  Ignore:    *-preview, *-preview*
-  Result:    All preview variants blocked
-
-BLOCK SPECIFIC SERIES:
-  Ignore:    o1*, dall-e*
-  Result:    All o1 and DALL-E models blocked
-
-ALLOW ONLY LATEST:
-  Ignore:    *
-  Whitelist: *-latest
-  Result:    Only models ending in "-latest" available""",
+                t("fg_help_examples_title"),
+                t("fg_help_examples"),
             ),
             (
-                "🖱️ Interface Guide",
-                """PROVIDER DROPDOWN
-  Select which provider to configure
-
-MODEL LISTS
-  • Left list: All fetched models (unfiltered)
-  • Right list: Same models with colored status
-  • Green = Available (normal)
-  • Red/Orange tones = Blocked (ignored)
-  • Blue/Teal tones = Whitelisted
-
-SEARCH BOX
-  Filter both lists to find specific models quickly
-
-CLICKING MODELS
-  • Left-click: Highlight the rule affecting this model
-  • Right-click: Context menu with quick actions
-
-CLICKING RULES
-  • Highlights all models affected by that rule
-  • Shows which models will be blocked/allowed
-
-RULE INPUT (Merge Mode)
-  • Enter patterns separated by commas
-  • Only adds patterns not covered by existing rules
-  • Press Add or Enter to create rules
-
-IMPORT BUTTON (Replace Mode)
-  • Replaces ALL existing rules with imported ones
-  • Paste comma-separated patterns
-
-DELETE RULES
-  • Click the × button on any rule to remove it""",
+                t("fg_help_interface_title"),
+                t("fg_help_interface"),
             ),
             (
-                "⌨️ Keyboard Shortcuts",
-                """Ctrl+S     Save changes
-Ctrl+R     Refresh models from provider
-Ctrl+F     Focus search box
-F1         Open this help window
-Escape     Clear search / Close dialogs""",
+                t("fg_help_shortcuts_title"),
+                t("fg_help_shortcuts"),
             ),
             (
-                "💾 Saving Changes",
-                """Changes are saved to your .env file in this format:
-
-  IGNORE_MODELS_OPENAI=pattern1,pattern2*
-  WHITELIST_MODELS_OPENAI=specific-model
-
-Click "Save" to persist changes, or "Discard" to revert.
-Closing the window with unsaved changes will prompt you.""",
+                t("fg_help_saving_title"),
+                t("fg_help_saving"),
             ),
         ]
 
@@ -1000,7 +902,7 @@ class UnsavedChangesDialog(ctk.CTkToplevel):
 
         self.result: Optional[str] = None  # 'save', 'discard', 'cancel'
 
-        self.title("Unsaved Changes")
+        self.title(t("fg_unsaved_title"))
         self.geometry("400x180")
         self.resizable(False, False)
 
@@ -1045,7 +947,7 @@ class UnsavedChangesDialog(ctk.CTkToplevel):
 
         title = ctk.CTkLabel(
             text_frame,
-            text="Unsaved Changes",
+            text=t("fg_unsaved_title"),
             font=(FONT_FAMILY, FONT_SIZE_LARGE, "bold"),
             text_color=TEXT_PRIMARY,
             anchor="w",
@@ -1054,7 +956,7 @@ class UnsavedChangesDialog(ctk.CTkToplevel):
 
         subtitle = ctk.CTkLabel(
             text_frame,
-            text="You have unsaved filter changes.\nWhat would you like to do?",
+            text=t("fg_unsaved_text"),
             font=(FONT_FAMILY, FONT_SIZE_NORMAL),
             text_color=TEXT_SECONDARY,
             anchor="w",
@@ -1068,7 +970,7 @@ class UnsavedChangesDialog(ctk.CTkToplevel):
 
         cancel_btn = ctk.CTkButton(
             btn_frame,
-            text="Cancel",
+            text=t("cancel"),
             font=(FONT_FAMILY, FONT_SIZE_NORMAL),
             fg_color=BG_SECONDARY,
             hover_color=BG_HOVER,
@@ -1081,7 +983,7 @@ class UnsavedChangesDialog(ctk.CTkToplevel):
 
         discard_btn = ctk.CTkButton(
             btn_frame,
-            text="Discard",
+            text=t("discard"),
             font=(FONT_FAMILY, FONT_SIZE_NORMAL),
             fg_color=ACCENT_RED,
             hover_color="#c0392b",
@@ -1092,7 +994,7 @@ class UnsavedChangesDialog(ctk.CTkToplevel):
 
         save_btn = ctk.CTkButton(
             btn_frame,
-            text="Save",
+            text=t("save"),
             font=(FONT_FAMILY, FONT_SIZE_NORMAL),
             fg_color=ACCENT_GREEN,
             hover_color="#27ae60",
@@ -1169,7 +1071,7 @@ class ImportRulesDialog(ctk.CTkToplevel):
 
         instruction = ctk.CTkLabel(
             instruction_frame,
-            text="Paste comma-separated patterns below (will REPLACE all existing rules):",
+            text=t("fg_import_instruction"),
             font=(FONT_FAMILY, FONT_SIZE_NORMAL),
             text_color=TEXT_PRIMARY,
             anchor="w",
@@ -1178,7 +1080,7 @@ class ImportRulesDialog(ctk.CTkToplevel):
 
         example = ctk.CTkLabel(
             instruction_frame,
-            text="Example: gpt-4*, claude-3*, model-name",
+            text=t("fg_import_example"),
             font=(FONT_FAMILY, FONT_SIZE_SMALL),
             text_color=TEXT_MUTED,
             anchor="w",
@@ -1192,7 +1094,7 @@ class ImportRulesDialog(ctk.CTkToplevel):
 
         cancel_btn = ctk.CTkButton(
             btn_frame,
-            text="Cancel",
+            text=t("cancel"),
             font=(FONT_FAMILY, FONT_SIZE_NORMAL),
             fg_color=BG_SECONDARY,
             hover_color=BG_HOVER,
@@ -1206,7 +1108,7 @@ class ImportRulesDialog(ctk.CTkToplevel):
 
         import_btn = ctk.CTkButton(
             btn_frame,
-            text="Replace All",
+            text=t("fg_replace_all"),
             font=(FONT_FAMILY, FONT_SIZE_NORMAL, "bold"),
             fg_color=ACCENT_BLUE,
             hover_color="#3a8aee",
@@ -1341,7 +1243,7 @@ class ImportResultDialog(ctk.CTkToplevel):
 
         ok_btn = ctk.CTkButton(
             btn_frame,
-            text="OK",
+            text=t("fg_ok"),
             font=(FONT_FAMILY, FONT_SIZE_NORMAL),
             fg_color=ACCENT_BLUE,
             hover_color="#3a8aee",
@@ -1644,7 +1546,7 @@ class VirtualModelList:
             self.canvas.create_text(
                 self.canvas.winfo_width() // 2,
                 canvas_height // 2,
-                text="No models",
+                text=t("fg_no_models"),
                 fill=TEXT_MUTED,
                 font=(FONT_FAMILY, FONT_SIZE_NORMAL),
             )
@@ -1774,7 +1676,7 @@ class VirtualSyncModelLists(ctk.CTkFrame):
 
         left_header = ctk.CTkLabel(
             left_header_frame,
-            text="All Fetched Models",
+            text=t("fg_all_models"),
             font=(FONT_FAMILY, FONT_SIZE_NORMAL, "bold"),
             text_color=TEXT_PRIMARY,
         )
@@ -1791,7 +1693,7 @@ class VirtualSyncModelLists(ctk.CTkFrame):
         # Copy button for all models
         self.left_copy_btn = ctk.CTkButton(
             left_header_frame,
-            text="Copy",
+            text=t("fg_copy"),
             font=(FONT_FAMILY, FONT_SIZE_SMALL),
             fg_color=BG_SECONDARY,
             hover_color=BG_HOVER,
@@ -1810,7 +1712,7 @@ class VirtualSyncModelLists(ctk.CTkFrame):
 
         right_header = ctk.CTkLabel(
             right_header_frame,
-            text="Filtered Status",
+            text=t("fg_filtered_status"),
             font=(FONT_FAMILY, FONT_SIZE_NORMAL, "bold"),
             text_color=TEXT_PRIMARY,
         )
@@ -1827,7 +1729,7 @@ class VirtualSyncModelLists(ctk.CTkFrame):
         # Copy button for filtered models
         self.right_copy_btn = ctk.CTkButton(
             right_header_frame,
-            text="Copy",
+            text=t("fg_copy"),
             font=(FONT_FAMILY, FONT_SIZE_SMALL),
             fg_color=BG_SECONDARY,
             hover_color=BG_HOVER,
@@ -1864,7 +1766,7 @@ class VirtualSyncModelLists(ctk.CTkFrame):
         self.loading_frame = ctk.CTkFrame(self, fg_color=BG_TERTIARY, corner_radius=6)
         self.loading_label = ctk.CTkLabel(
             self.loading_frame,
-            text="Loading...",
+            text=t("fg_loading"),
             font=(FONT_FAMILY, FONT_SIZE_NORMAL),
             text_color=TEXT_MUTED,
         )
@@ -1882,7 +1784,7 @@ class VirtualSyncModelLists(ctk.CTkFrame):
 
         self.retry_btn = ctk.CTkButton(
             self.error_frame,
-            text="Retry",
+            text=t("fg_retry"),
             font=(FONT_FAMILY, FONT_SIZE_NORMAL),
             fg_color=ACCENT_BLUE,
             hover_color="#3a8aee",
@@ -2375,7 +2277,7 @@ class VirtualRuleList:
             self.canvas.create_text(
                 self.canvas.winfo_width() // 2,
                 canvas_height // 2,
-                text="No rules configured\nAdd patterns below",
+                text=t("fg_no_rules"),
                 fill=TEXT_MUTED,
                 font=(FONT_FAMILY, FONT_SIZE_SMALL),
                 justify="center",
@@ -2529,7 +2431,7 @@ class RulePanel(ctk.CTkFrame):
         # Import button (right side)
         import_btn = ctk.CTkButton(
             title_frame,
-            text="Import",
+            text=t("fg_import_button"),
             font=(FONT_FAMILY, FONT_SIZE_SMALL),
             fg_color=BG_TERTIARY,
             hover_color=BG_HOVER,
@@ -2545,7 +2447,7 @@ class RulePanel(ctk.CTkFrame):
         # Copy button
         copy_btn = ctk.CTkButton(
             title_frame,
-            text="Copy",
+            text=t("fg_copy"),
             font=(FONT_FAMILY, FONT_SIZE_SMALL),
             fg_color=BG_TERTIARY,
             hover_color=BG_HOVER,
@@ -2581,7 +2483,7 @@ class RulePanel(ctk.CTkFrame):
         # Add button
         add_btn = ctk.CTkButton(
             input_frame,
-            text="+ Add",
+            text=t("fg_add_button"),
             font=(FONT_FAMILY, FONT_SIZE_SMALL),
             fg_color=ACCENT_BLUE,
             hover_color="#3a8aee",
@@ -2834,7 +2736,7 @@ class ModelFilterGUI(ctk.CTk):
         # Title (smaller font)
         title = ctk.CTkLabel(
             header,
-            text="🎯 Model Filter Configuration",
+            text=t("fg_header"),
             font=(FONT_FAMILY, FONT_SIZE_LARGE, "bold"),
             text_color=TEXT_PRIMARY,
         )
@@ -2860,7 +2762,7 @@ class ModelFilterGUI(ctk.CTk):
         # Refresh button (smaller)
         refresh_btn = ctk.CTkButton(
             header,
-            text="🔄 Refresh",
+            text=t("fg_refresh"),
             font=(FONT_FAMILY, FONT_SIZE_SMALL),
             fg_color=BG_SECONDARY,
             hover_color=BG_HOVER,
@@ -2879,7 +2781,7 @@ class ModelFilterGUI(ctk.CTk):
 
         provider_label = ctk.CTkLabel(
             provider_frame,
-            text="Provider:",
+            text=t("fg_provider_label"),
             font=(FONT_FAMILY, FONT_SIZE_SMALL),
             text_color=TEXT_SECONDARY,
         )
@@ -2919,7 +2821,7 @@ class ModelFilterGUI(ctk.CTk):
 
         self.search_entry = ctk.CTkEntry(
             search_frame,
-            placeholder_text="Search models...",
+            placeholder_text=t("fg_search_placeholder"),
             font=(FONT_FAMILY, FONT_SIZE_NORMAL),
             fg_color=BG_SECONDARY,
             border_color=BORDER_COLOR,
@@ -2967,7 +2869,7 @@ class ModelFilterGUI(ctk.CTk):
         # Ignore panel
         self.ignore_panel = RulePanel(
             self.rules_frame,
-            title="🚫 Ignore Rules",
+            title=t("fg_ignore_rules"),
             rule_type="ignore",
             on_rules_changed=self._on_rules_changed,
             on_rule_clicked=self._on_rule_clicked,
@@ -2984,7 +2886,7 @@ class ModelFilterGUI(ctk.CTk):
         # Whitelist panel
         self.whitelist_panel = RulePanel(
             self.rules_frame,
-            title="✓ Whitelist Rules",
+            title=t("fg_whitelist_rules"),
             rule_type="whitelist",
             on_rules_changed=self._on_rules_changed,
             on_rule_clicked=self._on_rule_clicked,
@@ -3007,7 +2909,7 @@ class ModelFilterGUI(ctk.CTk):
         # Status label (left side, smaller font)
         self.status_label = ctk.CTkLabel(
             self.status_frame,
-            text="Select a provider to begin",
+            text=t("fg_select_provider"),
             font=(FONT_FAMILY, FONT_SIZE_SMALL),
             text_color=TEXT_SECONDARY,
         )
@@ -3026,7 +2928,7 @@ class ModelFilterGUI(ctk.CTk):
         # Discard button
         discard_btn = ctk.CTkButton(
             self.status_frame,
-            text="↩️ Discard",
+            text=t("fg_discard_button"),
             font=(FONT_FAMILY, FONT_SIZE_SMALL),
             fg_color=BG_SECONDARY,
             hover_color=BG_HOVER,
@@ -3041,7 +2943,7 @@ class ModelFilterGUI(ctk.CTk):
         # Save button
         save_btn = ctk.CTkButton(
             self.status_frame,
-            text="💾 Save",
+            text=t("fg_save_button"),
             font=(FONT_FAMILY, FONT_SIZE_SMALL, "bold"),
             fg_color=ACCENT_GREEN,
             hover_color="#27ae60",
@@ -3060,19 +2962,19 @@ class ModelFilterGUI(ctk.CTk):
         """Create the right-click context menu."""
         self.context_menu = Menu(self, tearoff=0, bg=BG_SECONDARY, fg=TEXT_PRIMARY)
         self.context_menu.add_command(
-            label="➕ Add to Ignore List",
+            label=t("fg_add_to_ignore"),
             command=lambda: self._add_model_to_list("ignore"),
         )
         self.context_menu.add_command(
-            label="➕ Add to Whitelist",
+            label=t("fg_add_to_whitelist"),
             command=lambda: self._add_model_to_list("whitelist"),
         )
         self.context_menu.add_separator()
         self.context_menu.add_command(
-            label="🔍 View Affecting Rule", command=self._view_affecting_rule
+            label=t("fg_view_affecting_rule"), command=self._view_affecting_rule
         )
         self.context_menu.add_command(
-            label="📋 Copy Model Name", command=self._copy_model_name
+            label=t("fg_copy_model_name"), command=self._copy_model_name
         )
 
         self._context_model_id: Optional[str] = None
@@ -3526,7 +3428,7 @@ class ModelFilterGUI(ctk.CTk):
     def _update_status(self):
         """Update the status bar."""
         if not self.models:
-            self.status_label.configure(text="No models loaded")
+            self.status_label.configure(text=t("fg_no_models_loaded"))
             return
 
         available, total = self.filter_engine.get_available_count(self.models)
@@ -3541,7 +3443,7 @@ class ModelFilterGUI(ctk.CTk):
 
         # Update unsaved indicator
         if self.filter_engine.has_unsaved_changes():
-            self.unsaved_label.configure(text="● Unsaved changes")
+            self.unsaved_label.configure(text=t("fg_unsaved_changes"))
         else:
             self.unsaved_label.configure(text="")
 
@@ -3568,13 +3470,13 @@ class ModelFilterGUI(ctk.CTk):
             return
 
         if self.filter_engine.save_to_env(self.current_provider):
-            self.status_label.configure(text="✅ Changes saved successfully!")
+            self.status_label.configure(text=t("fg_save_success"))
             self.unsaved_label.configure(text="")
 
             # Reset to show normal status after a moment
             self.after(2000, self._update_status)
         else:
-            self.status_label.configure(text="❌ Failed to save changes")
+            self.status_label.configure(text=t("fg_save_failed"))
 
     def _discard_changes(self):
         """Discard unsaved changes."""
@@ -3595,7 +3497,7 @@ class ModelFilterGUI(ctk.CTk):
         # Update display
         self._on_rules_changed()
 
-        self.status_label.configure(text="Changes discarded")
+        self.status_label.configure(text=t("fg_changes_discarded"))
         self.after(2000, self._update_status)
 
     # ─────────────────────────────────────────────────────────────────────────────

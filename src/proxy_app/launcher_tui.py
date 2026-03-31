@@ -2,8 +2,8 @@
 # Copyright (c) 2026 Mirrowel
 
 """
-Interactive TUI launcher for the LLM API Key Proxy.
-Provides a beautiful Rich-based interface for configuration and execution.
+LLM API 密钥代理的交互式 TUI 启动器。
+提供基于 Rich 的界面，用于配置和执行。
 """
 
 import json
@@ -15,6 +15,8 @@ from rich.prompt import IntPrompt, Prompt
 from rich.panel import Panel
 from rich.text import Text
 from dotenv import load_dotenv, set_key
+
+from proxy_app.i18n import t, t_list
 
 console = Console()
 
@@ -50,7 +52,7 @@ def clear_screen(subtitle: str = ""):
         console.print(
             Panel(
                 f"[bold cyan]{subtitle}[/bold cyan]",
-                title="--- API Key Proxy ---",
+                title=t("app_title"),
             )
         )
 
@@ -363,12 +365,12 @@ class LauncherTUI:
         # Build title with GitHub link
         self.console.print(
             Panel.fit(
-                "[bold cyan]🚀 LLM API Key Proxy - Interactive Launcher[/bold cyan]",
+                "[bold cyan]" + t("launcher_title") + "[/bold cyan]",
                 border_style="cyan",
             )
         )
         self.console.print(
-            "[dim]GitHub: [blue underline]https://github.com/Mirrowel/LLM-API-Key-Proxy[/blue underline][/dim]"
+            t("launcher_github")
         )
 
         # Show warning if .env file doesn't exist
@@ -377,19 +379,7 @@ class LauncherTUI:
             self.console.print(
                 Panel(
                     Text.from_markup(
-                        "⚠️  [bold yellow]INITIAL SETUP REQUIRED[/bold yellow]\n\n"
-                        "The proxy needs initial configuration:\n"
-                        "  ❌ No .env file found\n\n"
-                        "Why this matters:\n"
-                        "  • The .env file stores your credentials and settings\n"
-                        "  • PROXY_API_KEY protects your proxy from unauthorized access\n"
-                        "  • Provider API keys enable LLM access\n\n"
-                        "What to do:\n"
-                        '  1. Select option "3. Manage Credentials" to launch the credential tool\n'
-                        "  2. The tool will create .env and set up PROXY_API_KEY automatically\n"
-                        "  3. You can add provider credentials (API keys or OAuth)\n\n"
-                        "⚠️  Note: The credential tool adds PROXY_API_KEY by default.\n"
-                        "   You can remove it later if you want an unsecured proxy."
+                        t("setup_required_body")
                     ),
                     border_style="yellow",
                     expand=False,
@@ -401,14 +391,7 @@ class LauncherTUI:
             self.console.print(
                 Panel(
                     Text.from_markup(
-                        "⚠️  [bold red]SECURITY WARNING: PROXY_API_KEY Not Set[/bold red]\n\n"
-                        "Your proxy is currently UNSECURED!\n"
-                        "Anyone can access it without authentication.\n\n"
-                        "This is a serious security risk if your proxy is accessible\n"
-                        "from the internet or untrusted networks.\n\n"
-                        "👉 [bold]Recommended:[/bold] Set PROXY_API_KEY in .env file\n"
-                        '   Use option "2. Configure Proxy Settings" → "3. Set Proxy API Key"\n'
-                        '   or option "3. Manage Credentials"'
+                        t("security_warning_body")
                     ),
                     border_style="red",
                     expand=False,
@@ -417,33 +400,33 @@ class LauncherTUI:
 
         # Show config
         self.console.print()
-        self.console.print("[bold]📋 Proxy Configuration[/bold]")
+        self.console.print("[bold]" + t("proxy_config_title") + "[/bold]")
         self.console.print("━" * 70)
-        self.console.print(f"   Host:                {self.config.config['host']}")
-        self.console.print(f"   Port:                {self.config.config['port']}")
+        self.console.print(f"   主机地址：          {self.config.config['host']}")
+        self.console.print(f"   端口：              {self.config.config['port']}")
         self.console.print(
-            f"   Transaction Logging: {'✅ Enabled' if self.config.config['enable_request_logging'] else '❌ Disabled'}"
+            f"   事务日志：          {'✅ 已启用' if self.config.config['enable_request_logging'] else '❌ 已禁用'}"
         )
         self.console.print(
-            f"   Raw I/O Logging:     {'✅ Enabled' if self.config.config.get('enable_raw_logging', False) else '❌ Disabled'}"
+            f"   原始I/O日志：       {'✅ 已启用' if self.config.config.get('enable_raw_logging', False) else '❌ 已禁用'}"
         )
 
         # Show actual API key value
         proxy_key = os.getenv("PROXY_API_KEY")
         if proxy_key:
-            self.console.print(f"   Proxy API Key:       {proxy_key}")
+            self.console.print(f"   代理 API 密钥：     {proxy_key}")
         else:
-            self.console.print("   Proxy API Key:       [red]Not Set (INSECURE!)[/red]")
+            self.console.print("   代理 API 密钥：     " + t("proxy_api_key_not_set"))
 
         # Show status summary
         self.console.print()
-        self.console.print("[bold]📊 Status Summary[/bold]")
+        self.console.print("[bold]" + t("status_summary_title") + "[/bold]")
         self.console.print("━" * 70)
         provider_count = len(credentials)
         custom_count = len(custom_bases)
 
-        self.console.print(f"   Providers:           {provider_count} configured")
-        self.console.print(f"   Custom Providers:    {custom_count} configured")
+        self.console.print(f"   供应商：             {provider_count} 个已配置")
+        self.console.print(f"   自定义供应商：       {custom_count} 个已配置")
         # Note: provider_settings detection is deferred to avoid heavy imports on startup
         has_advanced = bool(
             settings["model_definitions"]
@@ -451,38 +434,38 @@ class LauncherTUI:
             or settings["model_filters"]
         )
         self.console.print(
-            f"   Advanced Settings:   {'Active (view in menu 4)' if has_advanced else 'None (view menu 4 for details)'}"
+            f"   高级设置：           {'活跃 (在菜单4中查看)' if has_advanced else '无 (在菜单4中查看详情)'}"
         )
 
         # Show menu
         self.console.print()
         self.console.print("━" * 70)
         self.console.print()
-        self.console.print("[bold]🎯 Main Menu[/bold]")
+        self.console.print("[bold]🎯 主菜单[/bold]")
         self.console.print()
         if show_warning:
-            self.console.print("   1. ▶️  Run Proxy Server")
-            self.console.print("   2. ⚙️  Configure Proxy Settings")
+            self.console.print("   " + t("menu_run_proxy"))
+            self.console.print("   " + t("menu_config_proxy"))
             self.console.print(
-                "   3. 🔑 Manage Credentials            ⬅️  [bold yellow]Start here![/bold yellow]"
+                "   " + t("menu_manage_creds_start")
             )
         else:
-            self.console.print("   1. ▶️  Run Proxy Server")
-            self.console.print("   2. ⚙️  Configure Proxy Settings")
-            self.console.print("   3. 🔑 Manage Credentials")
+            self.console.print("   " + t("menu_run_proxy"))
+            self.console.print("   " + t("menu_config_proxy"))
+            self.console.print("   " + t("menu_manage_creds"))
 
-        self.console.print("   4. 📊 View Provider & Advanced Settings")
-        self.console.print("   5. 📈 View Quota & Usage Stats (Alpha)")
-        self.console.print("   6. 🔄 Reload Configuration")
-        self.console.print("   7. ℹ️  About")
-        self.console.print("   8. 🚪 Exit")
+        self.console.print("   " + t("menu_view_provider"))
+        self.console.print("   " + t("menu_view_quota"))
+        self.console.print("   " + t("menu_reload_config"))
+        self.console.print("   " + t("menu_about"))
+        self.console.print("   " + t("menu_exit"))
 
         self.console.print()
         self.console.print("━" * 70)
         self.console.print()
 
         choice = Prompt.ask(
-            "Select option",
+            t("select_option"),
             choices=["1", "2", "3", "4", "5", "6", "7", "8"],
             show_choices=False,
         )
@@ -500,7 +483,7 @@ class LauncherTUI:
         elif choice == "6":
             load_dotenv(dotenv_path=_get_env_file(), override=True)
             self.config = LauncherConfig()  # Reload config
-            self.console.print("\n[green]✅ Configuration reloaded![/green]")
+            self.console.print(t("config_reloaded"))
         elif choice == "7":
             self.show_about()
         elif choice == "8":
@@ -509,18 +492,18 @@ class LauncherTUI:
 
     def confirm_setting_change(self, setting_name: str, warning_lines: list) -> bool:
         """
-        Display a warning and require Y/N (case-sensitive) confirmation.
-        Re-prompts until user enters exactly 'Y' or 'N'.
-        Returns True only if user enters 'Y'.
+        显示警告并要求 Y/N（区分大小写）确认。
+        持续提示直到用户输入 'Y' 或 'N'。
+        仅当用户输入 'Y' 时返回 True。
         """
         clear_screen()
         self.console.print()
         self.console.print(
             Panel(
                 Text.from_markup(
-                    f"[bold yellow]⚠️  WARNING: You are about to change the {setting_name}[/bold yellow]\n\n"
+                    f"[bold yellow]⚠️  警告：您即将更改 {setting_name}[/bold yellow]\n\n"
                     + "\n".join(warning_lines)
-                    + "\n\n[bold]If you are not sure about changing this - don't.[/bold]"
+                    + "\n\n[bold]如果您不确定是否要更改 - 请不要更改。[/bold]"
                 ),
                 border_style="yellow",
                 expand=False,
@@ -529,63 +512,63 @@ class LauncherTUI:
 
         while True:
             response = Prompt.ask(
-                "Enter [bold]Y[/bold] to confirm, [bold]N[/bold] to cancel (case-sensitive)"
+                t("confirm_yn")
             )
             if response == "Y":
                 return True
             elif response == "N":
-                self.console.print("\n[dim]Operation cancelled.[/dim]")
+                self.console.print(t("operation_cancelled"))
                 return False
             else:
                 self.console.print(
-                    "[red]Please enter exactly 'Y' or 'N' (case-sensitive)[/red]"
+                    t("please_enter_yn")
                 )
 
     def show_config_menu(self):
-        """Display configuration sub-menu"""
+        """显示配置子菜单"""
         while True:
             clear_screen()
 
             self.console.print(
                 Panel.fit(
-                    "[bold cyan]⚙️  Proxy Configuration[/bold cyan]", border_style="cyan"
+                    "[bold cyan]⚙️  代理配置[/bold cyan]", border_style="cyan"
                 )
             )
 
             self.console.print()
-            self.console.print("[bold]📋 Current Settings[/bold]")
+            self.console.print("[bold]📋 当前设置[/bold]")
             self.console.print("━" * 70)
-            self.console.print(f"   Host:                {self.config.config['host']}")
-            self.console.print(f"   Port:                {self.config.config['port']}")
+            self.console.print(f"   主机地址：          {self.config.config['host']}")
+            self.console.print(f"   端口：              {self.config.config['port']}")
             self.console.print(
-                f"   Transaction Logging: {'✅ Enabled' if self.config.config['enable_request_logging'] else '❌ Disabled'}"
+                f"   事务日志：          {'✅ 已启用' if self.config.config['enable_request_logging'] else '❌ 已禁用'}"
             )
             self.console.print(
-                f"   Raw I/O Logging:     {'✅ Enabled' if self.config.config.get('enable_raw_logging', False) else '❌ Disabled'}"
+                f"   原始I/O日志：       {'✅ 已启用' if self.config.config.get('enable_raw_logging', False) else '❌ 已禁用'}"
             )
             self.console.print(
-                f"   Proxy API Key:       {'✅ Set' if os.getenv('PROXY_API_KEY') else '❌ Not Set'}"
+                f"   代理 API 密钥：     {'✅ 已设置' if os.getenv('PROXY_API_KEY') else '❌ 未设置'}"
             )
 
             self.console.print()
             self.console.print("━" * 70)
             self.console.print()
-            self.console.print("[bold]⚙️  Configuration Options[/bold]")
+            self.console.print("[bold]⚙️  配置选项[/bold]")
             self.console.print()
-            self.console.print("   1. 🌐 Set Host IP")
-            self.console.print("   2. 🔌 Set Port")
-            self.console.print("   3. 🔑 Set Proxy API Key")
-            self.console.print("   4. 📝 Toggle Transaction Logging")
-            self.console.print("   5. 📋 Toggle Raw I/O Logging")
-            self.console.print("   6. 🔄 Reset to Default Settings")
-            self.console.print("   7. ↩️  Back to Main Menu")
+            self.console.print("   " + t("config_set_host"))
+            self.console.print("   " + t("config_set_port"))
+            self.console.print("   " + t("config_set_api_key"))
+            self.console.print("   " + t("config_toggle_trans_log"))
+            self.console.print("   " + t("config_toggle_raw_log"))
+            self.console.print("   " + t("config_reset_defaults"))
+            self.console.print("   " + t("config_back"))
 
             self.console.print()
             self.console.print("━" * 70)
             self.console.print()
 
             choice = Prompt.ask(
-                "Select option",
+                t("select_option"),
                 choices=["1", "2", "3", "4", "5", "6", "7"],
                 show_choices=False,
             )
@@ -593,67 +576,48 @@ class LauncherTUI:
             if choice == "1":
                 # Show warning and require confirmation
                 confirmed = self.confirm_setting_change(
-                    "Host IP",
-                    [
-                        "Changing the host IP affects which network interfaces the proxy listens on:",
-                        "  • [cyan]127.0.0.1[/cyan] = Local access only (recommended for development)",
-                        "  • [cyan]0.0.0.0[/cyan] = Accessible from all network interfaces",
-                        "",
-                        "Applications configured to connect to the old host may fail to connect.",
-                    ],
+                    t("warn_host_ip"),
+                    t_list("warn_host_lines"),
                 )
                 if not confirmed:
                     continue
 
                 new_host = Prompt.ask(
-                    "Enter new host IP", default=self.config.config["host"]
+                    t("enter_new_host"), default=self.config.config["host"]
                 )
                 self.config.update(host=new_host)
-                self.console.print(f"\n[green]✅ Host updated to: {new_host}[/green]")
+                self.console.print(t("host_updated", host=new_host))
             elif choice == "2":
                 # Show warning and require confirmation
                 confirmed = self.confirm_setting_change(
-                    "Port",
-                    [
-                        "Changing the port will affect all applications currently configured",
-                        "to connect to your proxy on the existing port.",
-                        "",
-                        "Applications using the old port will fail to connect.",
-                    ],
+                    t("warn_port"),
+                    t_list("warn_port_lines"),
                 )
                 if not confirmed:
                     continue
 
                 new_port = IntPrompt.ask(
-                    "Enter new port", default=self.config.config["port"]
+                    t("enter_new_port"), default=self.config.config["port"]
                 )
                 if 1 <= new_port <= 65535:
                     self.config.update(port=new_port)
                     self.console.print(
-                        f"\n[green]✅ Port updated to: {new_port}[/green]"
+                        t("port_updated", port=new_port)
                     )
                 else:
-                    self.console.print("\n[red]❌ Port must be between 1-65535[/red]")
+                    self.console.print(t("port_invalid"))
             elif choice == "3":
                 # Show warning and require confirmation
                 confirmed = self.confirm_setting_change(
-                    "Proxy API Key",
-                    [
-                        "This is the authentication key that applications use to access your proxy.",
-                        "",
-                        "[bold red]⚠️  Changing this will BREAK all applications currently configured",
-                        "   with the existing API key![/bold red]",
-                        "",
-                        "[bold cyan]💡 If you want to add provider API keys (OpenAI, Gemini, etc.),",
-                        '   go to "3. 🔑 Manage Credentials" in the main menu instead.[/bold cyan]',
-                    ],
+                    t("warn_proxy_key"),
+                    t_list("warn_proxy_key_lines"),
                 )
                 if not confirmed:
                     continue
 
                 current = os.getenv("PROXY_API_KEY", "")
                 new_key = Prompt.ask(
-                    "Enter new Proxy API Key (leave empty to disable authentication)",
+                    t("enter_new_api_key"),
                     default=current,
                 )
 
@@ -661,35 +625,35 @@ class LauncherTUI:
                     # If setting to empty, show additional warning
                     if not new_key:
                         self.console.print(
-                            "\n[bold red]⚠️  Authentication will be DISABLED - anyone can access your proxy![/bold red]"
+                            t("auth_will_be_disabled")
                         )
-                        Prompt.ask("Press Enter to continue", default="")
+                        Prompt.ask(t("press_enter"), default="")
 
                     LauncherConfig.update_proxy_api_key(new_key)
 
                     if new_key:
                         self.console.print(
-                            "\n[green]✅ Proxy API Key updated successfully![/green]"
+                            t("api_key_updated")
                         )
-                        self.console.print("   Updated in .env file")
+                        self.console.print(t("api_key_updated_in_env"))
                     else:
                         self.console.print(
-                            "\n[yellow]⚠️  Proxy API Key cleared - authentication disabled![/yellow]"
+                            t("api_key_cleared")
                         )
-                        self.console.print("   Updated in .env file")
+                        self.console.print(t("api_key_updated_in_env"))
                 else:
-                    self.console.print("\n[yellow]No changes made[/yellow]")
+                    self.console.print(t("no_changes_made"))
             elif choice == "4":
                 current = self.config.config["enable_request_logging"]
                 self.config.update(enable_request_logging=not current)
                 self.console.print(
-                    f"\n[green]✅ Transaction Logging {'enabled' if not current else 'disabled'}![/green]"
+                    t("trans_log_toggled", status="启用" if not current else "禁用")
                 )
             elif choice == "5":
                 current = self.config.config.get("enable_raw_logging", False)
                 self.config.update(enable_raw_logging=not current)
                 self.console.print(
-                    f"\n[green]✅ Raw I/O Logging {'enabled' if not current else 'disabled'}![/green]"
+                    t("raw_log_toggled", status="启用" if not current else "禁用")
                 )
             elif choice == "6":
                 # Reset to Default Settings
@@ -711,25 +675,25 @@ class LauncherTUI:
 
                 # Build comparison table
                 warning_lines = [
-                    "This will reset ALL proxy settings to their defaults:",
+                    t("reset_defaults_warning"),
                     "",
-                    "[bold]   Setting              Current Value         →  Default Value[/bold]",
+                    "[bold]   设置              当前值                →  默认值[/bold]",
                     "   " + "─" * 62,
-                    f"   Host IP              {current_host:20} →  {default_host}",
-                    f"   Port                 {str(current_port):20} →  {default_port}",
-                    f"   Transaction Logging  {'Enabled':20} →  Disabled"
+                    f"   主机 IP             {current_host:20} →  {default_host}",
+                    f"   端口                {str(current_port):20} →  {default_port}",
+                    f"   事务日志            {'已启用':20} →  已禁用"
                     if current_logging
-                    else f"   Transaction Logging  {'Disabled':20} →  Disabled",
-                    f"   Raw I/O Logging      {'Enabled':20} →  Disabled"
+                    else f"   事务日志            {'已禁用':20} →  已禁用",
+                    f"   原始I/O日志         {'已启用':20} →  已禁用"
                     if current_raw_logging
-                    else f"   Raw I/O Logging      {'Disabled':20} →  Disabled",
-                    f"   Proxy API Key        {current_api_key[:20]:20} →  {default_api_key}",
+                    else f"   原始I/O日志         {'已禁用':20} →  已禁用",
+                    f"   代理 API 密钥       {current_api_key[:20]:20} →  {default_api_key}",
                     "",
-                    "[bold red]⚠️  This may break applications configured with current settings![/bold red]",
+                    "[bold red]⚠️  这可能导致使用当前设置的应用程序连接失败！[/bold red]",
                 ]
 
                 confirmed = self.confirm_setting_change(
-                    "Settings (Reset to Defaults)", warning_lines
+                    "设置（恢复默认值）", warning_lines
                 )
                 if not confirmed:
                     continue
@@ -744,18 +708,18 @@ class LauncherTUI:
                 LauncherConfig.update_proxy_api_key(default_api_key)
 
                 self.console.print(
-                    "\n[green]✅ All settings have been reset to defaults![/green]"
+                    t("all_settings_reset")
                 )
-                self.console.print(f"   Host:               {default_host}")
-                self.console.print(f"   Port:               {default_port}")
-                self.console.print(f"   Transaction Logging: Disabled")
-                self.console.print(f"   Raw I/O Logging:    Disabled")
-                self.console.print(f"   Proxy API Key:      {default_api_key}")
+                self.console.print(f"   主机：              {default_host}")
+                self.console.print(f"   端口：              {default_port}")
+                self.console.print(f"   事务日志：          已禁用")
+                self.console.print(f"   原始I/O日志：       已禁用")
+                self.console.print(f"   代理 API 密钥：     {default_api_key}")
             elif choice == "7":
                 break
 
     def show_provider_settings_menu(self):
-        """Display provider/advanced settings (read-only + launch tool)"""
+        """显示供应商/高级设置（只读 + 启动工具）"""
         clear_screen()
 
         # Use basic settings to avoid heavy imports - provider_settings deferred to Settings Tool
@@ -769,14 +733,14 @@ class LauncherTUI:
 
         self.console.print(
             Panel.fit(
-                "[bold cyan]📊 Provider & Advanced Settings[/bold cyan]",
+                "[bold cyan]📊 供应商与高级设置[/bold cyan]",
                 border_style="cyan",
             )
         )
 
         # Configured Providers
         self.console.print()
-        self.console.print("[bold]📊 Configured Providers[/bold]")
+        self.console.print("[bold]📊 已配置的供应商[/bold]")
         self.console.print("━" * 70)
         if credentials:
             for provider, info in credentials.items():
@@ -784,25 +748,25 @@ class LauncherTUI:
                 parts = []
                 if info["api_keys"] > 0:
                     parts.append(
-                        f"{info['api_keys']} API key{'s' if info['api_keys'] > 1 else ''}"
+                        f"{info['api_keys']} 个 API 密钥"
                     )
                 if info["oauth"] > 0:
                     parts.append(
-                        f"{info['oauth']} OAuth credential{'s' if info['oauth'] > 1 else ''}"
+                        f"{info['oauth']} 个 OAuth 凭据"
                     )
 
                 display = " + ".join(parts)
                 if info["custom"]:
-                    display += " (Custom)"
+                    display += " (自定义)"
 
                 self.console.print(f"   ✅ {provider_name:20} {display}")
         else:
-            self.console.print("   [dim]No providers configured[/dim]")
+            self.console.print("   [dim]未配置任何供应商[/dim]")
 
         # Custom API Bases
         if custom_bases:
             self.console.print()
-            self.console.print("[bold]🌐 Custom API Bases[/bold]")
+            self.console.print("[bold]🌐 自定义 API 地址[/bold]")
             self.console.print("━" * 70)
             for provider, base in custom_bases.items():
                 self.console.print(f"   • {provider:15} {base}")
@@ -810,74 +774,74 @@ class LauncherTUI:
         # Model Definitions
         if model_defs:
             self.console.print()
-            self.console.print("[bold]📦 Provider Model Definitions[/bold]")
+            self.console.print("[bold]📦 供应商模型定义[/bold]")
             self.console.print("━" * 70)
             for provider, count in model_defs.items():
                 self.console.print(
-                    f"   • {provider:15} {count} model{'s' if count > 1 else ''} configured"
+                    f"   • {provider:15} {count} 个模型已配置"
                 )
 
         # Concurrency Limits
         if concurrency:
             self.console.print()
-            self.console.print("[bold]⚡ Concurrency Limits[/bold]")
+            self.console.print("[bold]⚡ 并发限制[/bold]")
             self.console.print("━" * 70)
             for provider, limit in concurrency.items():
-                self.console.print(f"   • {provider:15} {limit} requests/key")
-            self.console.print("   • Default:        1 request/key (all others)")
+                self.console.print(f"   • {provider:15} {limit} 请求/密钥")
+            self.console.print("   • 默认:           1 请求/密钥 (其他供应商)")
 
         # Model Filters (basic info only)
         if filters:
             self.console.print()
-            self.console.print("[bold]🎯 Model Filters[/bold]")
+            self.console.print("[bold]🎯 模型过滤器[/bold]")
             self.console.print("━" * 70)
             for provider, filter_info in filters.items():
                 status_parts = []
                 if filter_info["has_whitelist"]:
-                    status_parts.append("Whitelist")
+                    status_parts.append("白名单")
                 if filter_info["has_ignore"]:
-                    status_parts.append("Ignore list")
-                status = " + ".join(status_parts) if status_parts else "None"
+                    status_parts.append("忽略列表")
+                status = " + ".join(status_parts) if status_parts else "无"
                 self.console.print(f"   • {provider:15} ✅ {status}")
 
         # Provider-Specific Settings (deferred to Settings Tool to avoid heavy imports)
         self.console.print()
-        self.console.print("[bold]🔬 Provider-Specific Settings[/bold]")
+        self.console.print("[bold]🔬 供应商特定设置[/bold]")
         self.console.print("━" * 70)
         self.console.print(
-            "   [dim]Launch Settings Tool to view/configure provider-specific settings[/dim]"
+            t("launch_settings_tool_hint")
         )
 
         # Actions
         self.console.print()
         self.console.print("━" * 70)
         self.console.print()
-        self.console.print("[bold]💡 Actions[/bold]")
+        self.console.print("[bold]💡 操作[/bold]")
         self.console.print()
         self.console.print(
-            "   1. 🔧 Launch Settings Tool      (configure advanced settings)"
+            "   1. 🔧 启动设置工具      （配置高级设置）"
         )
-        self.console.print("   2. ↩️  Back to Main Menu")
+        self.console.print("   2. ↩️  返回主菜单")
 
         self.console.print()
         self.console.print("━" * 70)
         self.console.print(
-            "[dim]ℹ️  Advanced settings are stored in .env file.\n   Use the Settings Tool to configure them interactively.[/dim]"
+            t("advanced_in_env")
         )
         self.console.print()
         self.console.print(
-            "[dim]⚠️  Note: Settings Tool supports only common configuration types.\n   For complex settings, edit .env directly.[/dim]"
+            t("settings_tool_note")
         )
         self.console.print()
 
-        choice = Prompt.ask("Select option", choices=["1", "2"], show_choices=False)
+        choice = Prompt.ask(t("select_option"), choices=["1", "2"], show_choices=False)
 
         if choice == "1":
             self.launch_settings_tool()
         # choice == "2" returns to main menu
 
     def launch_credential_tool(self):
-        """Launch credential management tool"""
+        """启动凭据管理工具"""
         import time
 
         # CRITICAL: Show full loading UI to replace the 6-7 second blank wait
@@ -887,24 +851,24 @@ class LauncherTUI:
 
         # Show the same header as standalone mode
         self.console.print("━" * 70)
-        self.console.print("Interactive Credential Setup Tool")
+        self.console.print(t("credential_tool_header"))
         self.console.print("GitHub: https://github.com/Mirrowel/LLM-API-Key-Proxy")
         self.console.print("━" * 70)
-        self.console.print("Loading credential management components...")
+        self.console.print(t("loading_credential_components"))
 
         # Now import with spinner (this is where the 6-7 second delay happens)
-        with self.console.status("Initializing credential tool...", spinner="dots"):
+        with self.console.status(t("initializing_credential_tool"), spinner="dots"):
             from rotator_library.credential_tool import (
                 run_credential_tool,
                 _ensure_providers_loaded,
             )
 
             _, PROVIDER_PLUGINS = _ensure_providers_loaded()
-        self.console.print("✓ Credential tool initialized")
+        self.console.print(t("credential_tool_initialized"))
 
         _elapsed = time.time() - _start_time
         self.console.print(
-            f"✓ Tool ready in {_elapsed:.2f}s ({len(PROVIDER_PLUGINS)} providers available)"
+            t("tool_ready", elapsed=_elapsed, count=len(PROVIDER_PLUGINS))
         )
 
         # Small delay to let user see the ready message
@@ -916,22 +880,22 @@ class LauncherTUI:
         load_dotenv(dotenv_path=_get_env_file(), override=True)
 
     def launch_settings_tool(self):
-        """Launch settings configuration tool"""
+        """启动设置配置工具"""
         import time
 
         clear_screen()
 
         self.console.print("━" * 70)
-        self.console.print("Advanced Settings Configuration Tool")
+        self.console.print(t("settings_tool_header"))
         self.console.print("━" * 70)
 
         _start_time = time.time()
 
-        with self.console.status("Initializing settings tool...", spinner="dots"):
+        with self.console.status(t("initializing_settings_tool"), spinner="dots"):
             from proxy_app.settings_tool import run_settings_tool
 
         _elapsed = time.time() - _start_time
-        self.console.print(f"✓ Settings tool ready in {_elapsed:.2f}s")
+        self.console.print(t("settings_tool_ready", elapsed=_elapsed))
 
         time.sleep(0.3)
 
@@ -940,11 +904,11 @@ class LauncherTUI:
         load_dotenv(dotenv_path=_get_env_file(), override=True)
 
     def launch_quota_viewer(self):
-        """Launch the quota stats viewer"""
+        """启动配额统计查看器"""
         clear_screen()
 
         self.console.print("━" * 70)
-        self.console.print("Quota & Usage Statistics Viewer")
+        self.console.print(t("quota_viewer_header"))
         self.console.print("━" * 70)
         self.console.print()
 
@@ -954,79 +918,61 @@ class LauncherTUI:
         run_quota_viewer()
 
     def show_about(self):
-        """Display About page with project information"""
+        """显示关于页面"""
         clear_screen()
 
         self.console.print(
             Panel.fit(
-                "[bold cyan]ℹ️  About LLM API Key Proxy[/bold cyan]", border_style="cyan"
+                "[bold cyan]ℹ️  关于 LLM API 密钥代理[/bold cyan]", border_style="cyan"
             )
         )
 
         self.console.print()
-        self.console.print("[bold]📦 Project Information[/bold]")
+        self.console.print("[bold]📦 项目信息[/bold]")
         self.console.print("━" * 70)
         self.console.print("   [bold cyan]LLM API Key Proxy[/bold cyan]")
         self.console.print(
-            "   A lightweight, high-performance proxy server for managing"
+            t("about_description_1")
         )
-        self.console.print("   LLM API keys with automatic rotation and OAuth support")
+        self.console.print(t("about_description_2"))
         self.console.print()
         self.console.print(
             "   [dim]GitHub:[/dim] [blue underline]https://github.com/Mirrowel/LLM-API-Key-Proxy[/blue underline]"
         )
 
         self.console.print()
-        self.console.print("[bold]✨ Key Features[/bold]")
+        self.console.print("[bold]✨ 主要特性[/bold]")
         self.console.print("━" * 70)
-        self.console.print(
-            "   • [green]Smart Key Rotation[/green] - Automatic rotation across multiple API keys"
-        )
-        self.console.print(
-            "   • [green]OAuth Support[/green] - Automated OAuth flows for supported providers"
-        )
-        self.console.print(
-            "   • [green]Multiple Providers[/green] - Support for 10+ LLM providers"
-        )
-        self.console.print(
-            "   • [green]Custom Providers[/green] - Easy integration of custom OpenAI-compatible APIs"
-        )
-        self.console.print(
-            "   • [green]Advanced Filtering[/green] - Model whitelists and ignore lists per provider"
-        )
-        self.console.print(
-            "   • [green]Concurrency Control[/green] - Per-key rate limiting and request management"
-        )
-        self.console.print(
-            "   • [green]Cost Tracking[/green] - Track usage and costs across all providers"
-        )
-        self.console.print(
-            "   • [green]Interactive TUI[/green] - Beautiful terminal interface for easy configuration"
-        )
+        self.console.print(t("feature_rotation"))
+        self.console.print(t("feature_oauth"))
+        self.console.print(t("feature_providers"))
+        self.console.print(t("feature_custom"))
+        self.console.print(t("feature_filtering"))
+        self.console.print(t("feature_concurrency"))
+        self.console.print(t("feature_cost"))
+        self.console.print(t("feature_tui"))
 
         self.console.print()
-        self.console.print("[bold]📝 License & Credits[/bold]")
+        self.console.print("[bold]📝 许可与致谢[/bold]")
         self.console.print("━" * 70)
-        self.console.print("   Made with ❤️  by the community")
-        self.console.print("   Open source - contributions welcome!")
+        self.console.print(t("made_with_love"))
+        self.console.print(t("open_source"))
 
         self.console.print()
         self.console.print("━" * 70)
         self.console.print()
 
-        Prompt.ask("Press Enter to return to main menu", default="")
+        Prompt.ask(t("press_enter_return_main"), default="")
 
     def run_proxy(self):
-        """Prepare and launch proxy in same window"""
+        """准备并在同一窗口启动代理"""
         # Check if forced onboarding needed
         if self.needs_onboarding():
             clear_screen()
             self.console.print(
                 Panel(
                     Text.from_markup(
-                        "⚠️  [bold yellow]Setup Required[/bold yellow]\n\n"
-                        "Cannot start without .env.\n"
-                        "Launching credential tool..."
+                        t("setup_required_run")
                     ),
                     border_style="yellow",
                 )
@@ -1046,14 +992,14 @@ class LauncherTUI:
             # Check again after credential tool
             if not os.getenv("PROXY_API_KEY"):
                 self.console.print(
-                    "\n[red]❌ PROXY_API_KEY still not set. Cannot start proxy.[/red]"
+                    t("proxy_key_still_not_set")
                 )
                 return
 
         # Clear console and modify sys.argv
         clear_screen()
         self.console.print(
-            f"\n[bold green]🚀 Starting proxy on {self.config.config['host']}:{self.config.config['port']}...[/bold green]\n"
+            t("starting_proxy", host=self.config.config['host'], port=self.config.config['port'])
         )
 
         # Brief pause so user sees the message before main.py takes over
