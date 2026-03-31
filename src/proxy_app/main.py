@@ -365,7 +365,7 @@ if ENABLE_REQUEST_LOGGING:
     )
 if ENABLE_RAW_LOGGING:
     logging.info("Raw I/O logging is enabled (proxy boundary, unmodified HTTP data).")
-PROXY_API_KEY = os.getenv("PROXY_API_KEY")
+PROXY_API_KEY = (os.getenv("PROXY_API_KEY") or "").strip().strip("'\"") or None
 # Note: PROXY_API_KEY validation moved to server startup to allow credential tool to run first
 
 # Discover API keys from environment variables

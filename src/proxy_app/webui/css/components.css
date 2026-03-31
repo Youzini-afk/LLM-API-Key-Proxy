@@ -828,6 +828,19 @@
   gap: var(--space-md);
 }
 
+/* =================== AUTH ERROR =================== */
+.auth-error-msg {
+  margin-top: var(--space-md);
+  padding: var(--space-md) var(--space-lg);
+  background: rgba(255, 113, 108, 0.08);
+  border: 1px solid rgba(255, 113, 108, 0.2);
+  border-radius: var(--radius-md);
+  color: var(--error);
+  font-size: var(--text-body-sm);
+  font-family: 'JetBrains Mono', monospace;
+  word-break: break-all;
+}
+
 /* =================== TOAST =================== */
 .toast-container {
   position: fixed;

@@ -12,8 +12,8 @@ import { showToast } from './toast.js';
 export async function checkAuth() {
   // If key exists, test it
   if (api.hasApiKey()) {
-    const valid = await api.testConnection();
-    if (valid) return true;
+    const result = await api.testConnection();
+    if (result.ok) return true;
     // Key is invalid, show modal
   }
 
@@ -45,6 +45,7 @@ export function showAuthModal() {
             placeholder: '输入 PROXY_API_KEY...',
             autocomplete: 'off',
           }),
+          h('div', { id: 'auth-error-msg', className: 'auth-error-msg', style: 'display:none' }),
           h('label', { className: 'input-checkbox-label mt-md' },
             h('input', { type: 'checkbox', id: 'auth-show-key' }),
             h('span', {}, ' 显示密钥')
@@ -66,6 +67,7 @@ export function showAuthModal() {
             onClick: async () => {
               const input = $('#auth-key-input');
               const btn = $('#auth-submit-btn');
+              const errEl = $('#auth-error-msg');
               const key = input.value.trim();
               if (!key) {
                 input.classList.add('input-error');
@@ -74,16 +76,22 @@ export function showAuthModal() {
 
               btn.textContent = '验证中...';
               btn.disabled = true;
+              errEl.style.display = 'none';
 
               api.setApiKey(key);
-              const valid = await api.testConnection();
+              const result = await api.testConnection();
 
-              if (valid) {
+              if (result.ok) {
                 showToast('认证成功', 'success');
                 overlay.remove();
                 resolve(true);
               } else {
-                showToast('认证失败，请检查密钥', 'error');
+                const errText = result.status
+                  ? `错误 ${result.status}: ${result.detail}`
+                  : result.detail;
+                errEl.textContent = errText;
+                errEl.style.display = 'block';
+                showToast('认证失败', 'error');
                 btn.textContent = '连接';
                 btn.disabled = false;
                 input.classList.add('input-error');

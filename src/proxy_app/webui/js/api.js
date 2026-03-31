@@ -79,16 +79,21 @@ class ProxyAPI {
   /**
    * Test connectivity with current API key
    * Uses an authenticated endpoint to verify the key is valid
-   * @returns {Promise<boolean>}
+   * @returns {Promise<{ok: boolean, status?: number, detail?: string}>}
    */
   async testConnection() {
     try {
       await this.getModels(false);
-      return true;
+      return { ok: true };
     } catch (e) {
-      if (e instanceof APIError && e.status === 401) return false;
-      // Connection error or other non-auth error — might still be valid
-      return true;
+      if (e instanceof APIError && e.status === 401) {
+        return { ok: false, status: 401, detail: '密钥无效或不匹配' };
+      }
+      if (e instanceof APIError) {
+        return { ok: false, status: e.status, detail: e.message };
+      }
+      // Network error
+      return { ok: false, status: 0, detail: `连接失败: ${e.message}` };
     }
   }
 
