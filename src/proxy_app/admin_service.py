@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import os
-from copy import deepcopy
-from datetime import datetime
-from typing import Dict, List, Tuple
+from datetime import datetime, timezone
+from typing import Dict, List
+from urllib.parse import urlparse
 
 from proxy_app.admin_schemas import (
     AdminConfig,
     ChannelConfig,
+    ChannelKeyConfig,
     ChannelCreateRequest,
     ChannelUpdateRequest,
     KeyCreateRequest,
@@ -30,6 +31,43 @@ class AdminService:
     def __init__(self):
         self._cfg = load_admin_config()
         self._last_reload_at = None
+
+    @staticmethod
+    def _normalize_api_base(raw_api_base: str) -> str:
+        s = (raw_api_base or "").strip().rstrip("/")
+        if not s:
+            raise ValueError("api_base is required")
+        if not (s.startswith("http://") or s.startswith("https://")):
+            raise ValueError("api_base must start with http:// or https://")
+
+        parsed = urlparse(s)
+        path = parsed.path or ""
+        # If user pasted full completions endpoint, normalize to provider base
+        if path.endswith("/chat/completions"):
+            path = path[: -len("/chat/completions")]
+        if path.endswith("/embeddings"):
+            path = path[: -len("/embeddings")]
+
+        normalized = f"{parsed.scheme}://{parsed.netloc}{path}".rstrip("/")
+        return normalized
+
+    @staticmethod
+    def _sanitize_channel_id(v: str) -> str:
+        s = (v or "").strip().lower()
+        s = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in s)
+        while "__" in s:
+            s = s.replace("__", "_")
+        return s.strip("_")
+
+    def _generate_channel_id(self, req: ChannelCreateRequest, cfg: AdminConfig) -> str:
+        base = self._sanitize_channel_id(req.display_name or req.provider_type or "channel") or "channel"
+        existing = {c.id for c in cfg.channels}
+        if base not in existing:
+            return base
+        idx = 2
+        while f"{base}_{idx}" in existing:
+            idx += 1
+        return f"{base}_{idx}"
 
     # -----------------------
     # Basic getters
@@ -90,14 +128,24 @@ class AdminService:
     # -----------------------
     def create_channel(self, req: ChannelCreateRequest) -> Dict:
         cfg = self.get_config()
-        if any(c.id == req.id for c in cfg.channels):
-            raise ValueError(f"Channel '{req.id}' already exists")
-        cfg.channels.append(ChannelConfig(**req.model_dump()))
+        channel_id = self._sanitize_channel_id(req.id or "")
+        if not channel_id:
+            channel_id = self._generate_channel_id(req, cfg)
+        if any(c.id == channel_id for c in cfg.channels):
+            raise ValueError(f"Channel '{channel_id}' already exists")
+
+        payload = req.model_dump()
+        payload["id"] = channel_id
+        payload["api_base"] = self._normalize_api_base(payload.get("api_base") or "")
+
+        cfg.channels.append(ChannelConfig(**payload))
         result = self.validate_config(cfg)
         if not result.ok:
             raise ValueError("; ".join(result.errors))
         self._cfg = save_admin_config(cfg)
-        return self.get_config_masked()
+        out = self.get_config_masked()
+        out["created_channel_id"] = channel_id
+        return out
 
     def update_channel(self, channel_id: str, req: ChannelUpdateRequest) -> Dict:
         cfg = self.get_config()
@@ -106,6 +154,9 @@ class AdminService:
             raise ValueError(f"Channel '{channel_id}' not found")
 
         upd = req.model_dump(exclude_none=True)
+        if "api_base" in upd:
+            upd["api_base"] = self._normalize_api_base(upd["api_base"])
+
         for k, v in upd.items():
             setattr(target, k, v)
 
@@ -268,7 +319,7 @@ class AdminService:
         from proxy_app.virtual_models import load_virtual_models
         vm = load_virtual_models()
 
-        self._last_reload_at = datetime.utcnow().isoformat() + "Z"
+        self._last_reload_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         cfg = self.get_config()
 
         return {

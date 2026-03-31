@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
@@ -14,7 +14,7 @@ RotationMode = Literal["balanced", "sequential"]
 
 class AdminMeta(BaseModel):
     version: int = 1
-    updated_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
 
 
 class ChannelKeyConfig(BaseModel):
@@ -108,8 +108,17 @@ class RuntimeStatus(BaseModel):
     message: str = "ok"
 
 
-class ChannelCreateRequest(ChannelConfig):
-    pass
+class ChannelCreateRequest(BaseModel):
+    id: Optional[str] = None
+    provider_type: str = Field(default="openai_compatible", min_length=1)
+    display_name: Optional[str] = None
+    enabled: bool = True
+    api_base: str = Field(..., min_length=1)
+    api_keys: List[ChannelKeyConfig] = Field(default_factory=list)
+    models: Dict[str, dict] = Field(default_factory=dict)
+    settings: ChannelSettingsConfig = Field(default_factory=ChannelSettingsConfig)
+
+
 
 
 class ChannelUpdateRequest(BaseModel):
