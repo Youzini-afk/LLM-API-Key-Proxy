@@ -1824,7 +1824,7 @@ if __name__ == "__main__":
 
         ensure_env_defaults()
         # Reload environment variables after ensure_env_defaults creates/updates .env
-        load_dotenv(ENV_FILE, override=True)
+        load_dotenv(ENV_FILE, override=False)  # Don't override platform env vars
         run_credential_tool()
     else:
         # Check if onboarding is needed
@@ -1834,7 +1834,7 @@ if __name__ == "__main__":
                 from rotator_library.credential_tool import ensure_env_defaults
 
                 ensure_env_defaults()
-                load_dotenv(ENV_FILE, override=True)
+                load_dotenv(ENV_FILE, override=False)  # Don't override platform env vars (Render/Railway)
                 PROXY_API_KEY = (os.getenv("PROXY_API_KEY") or "").strip().strip("'\"") or None
                 if not ENV_FILE.is_file():
                     print("WARNING: No .env file found and running in non-interactive mode.")
@@ -1855,11 +1855,11 @@ if __name__ == "__main__":
                 from rotator_library.credential_tool import ensure_env_defaults
 
                 ensure_env_defaults()
-                load_dotenv(ENV_FILE, override=True)
+                load_dotenv(ENV_FILE, override=False)  # Don't override platform env vars
                 run_credential_tool()
 
                 # After credential tool exits, reload and re-check
-                load_dotenv(ENV_FILE, override=True)
+                load_dotenv(ENV_FILE, override=False)  # Don't override platform env vars
                 # Re-read PROXY_API_KEY from environment
                 PROXY_API_KEY = (os.getenv("PROXY_API_KEY") or "").strip().strip("'\"") or None
 
