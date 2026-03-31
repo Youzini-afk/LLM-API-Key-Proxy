@@ -687,35 +687,6 @@ if _webui_dir.is_dir():
         """Serve the WebUI control panel at root."""
         return FileResponse(_webui_dir / "index.html")
 
-    @app.post("/auth-test")
-    async def webui_auth_test(request: Request):
-        """Debug endpoint to diagnose auth issues. Returns key hints without exposing full keys."""
-        body = await request.json() if request.headers.get("content-type") == "application/json" else {}
-        client_key = body.get("key", "")
-
-        # What the server has
-        server_key = PROXY_API_KEY or ""
-        server_hint = f"{server_key[:3]}...{server_key[-3:]}" if len(server_key) > 6 else f"(len={len(server_key)})"
-
-        # What the client sent
-        client_hint = f"{client_key[:3]}...{client_key[-3:]}" if len(client_key) > 6 else f"(len={len(client_key)})"
-
-        # Actual header the client would send
-        auth_header = request.headers.get("Authorization", "")
-        auth_hint = f"{auth_header[:10]}...{auth_header[-3:]}" if len(auth_header) > 13 else auth_header
-
-        match = client_key == server_key
-
-        return {
-            "match": match,
-            "server_key_hint": server_hint,
-            "server_key_len": len(server_key),
-            "client_key_hint": client_hint,
-            "client_key_len": len(client_key),
-            "auth_header_hint": auth_hint,
-            "proxy_key_set": bool(PROXY_API_KEY),
-        }
-
     logging.info(f"📊 WebUI available at http://{{args.host}}:{{args.port}}/")
 
     # Mount static files AFTER explicit routes so routes take precedence
