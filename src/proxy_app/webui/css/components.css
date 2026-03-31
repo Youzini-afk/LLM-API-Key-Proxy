@@ -779,6 +779,8 @@
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: var(--space-xl);
+  overflow-y: auto;
   z-index: var(--z-modal);
   animation: fade-in var(--transition-normal);
 }
@@ -789,6 +791,9 @@
   padding: var(--space-2xl);
   width: 90%;
   max-width: 440px;
+  max-height: calc(100vh - var(--space-xl) * 2);
+  display: flex;
+  flex-direction: column;
   box-shadow: var(--shadow-lg);
   border: 1px solid rgba(70, 72, 79, 0.15);
   animation: slide-up var(--transition-slow);
@@ -819,11 +824,14 @@
 }
 
 .modal-body {
+  min-height: 0;
+  overflow-y: auto;
   margin-bottom: var(--space-xl);
 }
 
 .modal-footer {
   display: flex;
+  flex-shrink: 0;
   justify-content: flex-end;
   gap: var(--space-md);
 }
