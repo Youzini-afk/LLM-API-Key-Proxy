@@ -78,17 +78,27 @@ class ProxyAPI {
 
   /**
    * Test connectivity with current API key
+   * Uses an authenticated endpoint to verify the key is valid
    * @returns {Promise<boolean>}
    */
   async testConnection() {
     try {
-      await this.getStatus();
+      await this.getModels(false);
       return true;
     } catch (e) {
       if (e instanceof APIError && e.status === 401) return false;
       // Connection error or other non-auth error — might still be valid
       return true;
     }
+  }
+
+  /**
+   * Clear stored API key and reload page to show auth modal
+   */
+  logout() {
+    this.apiKey = '';
+    localStorage.removeItem('proxy_api_key');
+    window.location.reload();
   }
 }
 
@@ -102,3 +112,4 @@ class APIError extends Error {
 // Singleton
 export const api = new ProxyAPI();
 export { APIError };
+

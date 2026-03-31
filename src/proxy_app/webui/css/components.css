@@ -689,6 +689,17 @@
   cursor: not-allowed;
 }
 
+.btn-danger {
+  background: rgba(255, 113, 108, 0.12);
+  color: var(--error);
+  border: 1px solid rgba(255, 113, 108, 0.25);
+}
+
+.btn-danger:hover {
+  background: rgba(255, 113, 108, 0.22);
+  box-shadow: 0 0 16px rgba(255, 113, 108, 0.15);
+}
+
 /* =================== INPUTS =================== */
 .input-field {
   background: var(--surface-container-lowest);
