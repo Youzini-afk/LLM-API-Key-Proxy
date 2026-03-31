@@ -643,6 +643,12 @@ async def lifespan(app: FastAPI):
     app.state.model_info_service = model_info_service
     logging.info("Model info service started (fetching pricing data in background).")
 
+    # Load virtual model registry (aggregated routing)
+    from proxy_app.virtual_models import load_virtual_models, get_all_virtual_model_names
+    vm_registry = load_virtual_models()
+    if vm_registry:
+        logging.info(f"Virtual model registry: {len(vm_registry)} model(s) loaded – {', '.join(vm_registry.keys())}")
+
     yield
 
     await client.background_refresher.stop()  # Stop the background task on shutdown
@@ -900,6 +906,11 @@ async def chat_completions(
     # Raw I/O logger captures unmodified HTTP data at proxy boundary (disabled by default)
     raw_logger = RawIOLogger() if ENABLE_RAW_LOGGING else None
     try:
+        # Import virtual model support
+        from proxy_app.virtual_models import is_virtual_model
+        from proxy_app.aggregate_router import (
+            execute_virtual_completion, execute_virtual_completion_streaming,
+        )
         # Read and parse the request body only once at the beginning.
         try:
             request_data = await request.json()
@@ -957,6 +968,60 @@ async def chat_completions(
             request_data=request_data,
         )
         is_streaming = request_data.get("stream", False)
+
+        # ── Virtual Model Aggregation ──────────────────────────────────
+        if model and is_virtual_model(model):
+            logging.info(f"[VirtualModel] Routing '{model}' through aggregation layer")
+
+            if is_streaming:
+                stream_gen, actual_target, fallback_count = (
+                    await execute_virtual_completion_streaming(
+                        client, request, request_data, model
+                    )
+                )
+
+                async def _wrap_stream():
+                    async for chunk in streaming_response_wrapper(
+                        request, request_data, stream_gen, raw_logger
+                    ):
+                        yield chunk
+
+                resp_headers = {
+                    "X-Proxy-Virtual-Model": model,
+                }
+                if actual_target:
+                    resp_headers["X-Proxy-Actual-Target"] = actual_target
+                    resp_headers["X-Proxy-Fallback-Count"] = str(fallback_count)
+
+                return StreamingResponse(
+                    _wrap_stream(),
+                    media_type="text/event-stream",
+                    headers=resp_headers,
+                )
+            else:
+                result, actual_target, fallback_count = (
+                    await execute_virtual_completion(
+                        client, request, request_data, model
+                    )
+                )
+
+                resp_headers = {
+                    "X-Proxy-Virtual-Model": model,
+                }
+                if actual_target:
+                    resp_headers["X-Proxy-Actual-Target"] = actual_target
+                    resp_headers["X-Proxy-Fallback-Count"] = str(fallback_count)
+
+                # If result is an error dict, return as JSON error
+                if isinstance(result, dict) and "error" in result:
+                    status_code = 502
+                    err_type = result["error"].get("type", "")
+                    if err_type == "virtual_model_exhausted":
+                        status_code = 502
+                    return JSONResponse(content=result, status_code=status_code, headers=resp_headers)
+
+                return result
+        # ── End Virtual Model Aggregation ──────────────────────────────
 
         if is_streaming:
             response_generator = client.acompletion(request=request, **request_data)
@@ -1282,7 +1347,21 @@ async def list_models(
         enriched: If True (default), returns detailed model info with pricing and capabilities.
                   If False, returns minimal OpenAI-compatible response.
     """
-    model_ids = await client.get_all_available_models(grouped=False)
+    # Get provider models
+    provider_model_ids = await client.get_all_available_models(grouped=False)
+
+    # Append virtual model names
+    from proxy_app.virtual_models import get_all_virtual_model_names
+    virtual_names = get_all_virtual_model_names()
+    # Deduplicate: only add virtual names not already present as provider models
+    existing_set = set(provider_model_ids)
+    virtual_to_add = [vm for vm in virtual_names if vm not in existing_set]
+    model_ids = provider_model_ids + virtual_to_add
+
+    if virtual_to_add:
+        logging.debug(
+            f"Added {len(virtual_to_add)} virtual model(s) to model list: {virtual_to_add}"
+        )
 
     if enriched and hasattr(request.app.state, "model_info_service"):
         model_info_service = request.app.state.model_info_service
