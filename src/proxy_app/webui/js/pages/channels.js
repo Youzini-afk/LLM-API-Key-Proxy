@@ -57,6 +57,14 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
   let pairs = modelsToPairs(initial?.models || {});
   if (pairs.length === 0) pairs = [{ key: '', value: '' }];
 
+  // 渠道级 Key 池（仅在新增时编辑；编辑场景保持原有 key 管理入口）
+  let keyPool = (initial?.api_keys || []).map(k => ({
+    id: k.id || '',
+    value: k.value || '',
+    enabled: k.enabled !== false,
+  }));
+  if (!initial && keyPool.length === 0) keyPool = [{ id: 'key_1', value: '', enabled: true }];
+
   const initialProviderType = initial?.provider_type || 'openai_compatible';
   const providerMatched = PROVIDER_OPTIONS.some((x) => x.value === initialProviderType);
 
@@ -96,6 +104,10 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
         h('select', {
           id: 'ch-provider-type-select',
           className: 'select-field',
+          onChange: (e) => {
+            const isCustom = e.target.value === '__custom__';
+            modal.querySelector('#provider-custom-wrap').style.display = isCustom ? 'block' : 'none';
+          },
         }, ...PROVIDER_OPTIONS.map((opt) =>
           h('option', {
             value: opt.value,
@@ -112,18 +124,79 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
           })
         ),
 
-        h('div', { className: 'mt-md', style: 'border:1px solid rgba(70,72,79,.25); border-radius:12px; padding:12px;' },
+        !initial ? h('div', { className: 'mt-md', style: 'border:1px solid rgba(70,72,79,.25); border-radius:12px; padding:12px;' },
           h('div', { className: 'flex items-center justify-between mb-sm' },
-            h('div', { className: 'font-headline' }, '模型重定向'),
+            h('div', { className: 'font-headline' }, 'API Key 池（此渠道专属）'),
             h('button', {
               className: 'btn btn-ghost btn-sm',
               type: 'button',
               onClick: () => {
-                const apiBase = document.getElementById('ch-api-base').value;
-                pairs = inferTemplateByUrl(apiBase);
-                renderPairs();
-              },
-            }, '填入模板')
+                keyPool.push({ id: `key_${keyPool.length + 1}`, value: '', enabled: true });
+                renderKeyPool();
+              }
+            }, '+ 添加 Key')
+          ),
+          h('div', { id: 'channel-key-pool' }),
+          h('div', { className: 'text-muted mt-sm' }, '每个渠道有自己的 key 池，后续轮询/故障切换都在该池内进行')
+        ) : h('div', { className: 'text-muted mt-md' }, '编辑模式下 Key 池请在渠道详情中管理（新增/启停/删除）'),
+
+        h('div', { className: 'mt-md', style: 'border:1px solid rgba(70,72,79,.25); border-radius:12px; padding:12px;' },
+          h('div', { className: 'font-headline mb-sm' }, 'Key 自动禁用策略'),
+          h('label', { className: 'input-checkbox-label' },
+            h('input', {
+              id: 'ch-auto-disable-enabled',
+              type: 'checkbox',
+              checked: initial?.settings?.auto_disable_long_unavailable ?? true,
+            }),
+            h('span', {}, ' 启用长时间不可用自动禁用')
+          ),
+          h('label', { className: 'input-label mt-sm' }, '连续不可用时长阈值（小时）'),
+          h('input', {
+            id: 'ch-auto-disable-hours',
+            className: 'input-field',
+            type: 'number',
+            min: '1',
+            max: '720',
+            value: String(initial?.settings?.auto_disable_unavailable_hours ?? 8),
+            placeholder: '默认 8',
+          }),
+          h('div', { className: 'text-muted mt-sm' }, '默认规则：连续 8 小时不可用则自动禁用；可按渠道覆盖')
+        ),
+
+        h('div', { className: 'mt-md', style: 'border:1px solid rgba(70,72,79,.25); border-radius:12px; padding:12px;' },
+          h('div', { className: 'flex items-center justify-between mb-sm' },
+            h('div', { className: 'font-headline' }, '模型重定向'),
+            h('div', { className: 'flex gap-sm' },
+              h('button', {
+                className: 'btn btn-ghost btn-sm',
+                type: 'button',
+                onClick: async () => {
+                  try {
+                    const apiBase = document.getElementById('ch-api-base').value;
+                    const firstEnabledKey = (keyPool.find(k => k.enabled && k.value?.trim()) || {}).value || '';
+                    const res = await api.discoverModels(apiBase, firstEnabledKey);
+                    if (!res.models || res.models.length === 0) {
+                      showToast('未拉取到模型，请检查 URL / API Key', 'warning');
+                      return;
+                    }
+                    pairs = res.models.map(m => ({ key: m, value: m }));
+                    renderPairs();
+                    showToast(`已拉取 ${res.models.length} 个模型`, 'success');
+                  } catch (e) {
+                    showToast(`拉取模型失败: ${e.message}`, 'error');
+                  }
+                },
+              }, '拉取模型'),
+              h('button', {
+                className: 'btn btn-ghost btn-sm',
+                type: 'button',
+                onClick: () => {
+                  const apiBase = document.getElementById('ch-api-base').value;
+                  pairs = inferTemplateByUrl(apiBase);
+                  renderPairs();
+                },
+              }, '填入模板')
+            )
           ),
           h('div', { className: 'mb-sm' },
             h('button', {
@@ -176,10 +249,11 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
           onClick: async () => {
             try {
               const selectVal = document.getElementById('ch-provider-type-select').value;
+              const customProviderType = (document.getElementById('ch-provider-type-custom').value || '').trim();
+              // 自定义渠道如果不填 provider_type，默认按 openai_compatible 保存，避免无法提交
               const providerType = selectVal === '__custom__'
-                ? (document.getElementById('ch-provider-type-custom').value || '').trim()
+                ? (customProviderType || 'openai_compatible')
                 : selectVal;
-              if (!providerType) throw new Error('请填写 provider_type');
 
               let models;
               if (mode === 'visual') {
@@ -189,6 +263,12 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
                 models = raw.trim() ? JSON.parse(raw) : {};
               }
 
+              const autoDisableHours = Number.parseInt((document.getElementById('ch-auto-disable-hours').value || '8').trim(), 10);
+              const normalizedAutoDisableHours = Number.isFinite(autoDisableHours)
+                ? Math.min(720, Math.max(1, autoDisableHours))
+                : 8;
+              const autoDisableEnabled = document.getElementById('ch-auto-disable-enabled').checked;
+
               const payload = {
                 id: (document.getElementById('ch-id').value || '').trim() || null,
                 display_name: (document.getElementById('ch-name').value || '').trim() || null,
@@ -196,8 +276,12 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
                 provider_type: providerType,
                 enabled: document.getElementById('ch-enabled').checked,
                 models,
-                api_keys: initial?.api_keys || [],
-                settings: initial?.settings || { rotation_mode: 'balanced', max_concurrent_requests_per_key: 1, ignore_models: [], whitelist_models: [] },
+                api_keys: initial ? (initial.api_keys || []) : keyPool.filter(k => k.id?.trim() && k.value?.trim()),
+                settings: {
+                  ...(initial?.settings || { rotation_mode: 'balanced', max_concurrent_requests_per_key: 1, ignore_models: [], whitelist_models: [] }),
+                  auto_disable_long_unavailable: autoDisableEnabled,
+                  auto_disable_unavailable_hours: normalizedAutoDisableHours,
+                },
               };
               await onSubmit(payload);
               modal.remove();
@@ -244,6 +328,49 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
     });
   }
 
+
+  function renderKeyPool() {
+    const box = modal.querySelector('#channel-key-pool');
+    if (!box) return;
+    box.innerHTML = '';
+
+    keyPool.forEach((k, idx) => {
+      box.appendChild(h('div', { className: 'flex items-center gap-sm mb-sm' },
+        h('input', {
+          className: 'input-field',
+          style: { width: '160px' },
+          value: k.id,
+          placeholder: 'key_id',
+          onInput: (e) => { k.id = e.target.value; }
+        }),
+        h('input', {
+          className: 'input-field',
+          style: { flex: '1' },
+          value: k.value,
+          placeholder: 'API Key Value',
+          onInput: (e) => { k.value = e.target.value; }
+        }),
+        h('label', { className: 'input-checkbox-label' },
+          h('input', {
+            type: 'checkbox',
+            checked: k.enabled,
+            onChange: (e) => { k.enabled = e.target.checked; }
+          }),
+          h('span', {}, '启用')
+        ),
+        h('button', {
+          className: 'btn btn-ghost btn-sm',
+          type: 'button',
+          onClick: () => {
+            keyPool.splice(idx, 1);
+            if (keyPool.length === 0) keyPool.push({ id: 'key_1', value: '', enabled: true });
+            renderKeyPool();
+          }
+        }, '删除')
+      ));
+    });
+  }
+
   function syncTabs() {
     const v = modal.querySelector('#models-visual-wrap');
     const r = modal.querySelector('#models-raw-wrap');
@@ -265,10 +392,7 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
     }
   }
 
-  modal.querySelector('#ch-provider-type-select').addEventListener('change', (e) => {
-    modal.querySelector('#provider-custom-wrap').style.display = e.target.value === '__custom__' ? 'block' : 'none';
-  });
-
+  renderKeyPool();
   renderPairs();
   syncTabs();
   return modal;
@@ -354,6 +478,21 @@ export async function renderChannels(container) {
         }, icon('check', 14), ' 新增渠道'),
         h('button', {
           className: 'btn btn-ghost btn-sm',
+          onClick: () => {
+            const modal = createChannelFormModal({
+              title: '新增渠道（先拉取模型）',
+              onSubmit: async (payload) => {
+                const res = await api.createChannel(payload);
+                const createdId = res?.config?.created_channel_id || res?.created_channel_id;
+                showToast(createdId ? `渠道创建成功: ${createdId}` : '渠道创建成功', 'success');
+                renderChannels(container);
+              }
+            });
+            document.body.appendChild(modal);
+          }
+        }, icon('refresh', 14), ' 拉取模型后新增'),
+        h('button', {
+          className: 'btn btn-ghost btn-sm',
           onClick: async () => {
             await api.applyAdminConfig();
             showToast('配置已应用并触发重载', 'success');
@@ -389,6 +528,12 @@ export async function renderChannels(container) {
         ),
 
         h('div', { className: 'channel-accordion-body' },
+          h('div', { className: 'flex gap-sm mb-md' },
+            h('span', { className: 'badge badge-sm badge-outline' },
+              `自动禁用: ${ch?.settings?.auto_disable_long_unavailable === false ? '关闭' : `开启(${ch?.settings?.auto_disable_unavailable_hours ?? 8}h)`}`
+            ),
+          ),
+
           h('div', { className: 'flex gap-sm mb-md' },
             h('button', {
               className: 'btn btn-ghost btn-sm',
@@ -439,20 +584,62 @@ export async function renderChannels(container) {
             h('button', {
               className: 'btn btn-ghost btn-sm',
               onClick: async () => {
+                try {
+                  const firstEnabledKey = (ch.api_keys || []).find(k => k.enabled)?.value || '';
+                  const res = await api.discoverModels(ch.api_base, firstEnabledKey);
+                  const models = (res.models || []).reduce((acc, m) => {
+                    acc[m] = { id: m };
+                    return acc;
+                  }, {});
+                  await api.updateChannel(ch.id, { models });
+                  showToast(`已拉取 ${res.models?.length || 0} 个模型并更新映射`, 'success');
+                  renderChannels(container);
+                } catch (e) {
+                  showToast(`拉取模型失败: ${e.message}`, 'error');
+                }
+              }
+            }, '拉取模型'),
+            h('button', {
+              className: 'btn btn-ghost btn-sm',
+              onClick: async () => {
                 const result = await api.testChannel(ch.id);
                 showToast(result.message || '测试完成', result.ok ? 'success' : 'warning');
               }
             }, '测试渠道')
           ),
 
+          (ch.api_keys || []).length > 0
+            ? h('div', { className: 'mt-sm mb-md' },
+              ...ch.api_keys.map((k) => {
+                const rt = k.runtime_status || (k.enabled ? 'active' : 'disabled');
+                const autoDisabled = !!k.auto_disabled;
+                const reason = k.auto_disabled_reason || '';
+                const at = k.auto_disabled_at
+                  ? new Date(k.auto_disabled_at * 1000).toLocaleString('zh-CN')
+                  : '';
+
+                return h('div', { className: 'text-muted text-body-sm mb-xs' },
+                  h('span', { className: 'text-mono' }, k.id || '-'),
+                  ' · 运行时状态: ',
+                  h('strong', {}, rt),
+                  autoDisabled
+                    ? h('span', { style: 'color: var(--error); margin-left: 8px;' },
+                      `自动禁用（${reason || 'long_unavailable'}）${at ? ` @ ${at}` : ''}`
+                    )
+                    : null
+                );
+              })
+            )
+            : null,
+
           KeyTable({
             credentials: (ch.api_keys || []).map(k => ({
               credential: `${k.id}:${k.value}`,
-              status: k.enabled ? 'active' : 'exhausted',
+              status: (k.runtime_status || (k.enabled ? 'active' : 'disabled')),
               requests: 0,
               tokens: {},
               approx_cost: 0,
-              cooldown_until: null,
+              cooldown_until: k.key_cooldown_until || null,
             })),
             onForceRefresh: async () => {
               await api.refreshQuota('force_refresh', 'provider', ch.id);

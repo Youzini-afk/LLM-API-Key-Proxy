@@ -26,6 +26,8 @@ class ChannelKeyConfig(BaseModel):
 class ChannelSettingsConfig(BaseModel):
     rotation_mode: RotationMode = "balanced"
     max_concurrent_requests_per_key: int = Field(default=1, ge=1)
+    auto_disable_long_unavailable: bool = True
+    auto_disable_unavailable_hours: int = Field(default=8, ge=1, le=720)
     ignore_models: List[str] = Field(default_factory=list)
     whitelist_models: List[str] = Field(default_factory=list)
 

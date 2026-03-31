@@ -283,6 +283,10 @@ class AdminService:
             env[f"MAX_CONCURRENT_REQUESTS_PER_KEY_{prefix}"] = str(
                 ch.settings.max_concurrent_requests_per_key
             )
+            env[f"AUTO_DISABLE_LONG_UNAVAILABLE_{prefix}"] = (
+                "true" if ch.settings.auto_disable_long_unavailable else "false"
+            )
+            env[f"AUTO_DISABLE_UNAVAILABLE_HOURS_{prefix}"] = str(ch.settings.auto_disable_unavailable_hours)
             if ch.settings.ignore_models:
                 env[f"IGNORE_MODELS_{prefix}"] = ",".join(ch.settings.ignore_models)
             if ch.settings.whitelist_models:

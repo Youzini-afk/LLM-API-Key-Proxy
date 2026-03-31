@@ -146,6 +146,16 @@ class ProxyAPI {
     });
   }
 
+  async discoverModels(apiBase, apiKey = '') {
+    return this.request('/admin/discover-models', {
+      method: 'POST',
+      body: JSON.stringify({
+        api_base: apiBase,
+        api_key: apiKey,
+      }),
+    });
+  }
+
   async getVirtualModels() {
     return this.request('/admin/virtual-models');
   }

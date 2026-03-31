@@ -107,13 +107,19 @@ def test_admin_service_runtime_overlay(monkeypatch, tmp_path):
     _, admin_service_mod = _reload_modules(monkeypatch, tmp_path)
     service = admin_service_mod.AdminService()
 
-    from proxy_app.admin_schemas import ChannelKeyConfig
+    from proxy_app.admin_schemas import ChannelKeyConfig, ChannelSettingsConfig
 
     service.create_channel(
         admin_service_mod.ChannelCreateRequest(
             id="dashscope_a",
             api_base="https://example.com/v1",
             provider_type="openai_compatible",
+            settings=ChannelSettingsConfig(
+                rotation_mode="balanced",
+                max_concurrent_requests_per_key=1,
+                auto_disable_long_unavailable=True,
+                auto_disable_unavailable_hours=12,
+            ),
             models={"kimi2.5": {"id": "kimi-k2"}},
             api_keys=[ChannelKeyConfig(id="k1", value="abc123")],
         )
@@ -123,3 +129,5 @@ def test_admin_service_runtime_overlay(monkeypatch, tmp_path):
     assert overlay["DASHSCOPE_A_API_BASE"] == "https://example.com/v1"
     assert overlay["DASHSCOPE_A_API_KEY_1"] == "abc123"
     assert "DASHSCOPE_A_MODELS" in overlay
+    assert overlay["AUTO_DISABLE_LONG_UNAVAILABLE_DASHSCOPE_A"] == "true"
+    assert overlay["AUTO_DISABLE_UNAVAILABLE_HOURS_DASHSCOPE_A"] == "12"

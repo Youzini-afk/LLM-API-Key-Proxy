@@ -125,3 +125,14 @@ COOLDOWN_TRANSIENT_ERROR: int = 30
 
 # Default rate limit cooldown when retry_after not provided (seconds)
 COOLDOWN_RATE_LIMIT_DEFAULT: int = 60
+
+# Auto-disable a credential if it remains unavailable (cooldown) for long duration.
+# This applies a durable key-level cooldown to prevent repeated selection attempts.
+# Override globally: AUTO_DISABLE_UNAVAILABLE_HOURS=<hours>
+# Override per provider: AUTO_DISABLE_UNAVAILABLE_HOURS_{PROVIDER}=<hours>
+DEFAULT_AUTO_DISABLE_UNAVAILABLE_HOURS: int = 8
+
+# Whether auto-disable for long unavailability is enabled by default.
+# Override globally: AUTO_DISABLE_LONG_UNAVAILABLE=true/false
+# Override per provider: AUTO_DISABLE_LONG_UNAVAILABLE_{PROVIDER}=true/false
+DEFAULT_AUTO_DISABLE_LONG_UNAVAILABLE: bool = True

@@ -122,7 +122,7 @@ with _console.status("[dim]Loading core dependencies...", spinner="dots"):
     from dotenv import load_dotenv
     import colorlog
     import json
-    from typing import AsyncGenerator, Any, List, Optional, Union
+    from typing import AsyncGenerator, Any, Dict, List, Optional, Union
     from pydantic import BaseModel, ConfigDict, Field
     from proxy_app.admin_schemas import (
         ChannelCreateRequest,
@@ -710,6 +710,16 @@ api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 def get_rotating_client(request: Request) -> RotatingClient:
     """Dependency to get the rotating client instance from the app state."""
     return request.app.state.rotating_client
+
+
+def _key_status_from_cred_entry(cred: Dict[str, Any]) -> str:
+    """Map usage credential entry status to frontend key status labels."""
+    status = (cred.get("status") or "active").strip().lower()
+    if status == "disabled":
+        return "disabled"
+    if status == "cooldown":
+        return "cooldown"
+    return "active" if status == "active" else "exhausted"
 
 
 def get_embedding_batcher(request: Request) -> EmbeddingBatcher:
@@ -1634,7 +1644,71 @@ async def admin_apply_config(_=Depends(verify_admin_api_key)):
 
 @app.get("/admin/channels")
 async def admin_list_channels(_=Depends(verify_admin_api_key)):
-    return {"channels": admin_service.list_channels()}
+    channels = admin_service.list_channels()
+
+    # Enrich key states from runtime usage stats so UI can expose auto-disabled reason/time.
+    # Fail-soft: if stats fetch fails, return config-only payload.
+    key_state_map: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    try:
+        stats = await app.state.rotating_client.get_quota_stats()
+        providers = (stats or {}).get("providers", {})
+
+        for provider_id, provider_data in providers.items():
+            provider_states: Dict[str, Dict[str, Any]] = {}
+            for cred in (provider_data or {}).get("credentials", []):
+                identifier = (cred.get("identifier") or "").strip()
+                if not identifier:
+                    continue
+
+                key_id = None
+                if identifier.startswith("key:"):
+                    # Optional future format if backend returns canonical key id
+                    key_id = identifier.split(":", 1)[1].strip()
+                elif ":" in identifier:
+                    # Backward compatibility if identifier carries "key_id:masked_value"
+                    key_id = identifier.split(":", 1)[0].strip()
+
+                if not key_id:
+                    continue
+
+                provider_states[key_id] = {
+                    "status": _key_status_from_cred_entry(cred),
+                    "auto_disabled": bool(cred.get("auto_disabled")),
+                    "auto_disabled_reason": cred.get("auto_disabled_reason"),
+                    "auto_disabled_at": cred.get("auto_disabled_at"),
+                    "key_cooldown_until": cred.get("key_cooldown_until"),
+                }
+
+            if provider_states:
+                key_state_map[provider_id] = provider_states
+    except Exception:
+        key_state_map = {}
+
+    # Merge runtime key states into admin channel config response
+    merged_channels = []
+    for ch in channels:
+        channel_id = (ch.get("id") or "").strip()
+        runtime_states = key_state_map.get(channel_id, {})
+        keys = []
+        for k in ch.get("api_keys", []):
+            key_id = (k.get("id") or "").strip()
+            state = runtime_states.get(key_id)
+            merged_key = dict(k)
+            if state:
+                merged_key["runtime_status"] = state.get("status")
+                merged_key["auto_disabled"] = state.get("auto_disabled")
+                merged_key["auto_disabled_reason"] = state.get("auto_disabled_reason")
+                merged_key["auto_disabled_at"] = state.get("auto_disabled_at")
+                merged_key["key_cooldown_until"] = state.get("key_cooldown_until")
+            else:
+                merged_key["runtime_status"] = "active" if merged_key.get("enabled") else "disabled"
+            keys.append(merged_key)
+
+        merged_channel = dict(ch)
+        merged_channel["api_keys"] = keys
+        merged_channels.append(merged_channel)
+
+    return {"channels": merged_channels}
 
 
 @app.post("/admin/channels")
@@ -1729,6 +1803,45 @@ async def admin_test_channel(channel_id: str, _=Depends(verify_admin_api_key)):
         "enabled_keys": len(enabled_keys),
         "models": list(channel.models.keys()),
     }
+
+
+@app.post("/admin/discover-models")
+async def admin_discover_models(request: Request, _=Depends(verify_admin_api_key)):
+    """Discover models from an OpenAI-compatible endpoint using /models."""
+    import httpx
+
+    from proxy_app.admin_service import admin_service
+
+    body = await request.json()
+    api_base = (body.get("api_base") or "").strip()
+    api_key = (body.get("api_key") or "").strip()
+
+    if not api_base:
+        raise HTTPException(status_code=400, detail="api_base is required")
+
+    try:
+        normalized_base = admin_service._normalize_api_base(api_base)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    url = f"{normalized_base}/models"
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            models = [m.get("id") for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
+            return {
+                "ok": True,
+                "api_base": normalized_base,
+                "models": models,
+            }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to discover models: {e}")
 
 
 @app.get("/admin/virtual-models")

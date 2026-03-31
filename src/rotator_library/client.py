@@ -52,6 +52,8 @@ from .config import (
     DEFAULT_ROTATION_TOLERANCE,
     DEFAULT_FAIR_CYCLE_DURATION,
     DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD,
+    DEFAULT_AUTO_DISABLE_UNAVAILABLE_HOURS,
+    DEFAULT_AUTO_DISABLE_LONG_UNAVAILABLE,
     DEFAULT_SEQUENTIAL_FALLBACK_MULTIPLIER,
 )
 
@@ -286,6 +288,8 @@ class RotatingClient:
         fair_cycle_tracking_mode: Dict[str, str] = {}
         fair_cycle_cross_tier: Dict[str, bool] = {}
         fair_cycle_duration: Dict[str, int] = {}
+        auto_disable_unavailable_hours: Dict[str, int] = {}
+        auto_disable_long_unavailable: Dict[str, bool] = {}
 
         for provider in self.all_credentials.keys():
             provider_class = self._provider_plugins.get(provider)
@@ -388,6 +392,53 @@ class RotatingClient:
             elif global_threshold != DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD:
                 # Use global threshold if set and different from default
                 exhaustion_cooldown_threshold[provider] = global_threshold
+
+        # Build auto-disable settings per provider
+        global_auto_disable_hours = DEFAULT_AUTO_DISABLE_UNAVAILABLE_HOURS
+        global_auto_disable_hours_str = os.getenv("AUTO_DISABLE_UNAVAILABLE_HOURS")
+        if global_auto_disable_hours_str:
+            try:
+                global_auto_disable_hours = max(1, int(global_auto_disable_hours_str))
+            except ValueError:
+                lib_logger.warning(
+                    f"Invalid AUTO_DISABLE_UNAVAILABLE_HOURS: {global_auto_disable_hours_str}. Using default {DEFAULT_AUTO_DISABLE_UNAVAILABLE_HOURS}."
+                )
+
+        global_auto_disable_enabled = DEFAULT_AUTO_DISABLE_LONG_UNAVAILABLE
+        global_auto_disable_enabled_str = os.getenv("AUTO_DISABLE_LONG_UNAVAILABLE")
+        if global_auto_disable_enabled_str is not None:
+            global_auto_disable_enabled = global_auto_disable_enabled_str.lower() in (
+                "true",
+                "1",
+                "yes",
+            )
+
+        for provider in self.all_credentials.keys():
+            # hours
+            provider_hours_key = f"AUTO_DISABLE_UNAVAILABLE_HOURS_{provider.upper()}"
+            provider_hours_val = os.getenv(provider_hours_key)
+            if provider_hours_val is not None:
+                try:
+                    auto_disable_unavailable_hours[provider] = max(1, int(provider_hours_val))
+                except ValueError:
+                    lib_logger.warning(
+                        f"Invalid {provider_hours_key}: {provider_hours_val}. Must be integer."
+                    )
+                    auto_disable_unavailable_hours[provider] = global_auto_disable_hours
+            else:
+                auto_disable_unavailable_hours[provider] = global_auto_disable_hours
+
+            # enabled
+            provider_enabled_key = f"AUTO_DISABLE_LONG_UNAVAILABLE_{provider.upper()}"
+            provider_enabled_val = os.getenv(provider_enabled_key)
+            if provider_enabled_val is not None:
+                auto_disable_long_unavailable[provider] = provider_enabled_val.lower() in (
+                    "true",
+                    "1",
+                    "yes",
+                )
+            else:
+                auto_disable_long_unavailable[provider] = global_auto_disable_enabled
 
         # Log fair cycle configuration
         for provider, enabled in fair_cycle_enabled.items():
@@ -508,6 +559,8 @@ class RotatingClient:
             fair_cycle_duration=fair_cycle_duration,
             exhaustion_cooldown_threshold=exhaustion_cooldown_threshold,
             custom_caps=custom_caps,
+            auto_disable_unavailable_hours=auto_disable_unavailable_hours,
+            auto_disable_long_unavailable=auto_disable_long_unavailable,
         )
         self._model_list_cache = {}
         self.http_client = httpx.AsyncClient()

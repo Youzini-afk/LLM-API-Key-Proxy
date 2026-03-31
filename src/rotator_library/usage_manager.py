@@ -85,6 +85,8 @@ class UsageManager:
         custom_caps: Optional[
             Dict[str, Dict[Union[int, Tuple[int, ...], str], Dict[str, Dict[str, Any]]]]
         ] = None,
+        auto_disable_unavailable_hours: Optional[Dict[str, int]] = None,
+        auto_disable_long_unavailable: Optional[Dict[str, bool]] = None,
     ):
         """
         Initialize the UsageManager.
@@ -126,6 +128,11 @@ class UsageManager:
             custom_caps: Dict mapping provider -> tier -> model/group -> cap config.
                 Allows setting custom usage limits per tier, per model or quota group.
                 See ProviderInterface.default_custom_caps for format details.
+            auto_disable_unavailable_hours: Dict mapping provider -> hours threshold.
+                If a credential cooldown is longer than this threshold, it is auto-disabled
+                via key-level cooldown to avoid repeated selection attempts.
+            auto_disable_long_unavailable: Dict mapping provider -> bool toggle for
+                long-unavailable auto-disable behavior.
         """
         # Resolve file_path - use default if not provided
         if file_path is None:
@@ -153,6 +160,8 @@ class UsageManager:
         self.custom_caps = custom_caps or {}
         # In-memory cycle state: {provider: {tier_key: {tracking_key: {"cycle_started_at": float, "exhausted": Set[str]}}}}
         self._cycle_exhausted: Dict[str, Dict[str, Dict[str, Dict[str, Any]]]] = {}
+        self.auto_disable_unavailable_hours = auto_disable_unavailable_hours or {}
+        self.auto_disable_long_unavailable = auto_disable_long_unavailable or {}
 
         self._data_lock = asyncio.Lock()
         self._usage_data: Optional[Dict] = None
@@ -245,6 +254,88 @@ class UsageManager:
         return self.exhaustion_cooldown_threshold.get(
             provider, DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD
         )
+
+    def _is_auto_disable_long_unavailable_enabled(self, provider: str) -> bool:
+        """Check whether long-unavailable auto-disable is enabled for provider."""
+        return self.auto_disable_long_unavailable.get(provider, True)
+
+    def _get_auto_disable_unavailable_seconds(self, provider: str) -> int:
+        """Get auto-disable threshold in seconds for provider."""
+        hours = self.auto_disable_unavailable_hours.get(provider, 8)
+        try:
+            hours = int(hours)
+        except Exception:
+            hours = 8
+        return max(1, hours) * 3600
+
+    def _update_long_unavailable_state(
+        self,
+        key: str,
+        key_data: Dict[str, Any],
+        now_ts: float,
+    ) -> None:
+        """
+        Track continuous unavailability and auto-disable key when threshold exceeded.
+
+        Unavailability is considered active when either:
+        - key_cooldown_until > now
+        - any model cooldown > now
+        """
+        provider = self._get_provider_from_credential(key)
+        if not provider:
+            return
+
+        key_cooldown_until = key_data.get("key_cooldown_until") or 0
+        model_cooldowns = key_data.get("model_cooldowns", {}) or {}
+        max_model_cooldown = 0
+        if isinstance(model_cooldowns, dict) and model_cooldowns:
+            max_model_cooldown = max(
+                [v for v in model_cooldowns.values() if isinstance(v, (int, float))],
+                default=0,
+            )
+
+        unavailable = key_cooldown_until > now_ts or max_model_cooldown > now_ts
+        if not unavailable:
+            key_data["unavailable_since_ts"] = None
+            return
+
+        if key_data.get("unavailable_since_ts") is None:
+            key_data["unavailable_since_ts"] = now_ts
+
+        if not self._is_auto_disable_long_unavailable_enabled(provider):
+            return
+
+        threshold_seconds = self._get_auto_disable_unavailable_seconds(provider)
+
+        # Fast path: current active cooldown itself already exceeds threshold.
+        # Example: quota reset cooldown is 12h and threshold is 8h.
+        remaining_unavailable = max(key_cooldown_until, max_model_cooldown) - now_ts
+        if remaining_unavailable >= threshold_seconds:
+            unavailable_seconds = threshold_seconds
+        else:
+            # Slow path: accumulate continuously unavailable duration across retries.
+            unavailable_seconds = now_ts - float(
+                key_data.get("unavailable_since_ts") or now_ts
+            )
+        if unavailable_seconds < threshold_seconds:
+            return
+
+        # Apply durable lockout as "auto-disabled" marker (can be recovered by config update/reload)
+        durable_lock_seconds = 365 * 24 * 3600
+        durable_until = now_ts + durable_lock_seconds
+        key_data["key_cooldown_until"] = max(key_cooldown_until, durable_until)
+        key_data["auto_disabled"] = True
+        key_data["auto_disabled_at"] = now_ts
+        key_data["auto_disabled_reason"] = (
+            f"unavailable>{int(threshold_seconds/3600)}h"
+        )
+
+    def _clear_long_unavailable_state(self, key_data: Dict[str, Any]) -> None:
+        """Reset long-unavailable tracking on successful usage."""
+        key_data["unavailable_since_ts"] = None
+        key_data["auto_disabled"] = False
+        key_data["auto_disabled_at"] = None
+        key_data["auto_disabled_reason"] = None
 
     # =========================================================================
     # CUSTOM CAPS HELPERS
@@ -2835,6 +2926,7 @@ class UsageManager:
             # Reset failures for this model
             model_failures = key_data.setdefault("failures", {}).setdefault(model, {})
             model_failures["consecutive_failures"] = 0
+            self._clear_long_unavailable_state(key_data)
 
             # Clear transient cooldown on success (but NOT quota_reset_ts)
             if model in key_data.get("model_cooldowns", {}):
@@ -3230,6 +3322,8 @@ class UsageManager:
                 "model": model,
                 "error": str(classified_error.original_exception),
             }
+
+            self._update_long_unavailable_state(key, key_data, now_ts)
 
         await self._save_usage()
 
@@ -3642,6 +3736,10 @@ class UsageManager:
                 if key_cooldown > now_ts:
                     key_cooldown_remaining = int(key_cooldown - now_ts)
 
+                auto_disabled = bool(cred_data.get("auto_disabled"))
+                auto_disabled_at = cred_data.get("auto_disabled_at")
+                auto_disabled_reason = cred_data.get("auto_disabled_reason")
+
                 has_active_cooldown = key_cooldown > now_ts or len(active_cooldowns) > 0
 
                 # Check if exhausted (all quota groups exhausted for Antigravity)
@@ -3659,7 +3757,10 @@ class UsageManager:
                     if all_exhausted and len(models_data) > 0:
                         is_exhausted = True
 
-                if is_exhausted:
+                if auto_disabled:
+                    # Explicitly auto-disabled due to long unavailability threshold.
+                    status = "disabled"
+                elif is_exhausted:
                     prov_stats["exhausted_count"] += 1
                     status = "exhausted"
                 elif has_active_cooldown:
@@ -3770,6 +3871,11 @@ class UsageManager:
                     cred_entry["key_cooldown_remaining"] = key_cooldown_remaining
                 if active_cooldowns:
                     cred_entry["model_cooldowns"] = active_cooldowns
+                if auto_disabled:
+                    cred_entry["auto_disabled"] = True
+                    cred_entry["auto_disabled_at"] = auto_disabled_at
+                    cred_entry["auto_disabled_reason"] = auto_disabled_reason
+                    cred_entry["key_cooldown_until"] = key_cooldown
 
                 # Add global stats for this credential
                 if include_global:
