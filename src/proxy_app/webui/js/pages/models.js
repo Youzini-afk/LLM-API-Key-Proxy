@@ -1,7 +1,7 @@
 // ============================================================
 // Models Page — 模型列表
 // ============================================================
-import { h, clearChildren } from '../utils/dom.js';
+import { h, clearChildren, icon } from '../utils/dom.js';
 import { api } from '../api.js';
 import { formatCost, getStrategyLabel } from '../utils/format.js';
 import { RouteChain } from '../components/ui.js';
@@ -27,7 +27,7 @@ export async function renderModels(container) {
 
     // Page header with search
     page.appendChild(h('div', { className: 'page-title' },
-      h('span', { className: 'page-title-icon' }, '🤖'),
+      h('span', { className: 'page-title-icon' }, icon('robot', 24)),
       '模型列表',
       h('div', { className: 'page-actions' },
         h('input', {
@@ -51,7 +51,7 @@ export async function renderModels(container) {
     // --- Virtual Models Section ---
     const virtualSection = h('div', { className: 'section', id: 'virtual-models-section' });
     virtualSection.appendChild(h('div', { className: 'section-title' },
-      h('span', { className: 'section-title-icon' }, '🔀'),
+      h('span', { className: 'section-title-icon' }, icon('route', 20)),
       '虚拟模型 (聚合路由)'
     ));
 
@@ -61,7 +61,7 @@ export async function renderModels(container) {
     // --- Provider Models Section ---
     const providerSection = h('div', { className: 'section', id: 'provider-models-section' });
     providerSection.appendChild(h('div', { className: 'section-title' },
-      h('span', { className: 'section-title-icon' }, '📋'),
+      h('span', { className: 'section-title-icon' }, icon('list', 20)),
       '全部模型',
       h('span', { className: 'section-subtitle', id: 'model-count' })
     ));

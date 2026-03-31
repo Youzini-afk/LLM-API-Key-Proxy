@@ -1,7 +1,4 @@
-// ============================================================
-// Toast Notification Component
-// ============================================================
-import { h } from '../utils/dom.js';
+import { h, icon } from '../utils/dom.js';
 
 let toastContainer = null;
 
@@ -24,15 +21,15 @@ function ensureContainer() {
  */
 export function showToast(message, type = 'info', duration = 3000) {
   const container = ensureContainer();
-  const typeIcons = {
-    info: 'ℹ️',
-    success: '✅',
-    warning: '⚠️',
-    error: '❌',
+  const typeIconMap = {
+    info: 'info',
+    success: 'checkCircle',
+    warning: 'warning',
+    error: 'error',
   };
 
   const toast = h('div', { className: `toast toast-${type}` },
-    h('span', { className: 'toast-icon' }, typeIcons[type] || 'ℹ️'),
+    h('span', { className: 'toast-icon' }, icon(typeIconMap[type] || 'info', 18)),
     h('span', { className: 'toast-message' }, message),
     h('button', {
       className: 'toast-close',

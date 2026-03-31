@@ -1,7 +1,7 @@
 // ============================================================
 // Stats Page — 统计分析
 // ============================================================
-import { h, clearChildren } from '../utils/dom.js';
+import { h, clearChildren, icon } from '../utils/dom.js';
 import { api } from '../api.js';
 import { formatNumber, formatTokens, formatCost, formatPercent } from '../utils/format.js';
 import { StatCard, BarChart } from '../components/ui.js';
@@ -19,7 +19,7 @@ export async function renderStats(container) {
 
     // Page header
     page.appendChild(h('div', { className: 'page-title' },
-      h('span', { className: 'page-title-icon' }, '📈'),
+      h('span', { className: 'page-title-icon' }, icon('stats', 24)),
       '统计分析'
     ));
 
@@ -72,10 +72,10 @@ export async function renderStats(container) {
 
     // --- Summary Cards ---
     const statsGrid = h('div', { className: 'stat-grid' },
-      StatCard({ title: '总请求', value: formatNumber(totalRequests), subtitle: `成功率 ~96%`, icon: '📊', accentColor: 'var(--primary)' }),
-      StatCard({ title: '输入 Token', value: formatTokens(totalInputTokens), subtitle: `${cachePercent}% 缓存命中`, icon: '📥', accentColor: 'var(--secondary)' }),
-      StatCard({ title: '输出 Token', value: formatTokens(totalOutputTokens), icon: '📤', accentColor: 'var(--primary)' }),
-      StatCard({ title: '估算总费用', value: formatCost(totalCost), icon: '💰', accentColor: 'var(--tertiary)' })
+      StatCard({ title: '总请求', value: formatNumber(totalRequests), subtitle: `成功率 ~96%`, icon: icon('chart', 20), accentColor: 'var(--primary)' }),
+      StatCard({ title: '输入 Token', value: formatTokens(totalInputTokens), subtitle: `${cachePercent}% 缓存命中`, icon: icon('inbox', 20), accentColor: 'var(--secondary)' }),
+      StatCard({ title: '输出 Token', value: formatTokens(totalOutputTokens), icon: icon('outbox', 20), accentColor: 'var(--primary)' }),
+      StatCard({ title: '估算总费用', value: formatCost(totalCost), icon: icon('wallet', 20), accentColor: 'var(--tertiary)' })
     );
     page.appendChild(statsGrid);
 

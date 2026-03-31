@@ -1,7 +1,7 @@
 // ============================================================
 // Dashboard Page — 仪表盘总览
 // ============================================================
-import { h, clearChildren } from '../utils/dom.js';
+import { h, clearChildren, icon } from '../utils/dom.js';
 import { api } from '../api.js';
 import { formatNumber, formatTokens, formatCost } from '../utils/format.js';
 import { StatCard, ChannelCard, RouteChain } from '../components/ui.js';
@@ -70,28 +70,28 @@ export async function renderDashboard(container) {
         title: '系统状态',
         value: '运行中',
         subtitle: `${providerCount} 个渠道在线`,
-        icon: '⚡',
+        icon: icon('bolt', 20),
         accentColor: 'var(--secondary)',
       }),
       StatCard({
         title: '活跃渠道',
         value: `${providerCount}`,
         subtitle: '全部在线',
-        icon: '🔗',
+        icon: icon('link', 20),
         accentColor: 'var(--primary)',
       }),
       StatCard({
         title: 'Key 状态',
         value: `${totalCreds}`,
         subtitle: `${activeCreds} 活跃 · ${cooldownCreds} 冷却 · ${exhaustedCreds} 耗尽`,
-        icon: '🔑',
+        icon: icon('key', 20),
         accentColor: exhaustedCreds > 0 ? 'var(--tertiary)' : 'var(--secondary)',
       }),
       StatCard({
         title: '请求总数',
         value: formatNumber(totalRequests),
         subtitle: `${formatCost(totalCost)} 估算费用`,
-        icon: '📊',
+        icon: icon('chart', 20),
         accentColor: 'var(--primary)',
       })
     );
@@ -99,7 +99,7 @@ export async function renderDashboard(container) {
     // --- Channel Health ---
     const channelSection = h('div', { className: 'section' },
       h('div', { className: 'section-title' },
-        h('span', { className: 'section-title-icon' }, '💎'),
+        h('span', { className: 'section-title-icon' }, icon('diamond', 20)),
         '渠道健康'
       )
     );
@@ -127,7 +127,7 @@ export async function renderDashboard(container) {
     // --- Virtual Model Routes ---
     const virtualSection = h('div', { className: 'section' },
       h('div', { className: 'section-title' },
-        h('span', { className: 'section-title-icon' }, '🔀'),
+        h('span', { className: 'section-title-icon' }, icon('route', 20)),
         '虚拟模型路由'
       )
     );

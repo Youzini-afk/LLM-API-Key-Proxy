@@ -1,7 +1,7 @@
 // ============================================================
 // Auth Modal Component
 // ============================================================
-import { h, $ } from '../utils/dom.js';
+import { h, $, icon } from '../utils/dom.js';
 import { api } from '../api.js';
 import { showToast } from './toast.js';
 
@@ -32,7 +32,7 @@ export function showAuthModal() {
     const overlay = h('div', { id: 'auth-modal', className: 'modal-overlay' },
       h('div', { className: 'modal-card' },
         h('div', { className: 'modal-header' },
-          h('span', { className: 'modal-icon' }, '🔐'),
+          h('span', { className: 'modal-icon' }, icon('lock', 28)),
           h('h2', { className: 'modal-title' }, '连接到代理服务')
         ),
         h('p', { className: 'modal-desc' }, '请输入您的 PROXY_API_KEY 进行身份验证。此密钥与 API 访问密钥相同。'),

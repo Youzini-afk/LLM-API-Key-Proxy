@@ -20,7 +20,7 @@ export async function renderChannels(container) {
 
     // Page header
     page.appendChild(h('div', { className: 'page-title' },
-      h('span', { className: 'page-title-icon' }, '🔗'),
+      h('span', { className: 'page-title-icon' }, icon('link', 24)),
       '渠道管理',
       h('div', { className: 'page-actions' },
         h('button', { className: 'btn btn-ghost btn-sm', id: 'btn-expand-all' }, '全部展开'),
