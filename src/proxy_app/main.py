@@ -678,6 +678,21 @@ app.add_middleware(
     allow_methods=["*"],  # Allows all methods
     allow_headers=["*"],  # Allows all headers
 )
+
+# --- WebUI Static Files ---
+_webui_dir = Path(__file__).parent / "webui"
+if _webui_dir.is_dir():
+    app.mount("/webui/css", StaticFiles(directory=_webui_dir / "css"), name="webui_css")
+    app.mount("/webui/js", StaticFiles(directory=_webui_dir / "js"), name="webui_js")
+
+    @app.get("/webui")
+    @app.get("/webui/")
+    async def serve_webui():
+        """Serve the WebUI control panel."""
+        return FileResponse(_webui_dir / "index.html")
+
+    logging.info(f"📊 WebUI available at http://{{args.host}}:{{args.port}}/webui/")
+
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
 
