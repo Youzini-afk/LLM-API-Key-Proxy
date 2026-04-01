@@ -711,7 +711,12 @@ class ProviderConfig:
     def is_custom_provider(self, provider: str) -> bool:
         """Check if provider is a custom OpenAI-compatible provider."""
         runtime_provider = self.get_runtime_provider(provider)
-        if runtime_provider in {"custom", "openai_compatible"}:
+        # IMPORTANT:
+        # - "openai_compatible" is a first-class runtime provider type for channel aliases
+        #   and should NOT be treated as dynamic custom provider.
+        # - Only explicit "custom" runtime type or discovered unknown *_API_BASE providers
+        #   should be considered custom providers.
+        if runtime_provider == "custom":
             return True
         return provider.lower() in self._custom_providers
 
@@ -763,8 +768,18 @@ class ProviderConfig:
                     kwargs["api_base"] = api_base
                 return kwargs
 
-        # Custom provider - route through OpenAI-compatible endpoint
-        # (requires api_base to be meaningful).
+        # Explicit openai_compatible runtime type:
+        # map channel alias model to openai/* while preserving channel-specific api_base.
+        if runtime_provider == "openai_compatible":
+            model_name = kwargs["model"].split("/", 1)[1] if "/" in kwargs["model"] else kwargs["model"]
+            kwargs["model"] = f"openai/{model_name}"
+            if api_base:
+                kwargs["api_base"] = api_base
+            kwargs["custom_llm_provider"] = "openai"
+            return kwargs
+
+        # Custom provider - route through OpenAI-compatible endpoint.
+        # Requires api_base to be meaningful.
         if not api_base:
             return kwargs
 

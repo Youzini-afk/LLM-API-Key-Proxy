@@ -64,6 +64,34 @@ def test_provider_config_runtime_provider_type_mapping(monkeypatch):
     assert out["custom_llm_provider"] == "openai"
 
 
+def test_provider_config_openai_compatible_not_custom_provider(monkeypatch):
+    from rotator_library.provider_config import ProviderConfig
+
+    monkeypatch.delenv("ALI_API_BASE", raising=False)
+    cfg = ProviderConfig(provider_type_overrides={"ali": "openai_compatible"})
+
+    # Regression: openai_compatible must NOT be treated as dynamic custom provider
+    # requiring ALI_API_BASE.
+    assert cfg.is_custom_provider("ali") is False
+
+
+def test_provider_config_explicit_custom_still_custom_provider(monkeypatch):
+    from rotator_library.provider_config import ProviderConfig
+
+    monkeypatch.delenv("ALI_API_BASE", raising=False)
+    cfg = ProviderConfig(provider_type_overrides={"ali": "custom"})
+
+    assert cfg.is_custom_provider("ali") is True
+
+
+def test_provider_config_openai_compatible_convert_without_forced_custom_detection(monkeypatch):
+    from rotator_library.provider_config import ProviderConfig
+
+    monkeypatch.setenv("ALI_API_BASE", "https://dashscope.example/v1")
+    cfg = ProviderConfig(provider_type_overrides={"ali": "openai_compatible"})
+    assert cfg.convert_for_litellm(model="ali/kimi-k2.5")["model"] == "openai/kimi-k2.5"
+
+
 @pytest.mark.asyncio
 async def test_usage_manager_public_identifier_redacts_raw_key(monkeypatch, tmp_path):
     if importlib.util.find_spec("litellm") is None or importlib.util.find_spec("aiofiles") is None:

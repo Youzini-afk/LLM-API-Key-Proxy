@@ -947,13 +947,17 @@ class RotatingClient:
                     provider_class,
                 )
             elif self._is_custom_openai_compatible_provider(provider_name):
-                # Create a generic OpenAI-compatible provider for custom providers
+                # Create a generic OpenAI-compatible provider only for true custom providers.
+                # Runtime provider_type="openai_compatible" channel aliases should NOT hit this branch.
+                runtime_provider = self._get_runtime_provider_type(provider_name)
+                if runtime_provider == "openai_compatible":
+                    return None
                 try:
                     self._provider_instances[provider_name] = OpenAICompatibleProvider(
                         provider_name
                     )
                 except ValueError:
-                    # If the provider doesn't have the required environment variables, treat it as a standard provider
+                    # Missing <PROVIDER>_API_BASE for true custom providers -> no plugin instance.
                     return None
             else:
                 return None

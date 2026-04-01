@@ -895,27 +895,124 @@ def get_rotating_client(request: Request) -> RotatingClient:
     return request.app.state.rotating_client
 
 
-def _refresh_virtual_models_registry_from_admin() -> Dict[str, Any]:
-    """
-    Keep virtual model runtime registry in sync with current admin effective config.
+# --- Runtime Auto-Sync State ---
+_last_synced_admin_version: Optional[int] = None
+_managed_overlay_keys: set = set()
+_runtime_sync_lock = asyncio.Lock()
 
-    This avoids drift where /v1/models and request routing see different virtual model sets.
+
+async def _ensure_runtime_synced(app: FastAPI) -> Dict[str, Any]:
     """
+    Ensure the runtime (env vars, RotatingClient, virtual model registry) is in sync
+    with admin_config.json.
+
+    Uses config version tracking to avoid unnecessary work:
+    - If config version hasn't changed → just return current VM registry (fast path)
+    - If config version changed → full sync: apply env overlay, reload VM registry,
+      conditionally rebuild RotatingClient if new providers appeared
+
+    This replaces the old _refresh_virtual_models_registry_from_admin() which only
+    synced VIRTUAL_MODELS but NOT channel credentials, causing virtual model routing
+    to fail with "No API keys configured for provider" errors.
+    """
+    global _last_synced_admin_version, _managed_overlay_keys
     from proxy_app.virtual_models import load_virtual_models
 
     try:
-        overlay = admin_service.build_runtime_env_overlay()
-        vm_raw = (overlay.get("VIRTUAL_MODELS") or "").strip()
-        if vm_raw:
-            os.environ["VIRTUAL_MODELS"] = vm_raw
-        else:
-            os.environ.pop("VIRTUAL_MODELS", None)
-    except Exception as e:
-        logging.warning(
-            f"Failed to sync VIRTUAL_MODELS from admin overlay, fallback to existing env: {e}"
-        )
+        cfg = admin_service.get_config()
+        current_version = cfg.metadata.version
 
-    return load_virtual_models()
+        # Fast path: config unchanged since last sync
+        if _last_synced_admin_version == current_version:
+            return load_virtual_models()
+
+        # Config changed — acquire lock to prevent concurrent rebuilds
+        async with _runtime_sync_lock:
+            # Double-check after acquiring lock (another request might have synced)
+            if _last_synced_admin_version == current_version:
+                return load_virtual_models()
+
+            logging.info(
+                f"[AutoSync] Admin config version changed "
+                f"(v{_last_synced_admin_version} → v{current_version}), syncing runtime..."
+            )
+
+            # 1) Build and apply FULL env overlay (channels + virtual models + policies)
+            overlay = admin_service.build_runtime_env_overlay()
+            next_keys = set(overlay.keys())
+
+            # Clean stale env keys from previous overlay
+            for key in (_managed_overlay_keys - next_keys):
+                os.environ.pop(key, None)
+
+            # Apply new overlay
+            for k, v in overlay.items():
+                os.environ[k] = v
+            _managed_overlay_keys = next_keys
+
+            # 2) Reload virtual model registry
+            vm = load_virtual_models()
+
+            # 3) Check if RotatingClient needs rebuild
+            client = getattr(app.state, "rotating_client", None)
+            needs_rebuild = False
+
+            if client:
+                # Collect all providers referenced by virtual model targets
+                vm_providers = set()
+                for vm_config in vm.values():
+                    for target in vm_config.enabled_targets:
+                        vm_providers.add(target.provider)
+
+                # Also collect providers from overlay (channels that exist in admin config)
+                overlay_providers = set()
+                for key in next_keys:
+                    if "_API_KEY_" in key:
+                        # Skip API_KEY_ID_N vars (these are key identifiers, not credentials)
+                        suffix = key.split("_API_KEY_", 1)[1]
+                        if suffix.startswith("ID_"):
+                            continue
+                        # Only count actual credential vars (suffix is a digit like "1", "2", ...)
+                        if suffix.isdigit():
+                            provider_part = key.split("_API_KEY_")[0].lower()
+                            if provider_part:
+                                overlay_providers.add(provider_part)
+
+                all_needed = vm_providers | overlay_providers
+                current_providers = set(client.all_credentials.keys())
+
+                missing = all_needed - current_providers
+                if missing:
+                    logging.info(
+                        f"[AutoSync] RotatingClient missing providers: {sorted(missing)}. "
+                        f"Triggering rebuild..."
+                    )
+                    needs_rebuild = True
+                else:
+                    # Even if providers exist, credentials might have changed
+                    # (keys added/removed/toggled). Rebuild to pick up changes.
+                    # We only rebuild if the overlay actually has provider credentials.
+                    if overlay_providers:
+                        needs_rebuild = True
+                        logging.info(
+                            "[AutoSync] Config version changed with active channels. "
+                            "Rebuilding RotatingClient to pick up credential changes..."
+                        )
+
+            if needs_rebuild:
+                await rebuild_runtime_client(app)
+
+            _last_synced_admin_version = current_version
+            logging.info(
+                f"[AutoSync] Runtime synced to v{current_version}. "
+                f"VM={len(vm)} model(s), overlay={len(next_keys)} key(s), "
+                f"rebuilt={'yes' if needs_rebuild else 'no'}"
+            )
+            return vm
+
+    except Exception as e:
+        logging.warning(f"[AutoSync] Sync failed, using existing state: {e}")
+        return load_virtual_models()
 
 
 def _key_status_from_cred_entry(cred: Dict[str, Any]) -> str:
@@ -1189,7 +1286,7 @@ async def chat_completions(
             execute_virtual_completion, execute_virtual_completion_streaming,
         )
 
-        _refresh_virtual_models_registry_from_admin()
+        await _ensure_runtime_synced(request.app)
         # Read and parse the request body only once at the beginning.
         try:
             request_data = await request.json()
@@ -1632,7 +1729,7 @@ async def list_models(
     # 仅返回虚拟模型名（含自动生成虚拟模型）
     # 优先使用 admin_service 的“有效虚拟模型”视图，避免依赖 runtime env 已应用。
     # 同时同步一次 runtime registry，保证列表展示与请求路由命中一致。
-    _refresh_virtual_models_registry_from_admin()
+    await _ensure_runtime_synced(request.app)
 
     try:
         virtual_models_map = admin_service.list_virtual_models() or {}
