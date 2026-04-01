@@ -25,6 +25,7 @@ def _stub_litellm_modules(monkeypatch):
     fake_litellm.ModelResponse = _ModelResp
     fake_litellm.EmbeddingResponse = _EmbeddingResp
     fake_litellm.InvalidRequestError = _BaseErr
+    fake_litellm.BadRequestError = _BaseErr
     fake_litellm.ContextWindowExceededError = _BaseErr
     fake_litellm.AuthenticationError = _BaseErr
     fake_litellm.RateLimitError = _BaseErr
@@ -40,6 +41,15 @@ def _stub_litellm_modules(monkeypatch):
 
     litellm_ex = types.ModuleType("litellm.exceptions")
     litellm_ex.APIConnectionError = _BaseErr
+    litellm_ex.RateLimitError = _BaseErr
+    litellm_ex.ServiceUnavailableError = _BaseErr
+    litellm_ex.AuthenticationError = _BaseErr
+    litellm_ex.InvalidRequestError = _BaseErr
+    litellm_ex.BadRequestError = _BaseErr
+    litellm_ex.OpenAIError = _BaseErr
+    litellm_ex.InternalServerError = _BaseErr
+    litellm_ex.Timeout = _BaseErr
+    litellm_ex.ContextWindowExceededError = _BaseErr
 
     litellm_tc = types.ModuleType("litellm.litellm_core_utils.token_counter")
     litellm_tc.token_counter = lambda *args, **kwargs: 0
@@ -90,6 +100,15 @@ def test_provider_config_openai_compatible_convert_without_forced_custom_detecti
     monkeypatch.setenv("ALI_API_BASE", "https://dashscope.example/v1")
     cfg = ProviderConfig(provider_type_overrides={"ali": "openai_compatible"})
     assert cfg.convert_for_litellm(model="ali/kimi-k2.5")["model"] == "openai/kimi-k2.5"
+
+
+def test_classify_error_builtin_timeout_is_connection_issue(monkeypatch):
+    _stub_litellm_modules(monkeypatch)
+
+    from rotator_library.error_handler import classify_error
+
+    classified = classify_error(TimeoutError("deadline exceeded"))
+    assert classified.error_type == "api_connection"
 
 
 @pytest.mark.asyncio

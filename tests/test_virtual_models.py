@@ -1,4 +1,5 @@
 """Tests for virtual model aggregation layer."""
+import asyncio
 import json
 import os
 import pytest
@@ -263,9 +264,13 @@ class TestRouteStrategy:
 
 
 # ---------------------------------------------------------------------------
-# 4. Aggregate router – error classification
+# 4. Aggregate router – error classification / timeout behavior
 # ---------------------------------------------------------------------------
-from proxy_app.aggregate_router import _classify_exception_type, _should_fallback
+from proxy_app.aggregate_router import (
+    _classify_exception_type,
+    _should_fallback,
+    execute_virtual_completion,
+)
 
 
 class TestAggregateErrorClassification:
@@ -294,3 +299,39 @@ class TestAggregateErrorClassification:
         FakeTimeout.__name__ = "TimeoutError"
         e = FakeTimeout()
         assert _classify_exception_type(e) == "timeout"
+
+
+class TestAggregateRouterTimeouts:
+    @pytest.mark.asyncio
+    async def test_non_streaming_target_timeout_falls_back(self, monkeypatch):
+        class FakeClient:
+            async def acompletion(self, request=None, **kwargs):
+                if kwargs["model"] == "slow/model":
+                    await asyncio.sleep(1.05)
+                    return {"id": "slow"}
+                return {"id": "fast"}
+
+        config = VirtualModelConfig(
+            strategy="sequential",
+            timeout_seconds=1,
+            targets=[
+                RouteTarget(model="slow/model"),
+                RouteTarget(model="fast/model"),
+            ],
+        )
+
+        monkeypatch.setattr(
+            "proxy_app.aggregate_router.get_virtual_model",
+            lambda _: config,
+        )
+
+        result, actual_target, fallback_count = await execute_virtual_completion(
+            FakeClient(),
+            request=None,
+            request_data={"model": "virtual/test"},
+            virtual_model_name="virtual/test",
+        )
+
+        assert result == {"id": "fast"}
+        assert actual_target == "fast/model"
+        assert fallback_count == 1

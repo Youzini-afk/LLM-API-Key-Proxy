@@ -776,7 +776,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             )
 
     if isinstance(
-        e, (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError)
+        e, (TimeoutError, httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError)
     ):  # [NEW]
         return ClassifiedError(
             error_type="api_connection", original_exception=e, status_code=status_code

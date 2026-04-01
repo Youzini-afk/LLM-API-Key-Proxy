@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 # Copyright (c) 2026 Mirrowel
 
-from typing import TYPE_CHECKING, Dict, Type
-
-from .client import RotatingClient
+from typing import TYPE_CHECKING
 
 # For type checkers (Pylint, mypy), import PROVIDER_PLUGINS statically
 # At runtime, it's lazy-loaded via __getattr__
 if TYPE_CHECKING:
+    from .client import RotatingClient
     from .providers import PROVIDER_PLUGINS
     from .providers.provider_interface import ProviderInterface
     from .model_info_service import ModelInfoService, ModelInfo, ModelMetadata
@@ -24,7 +23,11 @@ __all__ = [
 
 
 def __getattr__(name):
-    """Lazy-load PROVIDER_PLUGINS, ModelInfoService, and anthropic_compat to speed up module import."""
+    """Lazy-load heavy exports so light modules stay importable without optional deps."""
+    if name == "RotatingClient":
+        from .client import RotatingClient
+
+        return RotatingClient
     if name == "PROVIDER_PLUGINS":
         from .providers import PROVIDER_PLUGINS
 

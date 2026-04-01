@@ -6,7 +6,7 @@ import json
 import os
 import shutil
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import sys
 from typing import Dict, Optional
@@ -37,7 +37,7 @@ def _capture_corrupt_evidence(path: Path) -> Optional[str]:
     if not path.exists() or not path.is_file():
         return None
 
-    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     evidence_path = path.with_name(f"{path.stem}.corrupt.{timestamp}{path.suffix}")
     try:
         shutil.copy2(path, evidence_path)
@@ -103,7 +103,9 @@ def save_admin_config(cfg: AdminConfig) -> AdminConfig:
 
     # bump metadata
     cfg.metadata.version = int(cfg.metadata.version) + 1
-    cfg.metadata.updated_at = datetime.utcnow().isoformat() + "Z"
+    cfg.metadata.updated_at = (
+        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    )
 
     p = _config_path()
     tmp = p.with_suffix(".json.tmp")

@@ -5,6 +5,7 @@
 # rotation inside a single provider; AggregateRouter handles target
 # rotation across multiple providers for a given virtual model.
 
+import asyncio
 import json
 import logging
 import time
@@ -87,6 +88,39 @@ def _should_fallback(error_type: str) -> bool:
     return error_type not in NON_FALLBACK_ERROR_TYPES
 
 
+async def _await_target_timeout(
+    awaitable: Any, timeout_seconds: int, target_model: str
+) -> Any:
+    """Enforce per-target timeout budget for non-streaming virtual model attempts."""
+    try:
+        return await asyncio.wait_for(awaitable, timeout=timeout_seconds)
+    except TimeoutError as exc:
+        raise TimeoutError(
+            f"Virtual model target '{target_model}' timed out after {timeout_seconds}s"
+        ) from exc
+
+
+async def _iter_stream_with_initial_timeout(
+    stream: AsyncGenerator[str, None],
+    timeout_seconds: int,
+    target_model: str,
+) -> AsyncGenerator[str, None]:
+    """Fail over if a target does not produce its first streaming chunk in time."""
+    iterator = stream.__aiter__()
+    try:
+        first_chunk = await asyncio.wait_for(iterator.__anext__(), timeout=timeout_seconds)
+    except StopAsyncIteration:
+        return
+    except TimeoutError as exc:
+        raise TimeoutError(
+            f"Virtual model target '{target_model}' produced no stream data within {timeout_seconds}s"
+        ) from exc
+
+    yield first_chunk
+    async for chunk in iterator:
+        yield chunk
+
+
 def _build_aggregate_error(
     virtual_model: str, failures: List[TargetFailure]
 ) -> dict:
@@ -156,7 +190,11 @@ async def execute_virtual_completion(
         modified_data = {**request_data, "model": target_model}
 
         try:
-            result = await client.acompletion(request=request, **modified_data)
+            result = await _await_target_timeout(
+                client.acompletion(request=request, **modified_data),
+                config.timeout_seconds,
+                target_model,
+            )
 
             # Check for error result (RotatingClient returns dict on all-keys-exhausted)
             if _is_error_response(result):
@@ -276,7 +314,11 @@ async def execute_virtual_completion_streaming(
             modified_data = {**request_data, "model": target_model}
 
             try:
-                stream = client.acompletion(request=request, **modified_data)
+                stream = _iter_stream_with_initial_timeout(
+                    client.acompletion(request=request, **modified_data),
+                    config.timeout_seconds,
+                    target_model,
+                )
 
                 # Buffer initial chunks to detect immediate errors
                 buffer: List[str] = []

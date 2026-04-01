@@ -44,6 +44,7 @@ from .credential_manager import CredentialManager
 from .background_refresher import BackgroundRefresher
 from .model_definitions import ModelDefinitions
 from .transaction_logger import TransactionLogger
+from .timeout_config import TimeoutConfig
 from .utils.paths import get_default_root, get_logs_dir, get_oauth_dir, get_data_file
 from .utils.suppress_litellm_warnings import suppress_litellm_serialization_warnings
 from .config import (
@@ -1000,6 +1001,60 @@ class RotatingClient:
         # No conversion needed, return original
         return model
 
+    @staticmethod
+    def _remaining_deadline_budget(deadline: float) -> float:
+        """Return remaining request budget in seconds."""
+        return max(0.0, deadline - time.time())
+
+    def _compute_attempt_timeout(self, deadline: float, *, streaming: bool) -> float:
+        """
+        Bound each outbound attempt by both the configured HTTP timeout and the
+        remaining request budget.
+        """
+        configured_timeout = (
+            TimeoutConfig.read_streaming()
+            if streaming
+            else TimeoutConfig.read_non_streaming()
+        )
+        remaining_budget = self._remaining_deadline_budget(deadline)
+        if remaining_budget <= 0:
+            raise TimeoutError("Request deadline exceeded before outbound attempt began")
+        return min(configured_timeout, remaining_budget)
+
+    async def _await_with_deadline(
+        self,
+        awaitable,
+        deadline: float,
+        *,
+        streaming: bool,
+        operation: str,
+    ):
+        """
+        Enforce the remaining global request budget on a single outbound attempt.
+        """
+        timeout_seconds = self._compute_attempt_timeout(
+            deadline, streaming=streaming
+        )
+        try:
+            return await asyncio.wait_for(awaitable, timeout=timeout_seconds)
+        except TimeoutError as exc:
+            raise TimeoutError(
+                f"{operation} exceeded timeout budget ({timeout_seconds:.2f}s)"
+            ) from exc
+
+    def _apply_standard_timeout(
+        self, request_kwargs: Dict[str, Any], deadline: float, *, streaming: bool
+    ) -> Dict[str, Any]:
+        """
+        Ensure LiteLLM-backed requests get an explicit timeout instead of relying
+        on long library defaults.
+        """
+        if request_kwargs.get("timeout") is None:
+            request_kwargs["timeout"] = self._compute_attempt_timeout(
+                deadline, streaming=streaming
+            )
+        return request_kwargs
+
     async def _safe_streaming_wrapper(
         self,
         stream: Any,
@@ -1007,6 +1062,7 @@ class RotatingClient:
         model: str,
         request: Optional[Any] = None,
         provider_plugin: Optional[Any] = None,
+        initial_timeout: Optional[float] = None,
     ) -> AsyncGenerator[Any, None]:
         """
         A hybrid wrapper for streaming that buffers fragmented JSON, handles client disconnections gracefully,
@@ -1024,6 +1080,7 @@ class RotatingClient:
         json_buffer = ""
         accumulated_finish_reason = None  # Track strongest finish_reason across chunks
         has_tool_calls = False  # Track if ANY tool calls were seen in stream
+        waiting_for_first_chunk = True
 
         try:
             while True:
@@ -1034,7 +1091,13 @@ class RotatingClient:
                     break
 
                 try:
-                    chunk = await stream_iterator.__anext__()
+                    if waiting_for_first_chunk and initial_timeout is not None:
+                        chunk = await asyncio.wait_for(
+                            stream_iterator.__anext__(), timeout=initial_timeout
+                        )
+                    else:
+                        chunk = await stream_iterator.__anext__()
+                    waiting_for_first_chunk = False
                     if json_buffer:
                         lib_logger.warning(
                             f"Discarding incomplete JSON buffer from previous chunk: {json_buffer}"
@@ -1539,8 +1602,13 @@ class RotatingClient:
                                             f"Pre-request callback failed but abort_on_callback_error is False. Proceeding with request. Error: {e}"
                                         )
 
-                            response = await provider_plugin.acompletion(
-                                self.http_client, **litellm_kwargs
+                            response = await self._await_with_deadline(
+                                provider_plugin.acompletion(
+                                    self.http_client, **litellm_kwargs
+                                ),
+                                deadline,
+                                streaming=False,
+                                operation=f"{provider}/{model} request",
                             )
 
                             # For non-streaming, success is immediate
@@ -1785,9 +1853,18 @@ class RotatingClient:
                                 **litellm_kwargs
                             )
 
-                            response = await api_call(
-                                **final_kwargs,
-                                logger_fn=self._litellm_logger_callback,
+                            final_kwargs = self._apply_standard_timeout(
+                                final_kwargs, deadline, streaming=False
+                            )
+
+                            response = await self._await_with_deadline(
+                                api_call(
+                                    **final_kwargs,
+                                    logger_fn=self._litellm_logger_callback,
+                                ),
+                                deadline,
+                                streaming=False,
+                                operation=f"{provider}/{model} request",
                             )
 
                             await self.usage_manager.record_success(
@@ -2310,8 +2387,13 @@ class RotatingClient:
                                                 f"Pre-request callback failed but abort_on_callback_error is False. Proceeding with request. Error: {e}"
                                             )
 
-                                response = await provider_plugin.acompletion(
-                                    self.http_client, **litellm_kwargs
+                                response = await self._await_with_deadline(
+                                    provider_plugin.acompletion(
+                                        self.http_client, **litellm_kwargs
+                                    ),
+                                    deadline,
+                                    streaming=True,
+                                    operation=f"{provider}/{model} stream setup",
                                 )
 
                                 lib_logger.info(
@@ -2325,6 +2407,9 @@ class RotatingClient:
                                     model,
                                     request,
                                     provider_plugin,
+                                    initial_timeout=self._compute_attempt_timeout(
+                                        deadline, streaming=True
+                                    ),
                                 )
 
                                 # Wrap with transaction logging
@@ -2564,9 +2649,18 @@ class RotatingClient:
                                 **litellm_kwargs
                             )
 
-                            response = await litellm.acompletion(
-                                **final_kwargs,
-                                logger_fn=self._litellm_logger_callback,
+                            final_kwargs = self._apply_standard_timeout(
+                                final_kwargs, deadline, streaming=True
+                            )
+
+                            response = await self._await_with_deadline(
+                                litellm.acompletion(
+                                    **final_kwargs,
+                                    logger_fn=self._litellm_logger_callback,
+                                ),
+                                deadline,
+                                streaming=True,
+                                operation=f"{provider}/{model} stream setup",
                             )
 
                             lib_logger.info(
@@ -2580,6 +2674,9 @@ class RotatingClient:
                                 model,
                                 request,
                                 provider_instance,
+                                initial_timeout=self._compute_attempt_timeout(
+                                    deadline, streaming=True
+                                ),
                             )
 
                             # Wrap with transaction logging
