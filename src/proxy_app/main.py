@@ -379,61 +379,132 @@ ADMIN_API_KEY = (os.getenv("ADMIN_API_KEY") or "").strip().strip("'\"") or None
 
 # Note: PROXY_API_KEY validation moved to server startup to allow credential tool to run first
 
-# Discover API keys from environment variables
-api_keys = {}
-for key, value in os.environ.items():
-    if "_API_KEY" in key and key != "PROXY_API_KEY":
-        provider = key.split("_API_KEY")[0].lower()
-        if provider not in api_keys:
-            api_keys[provider] = []
-        api_keys[provider].append(value)
+def discover_api_keys_from_env() -> Dict[str, List[str]]:
+    api_keys: Dict[str, List[str]] = {}
+    for key, value in os.environ.items():
+        if "_API_KEY" in key and key not in {"PROXY_API_KEY", "ADMIN_API_KEY"}:
+            provider = key.split("_API_KEY")[0].lower()
+            api_keys.setdefault(provider, []).append(value)
+    return api_keys
 
-# Load model ignore lists from environment variables
-ignore_models = {}
-for key, value in os.environ.items():
-    if key.startswith("IGNORE_MODELS_"):
-        provider = key.replace("IGNORE_MODELS_", "").lower()
-        models_to_ignore = [
-            model.strip() for model in value.split(",") if model.strip()
-        ]
-        ignore_models[provider] = models_to_ignore
-        logging.debug(
-            f"Loaded ignore list for provider '{provider}': {models_to_ignore}"
-        )
 
-# Load model whitelist from environment variables
-whitelist_models = {}
-for key, value in os.environ.items():
-    if key.startswith("WHITELIST_MODELS_"):
-        provider = key.replace("WHITELIST_MODELS_", "").lower()
-        models_to_whitelist = [
-            model.strip() for model in value.split(",") if model.strip()
-        ]
-        whitelist_models[provider] = models_to_whitelist
-        logging.debug(
-            f"Loaded whitelist for provider '{provider}': {models_to_whitelist}"
-        )
-
-# Load max concurrent requests per key from environment variables
-max_concurrent_requests_per_key = {}
-for key, value in os.environ.items():
-    if key.startswith("MAX_CONCURRENT_REQUESTS_PER_KEY_"):
-        provider = key.replace("MAX_CONCURRENT_REQUESTS_PER_KEY_", "").lower()
-        try:
-            max_concurrent = int(value)
-            if max_concurrent < 1:
-                logging.warning(
-                    f"Invalid max_concurrent value for provider '{provider}': {value}. Must be >= 1. Using default (1)."
-                )
-                max_concurrent = 1
-            max_concurrent_requests_per_key[provider] = max_concurrent
+def discover_ignore_models_from_env() -> Dict[str, List[str]]:
+    ignore_models: Dict[str, List[str]] = {}
+    for key, value in os.environ.items():
+        if key.startswith("IGNORE_MODELS_"):
+            provider = key.replace("IGNORE_MODELS_", "").lower()
+            models_to_ignore = [
+                model.strip() for model in value.split(",") if model.strip()
+            ]
+            ignore_models[provider] = models_to_ignore
             logging.debug(
-                f"Loaded max concurrent requests for provider '{provider}': {max_concurrent}"
+                f"Loaded ignore list for provider '{provider}': {models_to_ignore}"
             )
-        except ValueError:
-            logging.warning(
-                f"Invalid max_concurrent value for provider '{provider}': {value}. Using default (1)."
+    return ignore_models
+
+
+def discover_whitelist_models_from_env() -> Dict[str, List[str]]:
+    whitelist_models: Dict[str, List[str]] = {}
+    for key, value in os.environ.items():
+        if key.startswith("WHITELIST_MODELS_"):
+            provider = key.replace("WHITELIST_MODELS_", "").lower()
+            models_to_whitelist = [
+                model.strip() for model in value.split(",") if model.strip()
+            ]
+            whitelist_models[provider] = models_to_whitelist
+            logging.debug(
+                f"Loaded whitelist for provider '{provider}': {models_to_whitelist}"
             )
+    return whitelist_models
+
+
+def discover_max_concurrent_requests_per_key_from_env() -> Dict[str, int]:
+    max_concurrent_requests_per_key: Dict[str, int] = {}
+    for key, value in os.environ.items():
+        if key.startswith("MAX_CONCURRENT_REQUESTS_PER_KEY_"):
+            provider = key.replace("MAX_CONCURRENT_REQUESTS_PER_KEY_", "").lower()
+            try:
+                max_concurrent = int(value)
+                if max_concurrent < 1:
+                    logging.warning(
+                        f"Invalid max_concurrent value for provider '{provider}': {value}. Must be >= 1. Using default (1)."
+                    )
+                    max_concurrent = 1
+                max_concurrent_requests_per_key[provider] = max_concurrent
+                logging.debug(
+                    f"Loaded max concurrent requests for provider '{provider}': {max_concurrent}"
+                )
+            except ValueError:
+                logging.warning(
+                    f"Invalid max_concurrent value for provider '{provider}': {value}. Using default (1)."
+                )
+    return max_concurrent_requests_per_key
+
+
+def build_rotating_client_from_env(
+    oauth_credentials: Optional[Dict[str, List[str]]] = None,
+) -> RotatingClient:
+    litellm_provider_params = {
+        "gemini_cli": {"project_id": os.getenv("GEMINI_CLI_PROJECT_ID")}
+    }
+    global_timeout = int(os.getenv("GLOBAL_TIMEOUT", "30"))
+    return RotatingClient(
+        api_keys=discover_api_keys_from_env(),
+        oauth_credentials=oauth_credentials,
+        configure_logging=True,
+        global_timeout=global_timeout,
+        litellm_provider_params=litellm_provider_params,
+        ignore_models=discover_ignore_models_from_env(),
+        whitelist_models=discover_whitelist_models_from_env(),
+        enable_request_logging=ENABLE_REQUEST_LOGGING,
+        max_concurrent_requests_per_key=discover_max_concurrent_requests_per_key_from_env(),
+    )
+
+
+async def rebuild_runtime_client(app: FastAPI) -> Dict[str, Any]:
+    old_client = getattr(app.state, "rotating_client", None)
+    old_batcher = getattr(app.state, "embedding_batcher", None)
+
+    oauth_credentials = None
+    if old_client is not None:
+        oauth_credentials = getattr(old_client, "oauth_credentials", None)
+
+    new_client = build_rotating_client_from_env(oauth_credentials=oauth_credentials)
+    new_client.background_refresher.start()
+    app.state.rotating_client = new_client
+
+    if old_batcher:
+        try:
+            await old_batcher.stop()
+        except Exception as e:
+            logging.warning(f"Failed to stop old EmbeddingBatcher during reload: {e}")
+
+        if USE_EMBEDDING_BATCHER:
+            app.state.embedding_batcher = EmbeddingBatcher(client=new_client)
+        else:
+            app.state.embedding_batcher = None
+
+    if old_client is not None:
+        try:
+            await old_client.background_refresher.stop()
+        except Exception as e:
+            logging.warning(f"Failed to stop old background refresher during reload: {e}")
+        try:
+            await old_client.close()
+        except Exception as e:
+            logging.warning(f"Failed to close old RotatingClient during reload: {e}")
+
+    return {
+        "runtime_client_rebuilt": True,
+        "providers_loaded": sorted(list(new_client.all_credentials.keys())),
+        "credential_provider_count": len(new_client.all_credentials),
+    }
+
+
+api_keys = discover_api_keys_from_env()
+ignore_models = discover_ignore_models_from_env()
+whitelist_models = discover_whitelist_models_from_env()
+max_concurrent_requests_per_key = discover_max_concurrent_requests_per_key_from_env()
 
 
 # --- Lifespan Management ---
@@ -689,6 +760,23 @@ app.add_middleware(
     allow_methods=["*"],  # Allows all methods
     allow_headers=["*"],  # Allows all headers
 )
+
+
+@app.middleware("http")
+async def webui_no_cache_middleware(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if (
+        path == "/"
+        or path.startswith("/dashboard")
+        or path.startswith("/js/")
+        or path.startswith("/css/")
+        or path.startswith("/webui/")
+    ):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
 
 # --- WebUI Static Files ---
 _webui_dir = Path(__file__).parent / "webui"
@@ -1401,18 +1489,27 @@ async def list_models(
     # Get provider models discovered from upstream /models
     provider_model_ids = await client.get_all_available_models(grouped=False)
 
-    # Fallback/补充：有些渠道不支持 /models，仍应展示已配置的 *_MODELS
+    # Fallback/补充：有些渠道不支持 /models，仍应展示管理端已配置的模型映射
     configured_model_ids = []
+    try:
+        cfg = admin_service.get_config()
+        for ch in cfg.channels:
+            if not ch.enabled:
+                continue
+            for model_name in (ch.models or {}).keys():
+                configured_model_ids.append(f"{ch.id}/{model_name}")
+    except Exception as e:
+        logging.debug(f"Failed to collect admin-configured models fallback: {e}")
+
+    # 再补一层：如果运行时已有加载的 model definitions，也一并合入
     try:
         model_definitions = getattr(client, "model_definitions", None)
         providers = list(getattr(client, "all_credentials", {}).keys())
         if model_definitions:
             for provider in providers:
-                configured_model_ids.extend(
-                    model_definitions.get_all_provider_models(provider)
-                )
+                configured_model_ids.extend(model_definitions.get_all_provider_models(provider))
     except Exception as e:
-        logging.debug(f"Failed to collect configured models fallback: {e}")
+        logging.debug(f"Failed to collect client model definitions fallback: {e}")
 
     # 合并去重：先保留运行时探测结果，再补充配置模型
     existing_set = set(provider_model_ids)
@@ -1657,12 +1754,14 @@ async def admin_validate_config(_=Depends(verify_admin_api_key)):
 
 
 @app.post("/admin/config/apply")
-async def admin_apply_config(_=Depends(verify_admin_api_key)):
+async def admin_apply_config(request: Request, _=Depends(verify_admin_api_key)):
     cfg = admin_service.get_config()
     result = admin_service.validate_config(cfg)
     if not result.ok:
         raise HTTPException(status_code=400, detail={"errors": result.errors})
-    return admin_service.apply_runtime_overlay()
+    overlay_result = admin_service.apply_runtime_overlay()
+    rebuild_result = await rebuild_runtime_client(request.app)
+    return {**overlay_result, **rebuild_result}
 
 
 @app.get("/admin/channels")
@@ -1972,8 +2071,10 @@ async def admin_delete_virtual_model(name: str, _=Depends(verify_admin_api_key))
 
 
 @app.post("/admin/runtime/reload")
-async def admin_runtime_reload(_=Depends(verify_admin_api_key)):
-    return admin_service.apply_runtime_overlay()
+async def admin_runtime_reload(request: Request, _=Depends(verify_admin_api_key)):
+    overlay_result = admin_service.apply_runtime_overlay()
+    rebuild_result = await rebuild_runtime_client(request.app)
+    return {**overlay_result, **rebuild_result}
 
 
 @app.get("/admin/runtime/status")
