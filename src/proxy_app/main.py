@@ -1929,6 +1929,18 @@ async def admin_test_channel(
     if not enabled_keys:
         return {"ok": False, "message": "No enabled key in this channel"}
 
+    # 模型测试应基于最新管理配置执行，而不是依赖用户手动点“应用配置”后
+    # 才能让 runtime client 看到刚保存的 key / api_base / models。
+    try:
+        admin_service.apply_runtime_overlay()
+        await rebuild_runtime_client(request.app)
+        client = request.app.state.rotating_client
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to load latest channel config into runtime before testing: {e}",
+        )
+
     inferred_upstream_models = list(channel.provided_models or [])
     if not inferred_upstream_models:
         effective_models = admin_service._build_effective_models(channel)
