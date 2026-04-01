@@ -88,6 +88,7 @@ class RotatingClient:
         max_concurrent_requests_per_key: Optional[Dict[str, int]] = None,
         rotation_tolerance: float = DEFAULT_ROTATION_TOLERANCE,
         data_dir: Optional[Union[str, Path]] = None,
+        provider_runtime_types: Optional[Dict[str, str]] = None,
     ):
         """
         Initialize the RotatingClient with intelligent credential rotation.
@@ -111,6 +112,8 @@ class RotatingClient:
                 - 5.0+: High randomness, more unpredictable selection patterns
             data_dir: Root directory for all data files (logs, cache, oauth_creds, key_usage.json).
                       If None, auto-detects: EXE directory if frozen, else current working directory.
+            provider_runtime_types: Optional provider alias -> runtime provider_type mapping.
+                      Example: {"dashscope_a": "openai_compatible", "anthropic_1": "anthropic"}
         """
         # Resolve data_dir early - this becomes the root for all file operations
         if data_dir is not None:
@@ -175,6 +178,18 @@ class RotatingClient:
             all_credentials.setdefault(provider, []).extend(paths)
         self.all_credentials = all_credentials
 
+        self.provider_runtime_types: Dict[str, str] = {}
+        for provider in self.all_credentials.keys():
+            override = (provider_runtime_types or {}).get(provider)
+            if not override:
+                override = os.getenv(f"PROVIDER_TYPE_{provider.upper()}")
+            runtime_provider = (override or provider).strip().lower()
+            self.provider_runtime_types[provider] = runtime_provider
+            if runtime_provider != provider:
+                lib_logger.info(
+                    f"Provider runtime mapping active: {provider} -> {runtime_provider}"
+                )
+
         self.max_retries = max_retries
         self.global_timeout = global_timeout
         self.abort_on_callback_error = abort_on_callback_error
@@ -187,7 +202,8 @@ class RotatingClient:
         # Each provider can specify its preferred rotation mode ("balanced" or "sequential")
         provider_rotation_modes = {}
         for provider in self.all_credentials.keys():
-            provider_class = self._provider_plugins.get(provider)
+            runtime_provider = self._get_runtime_provider_type(provider)
+            provider_class = self._provider_plugins.get(runtime_provider)
             if provider_class and hasattr(provider_class, "get_rotation_mode"):
                 # Use class method to get rotation mode (checks env var + class default)
                 mode = provider_class.get_rotation_mode(provider)
@@ -207,7 +223,8 @@ class RotatingClient:
         sequential_fallback_multipliers: Dict[str, int] = {}
 
         for provider in self.all_credentials.keys():
-            provider_class = self._provider_plugins.get(provider)
+            runtime_provider = self._get_runtime_provider_type(provider)
+            provider_class = self._provider_plugins.get(runtime_provider)
 
             # Start with provider class defaults
             if provider_class:
@@ -292,7 +309,8 @@ class RotatingClient:
         auto_disable_long_unavailable: Dict[str, bool] = {}
 
         for provider in self.all_credentials.keys():
-            provider_class = self._provider_plugins.get(provider)
+            runtime_provider = self._get_runtime_provider_type(provider)
+            provider_class = self._provider_plugins.get(runtime_provider)
             rotation_mode = provider_rotation_modes.get(provider, "balanced")
 
             # Fair cycle enabled - check env, then provider default, then derive from rotation mode
@@ -369,7 +387,8 @@ class RotatingClient:
                 )
 
         for provider in self.all_credentials.keys():
-            provider_class = self._provider_plugins.get(provider)
+            runtime_provider = self._get_runtime_provider_type(provider)
+            provider_class = self._provider_plugins.get(runtime_provider)
 
             # Check per-provider env var first
             env_key = f"EXHAUSTION_COOLDOWN_THRESHOLD_{provider.upper()}"
@@ -461,7 +480,8 @@ class RotatingClient:
         ] = {}
 
         for provider in self.all_credentials.keys():
-            provider_class = self._provider_plugins.get(provider)
+            runtime_provider = self._get_runtime_provider_type(provider)
+            provider_class = self._provider_plugins.get(runtime_provider)
             provider_upper = provider.upper()
 
             # Start with provider class defaults
@@ -549,7 +569,8 @@ class RotatingClient:
             file_path=resolved_usage_path,
             rotation_tolerance=rotation_tolerance,
             provider_rotation_modes=provider_rotation_modes,
-            provider_plugins=PROVIDER_PLUGINS,
+            provider_plugins=self._provider_plugins,
+            provider_runtime_types=self.provider_runtime_types,
             priority_multipliers=priority_multipliers,
             priority_multipliers_by_mode=priority_multipliers_by_mode,
             sequential_fallback_multipliers=sequential_fallback_multipliers,
@@ -564,7 +585,7 @@ class RotatingClient:
         )
         self._model_list_cache = {}
         self.http_client = httpx.AsyncClient()
-        self.provider_config = ProviderConfig()
+        self.provider_config = ProviderConfig(provider_type_overrides=self.provider_runtime_types)
         self.cooldown_manager = CooldownManager()
         self.litellm_provider_params = litellm_provider_params or {}
         self.ignore_models = ignore_models or {}
@@ -860,6 +881,12 @@ class RotatingClient:
     def get_oauth_credentials(self) -> Dict[str, List[str]]:
         return self.oauth_credentials
 
+    def _get_runtime_provider_type(self, provider_name: str) -> str:
+        provider_lower = (provider_name or "").strip().lower()
+        if not provider_lower:
+            return provider_lower
+        return self.provider_runtime_types.get(provider_lower, provider_lower)
+
     def _is_custom_openai_compatible_provider(self, provider_name: str) -> bool:
         """
         Checks if a provider is a custom OpenAI-compatible provider.
@@ -907,9 +934,18 @@ class RotatingClient:
             return None
 
         if provider_name not in self._provider_instances:
-            provider_class = self._provider_plugins.get(provider_name)
+            runtime_provider = self._get_runtime_provider_type(provider_name)
+            provider_class = self._provider_plugins.get(runtime_provider)
             if provider_class:
-                self._provider_instances[provider_name] = self._instantiate_provider_plugin(provider_name, provider_class)
+                instantiate_name = (
+                    provider_name
+                    if provider_class is OpenAICompatibleProvider
+                    else runtime_provider
+                )
+                self._provider_instances[provider_name] = self._instantiate_provider_plugin(
+                    instantiate_name,
+                    provider_class,
+                )
             elif self._is_custom_openai_compatible_provider(provider_name):
                 # Create a generic OpenAI-compatible provider for custom providers
                 try:
@@ -3074,7 +3110,8 @@ class RotatingClient:
 
         # Enrich with provider-specific quota data
         for provider, prov_stats in stats.get("providers", {}).items():
-            provider_class = self._provider_plugins.get(provider)
+            runtime_provider = self._get_runtime_provider_type(provider)
+            provider_class = self._provider_plugins.get(runtime_provider)
             if not provider_class:
                 continue
 
@@ -3417,7 +3454,8 @@ class RotatingClient:
             providers_to_refresh = list(self.all_credentials.keys())
 
         for prov in providers_to_refresh:
-            provider_class = self._provider_plugins.get(prov)
+            runtime_provider = self._get_runtime_provider_type(prov)
+            provider_class = self._provider_plugins.get(runtime_provider)
             if not provider_class:
                 continue
 

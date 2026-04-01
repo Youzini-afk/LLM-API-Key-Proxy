@@ -240,6 +240,7 @@ docker run -d \
   -v $(pwd)/.env:/app/.env:ro \
   -v $(pwd)/oauth_creds:/app/oauth_creds \
   -v $(pwd)/logs:/app/logs \
+  -v $(pwd)/data:/app/data \
   -v $(pwd)/key_usage.json:/app/key_usage.json \
   -e SKIP_OAUTH_INIT_CHECK=true \
   -e PYTHONUNBUFFERED=1 \
@@ -262,12 +263,13 @@ docker pull ghcr.io/mirrowel/llm-api-key-proxy:20250106-143022-abc1234
 
 ### Volume Mounts Explained
 
-| Host Path          | Container Path        | Purpose                           | Mode              |
-| ------------------ | --------------------- | --------------------------------- | ----------------- |
-| `./.env`           | `/app/.env`           | Configuration and API keys        | Read-only (`:ro`) |
-| `./oauth_creds/`   | `/app/oauth_creds/`   | OAuth credential JSON files       | Read-write        |
-| `./logs/`          | `/app/logs/`          | Request logs and detailed logging | Read-write        |
-| `./key_usage.json` | `/app/key_usage.json` | Usage statistics persistence      | Read-write        |
+| Host Path          | Container Path        | Purpose                                                    | Mode              |
+| ------------------ | --------------------- | ---------------------------------------------------------- | ----------------- |
+| `./.env`           | `/app/.env`           | Configuration and API keys                                 | Read-only (`:ro`) |
+| `./oauth_creds/`   | `/app/oauth_creds/`   | OAuth credential JSON files                                | Read-write        |
+| `./logs/`          | `/app/logs/`          | Request logs and detailed logging                          | Read-write        |
+| `./data/`          | `/app/data/`          | Admin WebUI config persistence (`/app/data/admin_config.json`) | Read-write        |
+| `./key_usage.json` | `/app/key_usage.json` | Usage statistics persistence                               | Read-write        |
 
 ### Setting Up OAuth Providers with Docker
 

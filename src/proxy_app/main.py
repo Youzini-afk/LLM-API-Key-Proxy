@@ -87,12 +87,38 @@ if _env_files_found:
     _env_names = [_ef.name for _ef in _env_files_found]
     print(f"📁 Loaded {len(_env_files_found)} .env file(s): {', '.join(_env_names)}")
 
+
+def _normalize_env_secret(name: str):
+    raw = (os.getenv(name) or "").strip().strip("'\"")
+    return raw or None
+
+
+def _env_flag_true(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _mask_secret_for_display(value) -> str:
+    if not value:
+        return ""
+    if len(value) <= 8:
+        return "*" * len(value)
+    return f"{value[:3]}...{value[-3:]}"
+
+
 # Get proxy API key for display
-proxy_api_key = os.getenv("PROXY_API_KEY")
+proxy_api_key = _normalize_env_secret("PROXY_API_KEY")
+allow_insecure_no_auth = _env_flag_true("ALLOW_INSECURE_NO_AUTH", False)
 if proxy_api_key:
-    key_display = f"✓ {proxy_api_key}"
+    key_display = f"✓ {_mask_secret_for_display(proxy_api_key)}"
 else:
-    key_display = "✗ Not Set (INSECURE - anyone can access!)"
+    key_display = (
+        "✗ Not Set (INSECURE MODE ENABLED)"
+        if allow_insecure_no_auth
+        else "✗ Not Set (FAIL-CLOSED: requests require explicit key configuration)"
+    )
 
 print("━" * 70)
 print(f"Starting proxy on {args.host}:{args.port}")
@@ -374,18 +400,84 @@ if ENABLE_REQUEST_LOGGING:
     )
 if ENABLE_RAW_LOGGING:
     logging.info("Raw I/O logging is enabled (proxy boundary, unmodified HTTP data).")
-PROXY_API_KEY = (os.getenv("PROXY_API_KEY") or "").strip().strip("'\"") or None
-ADMIN_API_KEY = (os.getenv("ADMIN_API_KEY") or "").strip().strip("'\"") or None
 
-# Note: PROXY_API_KEY validation moved to server startup to allow credential tool to run first
+
+def get_proxy_api_key():
+    return _normalize_env_secret("PROXY_API_KEY")
+
+
+def get_admin_api_key():
+    return _normalize_env_secret("ADMIN_API_KEY") or get_proxy_api_key()
+
+
+def allow_insecure_no_auth() -> bool:
+    return _env_flag_true("ALLOW_INSECURE_NO_AUTH", False)
+
+
+ADMIN_API_KEY = _normalize_env_secret("ADMIN_API_KEY")
+
+
+def _iter_env_api_key_entries() -> List[tuple[str, int, str]]:
+    entries: List[tuple[str, int, str]] = []
+    for key in sorted(os.environ.keys()):
+        if key in {"PROXY_API_KEY", "ADMIN_API_KEY"}:
+            continue
+        if "_API_KEY" not in key:
+            continue
+
+        provider, suffix = key.split("_API_KEY", 1)
+        provider = provider.strip().lower()
+        if not provider:
+            continue
+
+        if suffix:
+            if not suffix.startswith("_"):
+                continue
+            index_part = suffix[1:]
+            if not index_part.isdigit():
+                continue
+            index = int(index_part)
+        else:
+            index = 1
+
+        value = (os.environ.get(key) or "").strip().strip("'\"")
+        if not value:
+            continue
+        entries.append((provider, index, value))
+    return entries
 
 def discover_api_keys_from_env() -> Dict[str, List[str]]:
     api_keys: Dict[str, List[str]] = {}
-    for key, value in os.environ.items():
-        if "_API_KEY" in key and key not in {"PROXY_API_KEY", "ADMIN_API_KEY"}:
-            provider = key.split("_API_KEY")[0].lower()
-            api_keys.setdefault(provider, []).append(value)
+    grouped: Dict[str, List[tuple[int, str]]] = {}
+
+    for provider, index, value in _iter_env_api_key_entries():
+        grouped.setdefault(provider, []).append((index, value))
+
+    for provider, items in grouped.items():
+        deduped: List[str] = []
+        seen_values = set()
+        for _, value in sorted(items, key=lambda x: x[0]):
+            if value in seen_values:
+                continue
+            seen_values.add(value)
+            deduped.append(value)
+        if deduped:
+            api_keys[provider] = deduped
+
     return api_keys
+
+
+def discover_provider_types_from_env() -> Dict[str, str]:
+    provider_types: Dict[str, str] = {}
+    for key, value in os.environ.items():
+        if not key.startswith("PROVIDER_TYPE_"):
+            continue
+        provider = key.replace("PROVIDER_TYPE_", "", 1).strip().lower()
+        provider_type = (value or "").strip().lower()
+        if not provider or not provider_type:
+            continue
+        provider_types[provider] = provider_type
+    return provider_types
 
 
 def discover_ignore_models_from_env() -> Dict[str, List[str]]:
@@ -458,6 +550,7 @@ def build_rotating_client_from_env(
         whitelist_models=discover_whitelist_models_from_env(),
         enable_request_logging=ENABLE_REQUEST_LOGGING,
         max_concurrent_requests_per_key=discover_max_concurrent_requests_per_key_from_env(),
+        provider_runtime_types=discover_provider_types_from_env(),
     )
 
 
@@ -502,6 +595,7 @@ async def rebuild_runtime_client(app: FastAPI) -> Dict[str, Any]:
 
 
 api_keys = discover_api_keys_from_env()
+provider_runtime_types = discover_provider_types_from_env()
 ignore_models = discover_ignore_models_from_env()
 whitelist_models = discover_whitelist_models_from_env()
 max_concurrent_requests_per_key = discover_max_concurrent_requests_per_key_from_env()
@@ -687,6 +781,7 @@ async def lifespan(app: FastAPI):
         whitelist_models=whitelist_models,
         enable_request_logging=ENABLE_REQUEST_LOGGING,
         max_concurrent_requests_per_key=max_concurrent_requests_per_key,
+        provider_runtime_types=provider_runtime_types,
     )
 
     # Log loaded credentials summary (compact, always visible for deployment verification)
@@ -817,20 +912,31 @@ def get_embedding_batcher(request: Request) -> EmbeddingBatcher:
 
 async def verify_api_key(auth: str = Depends(api_key_header)):
     """Dependency to verify the proxy API key."""
-    # If PROXY_API_KEY is not set or empty, skip verification (open access)
-    if not PROXY_API_KEY:
-        return auth
-    if not auth or auth != f"Bearer {PROXY_API_KEY}":
+    effective = get_proxy_api_key()
+    if not effective:
+        if allow_insecure_no_auth():
+            return auth
+        raise HTTPException(
+            status_code=503,
+            detail="Proxy auth is not configured. Set PROXY_API_KEY or explicitly set ALLOW_INSECURE_NO_AUTH=true.",
+        )
+
+    if not auth or auth != f"Bearer {effective}":
         raise HTTPException(status_code=401, detail="Invalid or missing API Key")
     return auth
 
 
 async def verify_admin_api_key(auth: str = Depends(api_key_header)):
     """Dependency to verify admin API key for /admin/* endpoints."""
-    # Priority: ADMIN_API_KEY -> PROXY_API_KEY -> open if both not set
-    effective = ADMIN_API_KEY or PROXY_API_KEY
+    # Priority: ADMIN_API_KEY -> PROXY_API_KEY -> fail-closed unless insecure mode is explicitly enabled
+    effective = get_admin_api_key()
     if not effective:
-        return auth
+        if allow_insecure_no_auth():
+            return auth
+        raise HTTPException(
+            status_code=503,
+            detail="Admin auth is not configured. Set ADMIN_API_KEY/PROXY_API_KEY or explicitly set ALLOW_INSECURE_NO_AUTH=true.",
+        )
     if not auth or auth != f"Bearer {effective}":
         raise HTTPException(
             status_code=401,
@@ -851,11 +957,20 @@ async def verify_anthropic_api_key(
     Dependency to verify API key for Anthropic endpoints.
     Accepts either x-api-key header (Anthropic style) or Authorization Bearer (OpenAI style).
     """
+    effective = get_proxy_api_key()
+    if not effective:
+        if allow_insecure_no_auth():
+            return x_api_key or auth
+        raise HTTPException(
+            status_code=503,
+            detail="Proxy auth is not configured. Set PROXY_API_KEY or explicitly set ALLOW_INSECURE_NO_AUTH=true.",
+        )
+
     # Check x-api-key first (Anthropic style)
-    if x_api_key and x_api_key == PROXY_API_KEY:
+    if x_api_key and x_api_key == effective:
         return x_api_key
     # Fall back to Bearer token (OpenAI style)
-    if auth and auth == f"Bearer {PROXY_API_KEY}":
+    if auth and auth == f"Bearer {effective}":
         return auth
     raise HTTPException(status_code=401, detail="Invalid or missing API Key")
 
@@ -1760,7 +1875,10 @@ async def admin_apply_config(request: Request, _=Depends(verify_admin_api_key)):
     result = admin_service.validate_config(cfg)
     if not result.ok:
         raise HTTPException(status_code=400, detail={"errors": result.errors})
-    overlay_result = admin_service.apply_runtime_overlay()
+    try:
+        overlay_result = admin_service.apply_runtime_overlay()
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     rebuild_result = await rebuild_runtime_client(request.app)
     return {**overlay_result, **rebuild_result}
 
@@ -1785,10 +1903,13 @@ async def admin_list_channels(_=Depends(verify_admin_api_key)):
 
                 key_id = None
                 if identifier.startswith("key:"):
-                    # Optional future format if backend returns canonical key id
-                    key_id = identifier.split(":", 1)[1].strip()
+                    payload = identifier.split(":", 1)[1].strip()
+                    if "/" in payload:
+                        key_provider, parsed_key_id = payload.split("/", 1)
+                        if key_provider.strip().lower() == provider_id.strip().lower():
+                            key_id = parsed_key_id.strip()
                 elif ":" in identifier:
-                    # Backward compatibility if identifier carries "key_id:masked_value"
+                    # legacy fallback: "key_id:masked_value"
                     key_id = identifier.split(":", 1)[0].strip()
 
                 if not key_id:
@@ -1811,6 +1932,7 @@ async def admin_list_channels(_=Depends(verify_admin_api_key)):
     merged_channels = []
     for ch in channels:
         channel_id = (ch.get("id") or "").strip()
+        channel_enabled = bool(ch.get("enabled", True))
         runtime_states = key_state_map.get(channel_id, {})
         keys = []
         for k in ch.get("api_keys", []):
@@ -1824,7 +1946,11 @@ async def admin_list_channels(_=Depends(verify_admin_api_key)):
                 merged_key["auto_disabled_at"] = state.get("auto_disabled_at")
                 merged_key["key_cooldown_until"] = state.get("key_cooldown_until")
             else:
-                merged_key["runtime_status"] = "active" if merged_key.get("enabled") else "disabled"
+                merged_key["runtime_status"] = (
+                    "disabled"
+                    if not channel_enabled
+                    else ("active" if merged_key.get("enabled") else "disabled")
+                )
             keys.append(merged_key)
 
         merged_channel = dict(ch)
@@ -1917,29 +2043,37 @@ async def admin_test_channel(
     request: Request,
     channel_id: str,
     body: ChannelModelTestRequest | None = None,
-    client: RotatingClient = Depends(get_rotating_client),
     _=Depends(verify_admin_api_key),
 ):
     cfg = admin_service.get_config()
     channel = next((c for c in cfg.channels if c.id == channel_id), None)
     if not channel:
         raise HTTPException(status_code=404, detail=f"Channel '{channel_id}' not found")
+    if not channel.enabled:
+        raise HTTPException(status_code=400, detail=f"Channel '{channel_id}' is disabled")
 
     enabled_keys = [k for k in channel.api_keys if k.enabled]
     if not enabled_keys:
         return {"ok": False, "message": "No enabled key in this channel"}
 
-    # 模型测试应基于最新管理配置执行，而不是依赖用户手动点“应用配置”后
-    # 才能让 runtime client 看到刚保存的 key / api_base / models。
-    try:
-        admin_service.apply_runtime_overlay()
-        await rebuild_runtime_client(request.app)
-        client = request.app.state.rotating_client
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to load latest channel config into runtime before testing: {e}",
-        )
+    # Isolated diagnostics: never mutate global runtime client.
+    provider_type = (channel.provider_type or "openai_compatible").strip().lower()
+    isolated_client = RotatingClient(
+        api_keys={channel.id: [k.value for k in enabled_keys]},
+        oauth_credentials={},
+        configure_logging=True,
+        global_timeout=30,
+        ignore_models={channel.id: list(channel.settings.ignore_models or [])},
+        whitelist_models={channel.id: list(channel.settings.whitelist_models or [])},
+        max_concurrent_requests_per_key={
+            channel.id: int(channel.settings.max_concurrent_requests_per_key)
+        },
+        provider_runtime_types={channel.id: provider_type},
+    )
+    isolated_client.provider_config._api_bases[channel.id] = admin_service._normalize_api_base(
+        channel.api_base
+    )
+    isolated_client.background_refresher.start()
 
     inferred_upstream_models = list(channel.provided_models or [])
     if not inferred_upstream_models:
@@ -1963,34 +2097,44 @@ async def admin_test_channel(
 
     model_results = []
     success_count = 0
-    for m in selected_models:
-        started = time.perf_counter()
-        status = "failed"
-        err_msg = ""
-        try:
-            await client.acompletion(
-                request=request,
-                model=f"{channel_id}/{m}",
-                messages=[{"role": "user", "content": "ping"}],
-                max_tokens=1,
-                stream=False,
-                timeout=20,
-            )
-            status = "success"
-            success_count += 1
-        except Exception as e:
+    try:
+        for m in selected_models:
+            started = time.perf_counter()
             status = "failed"
-            err_msg = str(e)
+            err_msg = ""
+            try:
+                await isolated_client.acompletion(
+                    request=request,
+                    model=f"{channel_id}/{m}",
+                    messages=[{"role": "user", "content": "ping"}],
+                    max_tokens=1,
+                    stream=False,
+                    timeout=20,
+                )
+                status = "success"
+                success_count += 1
+            except Exception as e:
+                status = "failed"
+                err_msg = str(e)
 
-        elapsed = round(time.perf_counter() - started, 3)
-        model_results.append(
-            {
-                "model": m,
-                "status": status,
-                "latency_seconds": elapsed,
-                "error": err_msg,
-            }
-        )
+            elapsed = round(time.perf_counter() - started, 3)
+            model_results.append(
+                {
+                    "model": m,
+                    "status": status,
+                    "latency_seconds": elapsed,
+                    "error": err_msg,
+                }
+            )
+    finally:
+        try:
+            await isolated_client.background_refresher.stop()
+        except Exception:
+            pass
+        try:
+            await isolated_client.close()
+        except Exception:
+            pass
 
     all_ok = success_count == len(selected_models)
     msg = (
@@ -2012,6 +2156,38 @@ async def admin_test_channel(
             "failed": len(selected_models) - success_count,
         },
     }
+
+
+@app.post("/admin/channels/{channel_id}/discover-models")
+async def admin_discover_models_for_channel(
+    channel_id: str,
+    _=Depends(verify_admin_api_key),
+):
+    """Discover models for a saved channel using backend-held real credentials."""
+    import httpx
+
+    channel = admin_service.get_channel(channel_id)
+    if not channel:
+        raise HTTPException(status_code=404, detail=f"Channel '{channel_id}' not found")
+    if not channel.enabled:
+        raise HTTPException(status_code=400, detail=f"Channel '{channel_id}' is disabled")
+
+    enabled_keys = [k for k in channel.api_keys if k.enabled and (k.value or "").strip()]
+    if not enabled_keys:
+        raise HTTPException(status_code=400, detail="No enabled key in this channel")
+
+    normalized_base = admin_service._normalize_api_base(channel.api_base)
+    headers = {"Authorization": f"Bearer {enabled_keys[0].value.strip()}"}
+    url = f"{normalized_base}/models"
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            models = [m.get("id") for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
+            return {"ok": True, "channel_id": channel_id, "api_base": normalized_base, "models": models}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to discover models for channel '{channel_id}': {e}")
 
 
 @app.post("/admin/discover-models")
@@ -2094,7 +2270,10 @@ async def admin_delete_virtual_model(name: str, _=Depends(verify_admin_api_key))
 
 @app.post("/admin/runtime/reload")
 async def admin_runtime_reload(request: Request, _=Depends(verify_admin_api_key)):
-    overlay_result = admin_service.apply_runtime_overlay()
+    try:
+        overlay_result = admin_service.apply_runtime_overlay()
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     rebuild_result = await rebuild_runtime_client(request.app)
     return {**overlay_result, **rebuild_result}
 
@@ -2265,12 +2444,13 @@ if __name__ == "__main__":
         Check if the proxy needs onboarding (first-time setup).
         Returns True if onboarding is needed, False otherwise.
         """
-        # Only check if .env file exists
-        # PROXY_API_KEY is optional (will show warning if not set)
         if not ENV_FILE.is_file():
             return True
 
-        return False
+        if allow_insecure_no_auth():
+            return False
+
+        return get_proxy_api_key() is None
 
     def show_onboarding_message():
         """Display clear explanatory message for why onboarding is needed."""
@@ -2286,7 +2466,10 @@ if __name__ == "__main__":
         console.print("[bold yellow]⚠️  Configuration Required[/bold yellow]\n")
 
         console.print("The proxy needs initial configuration:")
-        console.print("  [red]❌ No .env file found[/red]")
+        if not ENV_FILE.is_file():
+            console.print("  [red]❌ No .env file found[/red]")
+        elif not get_proxy_api_key() and not allow_insecure_no_auth():
+            console.print("  [red]❌ PROXY_API_KEY is not set (fail-closed mode)[/red]")
 
         console.print("\n[bold]Why this matters:[/bold]")
         console.print("  • The .env file stores your credentials and settings")
@@ -2294,14 +2477,10 @@ if __name__ == "__main__":
         console.print("  • Provider API keys enable LLM access")
 
         console.print("\n[bold]What happens next:[/bold]")
-        console.print("  1. We'll create a .env file with PROXY_API_KEY")
+        console.print("  1. We'll create a .env file (if missing)")
         console.print("  2. You can add LLM provider credentials (API keys or OAuth)")
-        console.print("  3. The proxy will then start normally")
-
-        console.print(
-            "\n[bold yellow]⚠️  Note:[/bold yellow] The credential tool adds PROXY_API_KEY by default."
-        )
-        console.print("   You can remove it later if you want an unsecured proxy.\n")
+        console.print("  3. Please set PROXY_API_KEY manually or explicitly enable ALLOW_INSECURE_NO_AUTH=true")
+        console.print("  4. The proxy will then start normally\n")
 
         console.input(
             "[bold green]Press Enter to launch the credential setup tool...[/bold green]"
@@ -2309,7 +2488,7 @@ if __name__ == "__main__":
 
     # Check if user explicitly wants to add credentials
     if args.add_credential:
-        # Import and call ensure_env_defaults to create .env and PROXY_API_KEY if needed
+        # Import and call ensure_env_defaults to create .env if needed
         from rotator_library.credential_tool import ensure_env_defaults
 
         ensure_env_defaults()
@@ -2325,11 +2504,14 @@ if __name__ == "__main__":
 
                 ensure_env_defaults()
                 load_dotenv(ENV_FILE, override=False)  # Don't override platform env vars (Render/Railway)
-                PROXY_API_KEY = (os.getenv("PROXY_API_KEY") or "").strip().strip("'\"") or None
                 if not ENV_FILE.is_file():
                     print("WARNING: No .env file found and running in non-interactive mode.")
                     print("Please mount a .env file via Docker volume: -v ./.env:/app/.env")
                     print("Starting proxy anyway...")
+                elif not get_proxy_api_key() and not allow_insecure_no_auth():
+                    print("ERROR: PROXY_API_KEY is not set and ALLOW_INSECURE_NO_AUTH is not enabled.")
+                    print("Refusing to start in non-interactive fail-closed mode.")
+                    sys.exit(1)
                 # Fall through to start the server
             else:
                 # Interactive mode - show onboarding message
@@ -2350,14 +2532,12 @@ if __name__ == "__main__":
 
                 # After credential tool exits, reload and re-check
                 load_dotenv(ENV_FILE, override=False)  # Don't override platform env vars
-                # Re-read PROXY_API_KEY from environment
-                PROXY_API_KEY = (os.getenv("PROXY_API_KEY") or "").strip().strip("'\"") or None
 
                 # Verify onboarding is complete
                 if needs_onboarding():
                     console.print("\n[bold red]❌ Configuration incomplete.[/bold red]")
                     console.print(
-                        "The proxy still cannot start. Please ensure PROXY_API_KEY is set in .env\n"
+                        "The proxy still cannot start. Please set PROXY_API_KEY in .env, or explicitly set ALLOW_INSECURE_NO_AUTH=true\n"
                     )
                     sys.exit(1)
                 else:

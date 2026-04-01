@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from typing import Dict, List
+from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
 from proxy_app.admin_schemas import (
@@ -20,10 +20,11 @@ from proxy_app.admin_schemas import (
     VirtualModelAdminConfig,
 )
 from proxy_app.admin_store import (
+    get_admin_store_health,
     load_admin_config,
-    save_admin_config,
     masked_config_dict,
     merge_masked_key_value,
+    save_admin_config,
 )
 
 
@@ -31,6 +32,20 @@ class AdminService:
     def __init__(self):
         self._cfg = load_admin_config()
         self._last_reload_at = None
+        self._managed_runtime_env_keys: set[str] = set()
+
+    @staticmethod
+    def _current_store_health() -> Dict[str, object]:
+        return get_admin_store_health()
+
+    def _ensure_store_writable(self) -> None:
+        health = self._current_store_health()
+        if health.get("ok"):
+            return
+        raise ValueError(
+            "admin_config.json 已进入损坏保护只读模式，已拒绝写入。"
+            f" error={health.get('error')}; evidence={health.get('corrupt_evidence_path')}"
+        )
 
     @staticmethod
     def _validate_api_base(raw_api_base: str) -> str:
@@ -151,7 +166,9 @@ class AdminService:
 
     def get_config_masked(self) -> Dict:
         self._cfg = load_admin_config()
-        return masked_config_dict(self._cfg)
+        data = masked_config_dict(self._cfg)
+        data["_store_health"] = self._current_store_health()
+        return data
 
     def list_channels(self) -> List[dict]:
         return self.get_config_masked().get("channels", [])
@@ -172,6 +189,7 @@ class AdminService:
             errors.append("Duplicate channel ids are not allowed")
 
         channel_ids = set(ids)
+        enabled_channel_ids = {c.id for c in cfg.channels if c.enabled}
 
         # Channel minimal checks
         for ch in cfg.channels:
@@ -194,6 +212,10 @@ class AdminService:
                         errors.append(
                             f"Virtual model '{vm_name}' references unknown channel '{provider}'"
                         )
+                    elif provider not in enabled_channel_ids:
+                        errors.append(
+                            f"Virtual model '{vm_name}' references disabled channel '{provider}'"
+                        )
 
         return ValidationResult(ok=len(errors) == 0, errors=errors, warnings=warnings)
 
@@ -201,6 +223,7 @@ class AdminService:
     # Channel CRUD
     # -----------------------
     def create_channel(self, req: ChannelCreateRequest) -> Dict:
+        self._ensure_store_writable()
         cfg = self.get_config()
         channel_id = self._sanitize_channel_id(req.id or "")
         if not channel_id:
@@ -225,6 +248,7 @@ class AdminService:
         return out
 
     def update_channel(self, channel_id: str, req: ChannelUpdateRequest) -> Dict:
+        self._ensure_store_writable()
         cfg = self.get_config()
         target_idx = next((idx for idx, c in enumerate(cfg.channels) if c.id == channel_id), None)
         target = cfg.channels[target_idx] if target_idx is not None else None
@@ -271,6 +295,7 @@ class AdminService:
         return out
 
     def delete_channel(self, channel_id: str) -> Dict:
+        self._ensure_store_writable()
         cfg = self.get_config()
         before = len(cfg.channels)
         cfg.channels = [c for c in cfg.channels if c.id != channel_id]
@@ -292,6 +317,7 @@ class AdminService:
     # Key CRUD
     # -----------------------
     def add_key(self, channel_id: str, req: KeyCreateRequest) -> Dict:
+        self._ensure_store_writable()
         cfg = self.get_config()
         target = next((c for c in cfg.channels if c.id == channel_id), None)
         if not target:
@@ -306,6 +332,7 @@ class AdminService:
         return self.get_config_masked()
 
     def update_key(self, channel_id: str, key_id: str, req: KeyUpdateRequest) -> Dict:
+        self._ensure_store_writable()
         cfg = self.get_config()
         ch = next((c for c in cfg.channels if c.id == channel_id), None)
         if not ch:
@@ -326,6 +353,7 @@ class AdminService:
         return self.get_config_masked()
 
     def delete_key(self, channel_id: str, key_id: str) -> Dict:
+        self._ensure_store_writable()
         cfg = self.get_config()
         ch = next((c for c in cfg.channels if c.id == channel_id), None)
         if not ch:
@@ -343,6 +371,7 @@ class AdminService:
     # Virtual model CRUD
     # -----------------------
     def create_or_update_virtual_model(self, name: str, vm: VirtualModelAdminConfig) -> Dict:
+        self._ensure_store_writable()
         cfg = self.get_config()
         cfg.virtual_models[name] = vm
 
@@ -354,6 +383,7 @@ class AdminService:
         return self.get_config_masked()
 
     def delete_virtual_model(self, name: str) -> Dict:
+        self._ensure_store_writable()
         cfg = self.get_config()
         if name not in cfg.virtual_models:
             raise ValueError(f"Virtual model '{name}' not found")
@@ -364,52 +394,72 @@ class AdminService:
     # -----------------------
     # Runtime derivation/reload
     # -----------------------
+    def get_channel(self, channel_id: str) -> Optional[ChannelConfig]:
+        cfg = self.get_config()
+        return next((c for c in cfg.channels if c.id == channel_id), None)
+
+    @staticmethod
+    def _build_channel_overlay(ch: ChannelConfig) -> Dict[str, str]:
+        import json
+
+        env: Dict[str, str] = {}
+        prefix = ch.id.upper()
+        env[f"{prefix}_API_BASE"] = AdminService._normalize_api_base(ch.api_base)
+        env[f"PROVIDER_TYPE_{prefix}"] = (ch.provider_type or "openai_compatible").strip().lower()
+
+        enabled_keys = [k for k in AdminService._dedupe_channel_keys(ch.api_keys) if k.enabled]
+        for idx, key in enumerate(enabled_keys, start=1):
+            env[f"{prefix}_API_KEY_{idx}"] = key.value
+            env[f"{prefix}_API_KEY_ID_{idx}"] = key.id
+
+        effective_models = AdminService._build_effective_models(ch)
+        if effective_models:
+            env[f"{prefix}_MODELS"] = json.dumps(effective_models, ensure_ascii=False)
+
+        env[f"ROTATION_MODE_{prefix}"] = ch.settings.rotation_mode
+        env[f"MAX_CONCURRENT_REQUESTS_PER_KEY_{prefix}"] = str(
+            ch.settings.max_concurrent_requests_per_key
+        )
+        env[f"AUTO_DISABLE_LONG_UNAVAILABLE_{prefix}"] = (
+            "true" if ch.settings.auto_disable_long_unavailable else "false"
+        )
+        env[f"AUTO_DISABLE_UNAVAILABLE_HOURS_{prefix}"] = str(
+            ch.settings.auto_disable_unavailable_hours
+        )
+        if ch.settings.ignore_models:
+            env[f"IGNORE_MODELS_{prefix}"] = ",".join(ch.settings.ignore_models)
+        if ch.settings.whitelist_models:
+            env[f"WHITELIST_MODELS_{prefix}"] = ",".join(ch.settings.whitelist_models)
+
+        return env
+
     def build_runtime_env_overlay(self) -> Dict[str, str]:
         """
         Convert admin_config into env-like overlay, reusing existing startup logic.
+
+        Full-sync semantics:
+        - only enabled channels are emitted
+        - deleted/renamed/disabled channels are cleaned in apply_runtime_overlay()
         """
         cfg = self.get_config()
         env: Dict[str, str] = {}
 
         for ch in cfg.channels:
-            prefix = ch.id.upper()
-            env[f"{prefix}_API_BASE"] = self._normalize_api_base(ch.api_base)
+            if not ch.enabled:
+                continue
+            env.update(self._build_channel_overlay(ch))
 
-            # keys
-            enabled_keys = [k for k in self._dedupe_channel_keys(ch.api_keys) if k.enabled]
-            for idx, k in enumerate(enabled_keys, start=1):
-                env[f"{prefix}_API_KEY_{idx}"] = k.value
-
-            # effective models mapping = provided models(identity) + alias mappings
-            effective_models = self._build_effective_models(ch)
-            if effective_models:
-                import json
-                env[f"{prefix}_MODELS"] = json.dumps(effective_models, ensure_ascii=False)
-
-            # settings
-            env[f"ROTATION_MODE_{prefix}"] = ch.settings.rotation_mode
-            env[f"MAX_CONCURRENT_REQUESTS_PER_KEY_{prefix}"] = str(
-                ch.settings.max_concurrent_requests_per_key
-            )
-            env[f"AUTO_DISABLE_LONG_UNAVAILABLE_{prefix}"] = (
-                "true" if ch.settings.auto_disable_long_unavailable else "false"
-            )
-            env[f"AUTO_DISABLE_UNAVAILABLE_HOURS_{prefix}"] = str(ch.settings.auto_disable_unavailable_hours)
-            if ch.settings.ignore_models:
-                env[f"IGNORE_MODELS_{prefix}"] = ",".join(ch.settings.ignore_models)
-            if ch.settings.whitelist_models:
-                env[f"WHITELIST_MODELS_{prefix}"] = ",".join(ch.settings.whitelist_models)
-
-        # virtual models -> VIRTUAL_MODELS
+        # virtual models -> VIRTUAL_MODELS (only enabled virtual models)
         if cfg.virtual_models:
             import json
-            env["VIRTUAL_MODELS"] = json.dumps(
-                {
-                    name: vm.model_dump()
-                    for name, vm in cfg.virtual_models.items()
-                },
-                ensure_ascii=False,
-            )
+
+            enabled_vms = {
+                name: vm.model_dump()
+                for name, vm in cfg.virtual_models.items()
+                if vm.enabled
+            }
+            if enabled_vms:
+                env["VIRTUAL_MODELS"] = json.dumps(enabled_vms, ensure_ascii=False)
 
         if cfg.policies.global_timeout is not None:
             env["GLOBAL_TIMEOUT"] = str(cfg.policies.global_timeout)
@@ -423,9 +473,17 @@ class AdminService:
         - reload virtual models registry immediately
         - return status (full RotatingClient live rebuild can be added later)
         """
+        self._ensure_store_writable()
         overlay = self.build_runtime_env_overlay()
+        next_keys = set(overlay.keys())
+
+        stale_keys = sorted(self._managed_runtime_env_keys - next_keys)
+        for key in stale_keys:
+            os.environ.pop(key, None)
+
         for k, v in overlay.items():
             os.environ[k] = v
+        self._managed_runtime_env_keys = next_keys
 
         # reload virtual model registry
         from proxy_app.virtual_models import load_virtual_models
@@ -438,6 +496,7 @@ class AdminService:
             "ok": True,
             "message": "runtime overlay applied",
             "overlay_keys": sorted(list(overlay.keys())),
+            "removed_stale_keys": stale_keys,
             "virtual_models_loaded": list(vm.keys()),
             "last_reload_at": self._last_reload_at,
             "config_version": cfg.metadata.version,
@@ -445,16 +504,17 @@ class AdminService:
 
     def get_runtime_status(self) -> RuntimeStatus:
         cfg = self.get_config()
+        health = self._current_store_health()
         channels_enabled = sum(1 for c in cfg.channels if c.enabled)
         virtual_enabled = sum(1 for _, v in cfg.virtual_models.items() if v.enabled)
         return RuntimeStatus(
-            loaded=True,
+            loaded=bool(health.get("ok")),
             config_version=cfg.metadata.version,
             updated_at=cfg.metadata.updated_at,
             channels_enabled=channels_enabled,
             virtual_models_enabled=virtual_enabled,
             last_reload_at=self._last_reload_at,
-            message="ok",
+            message="ok" if health.get("ok") else "admin_config_corrupted_readonly",
         )
 
 

@@ -7,6 +7,7 @@ import time
 import logging
 import asyncio
 import random
+import hashlib
 from datetime import date, datetime, timezone, time as dt_time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -87,6 +88,7 @@ class UsageManager:
         ] = None,
         auto_disable_unavailable_hours: Optional[Dict[str, int]] = None,
         auto_disable_long_unavailable: Optional[Dict[str, bool]] = None,
+        provider_runtime_types: Optional[Dict[str, str]] = None,
     ):
         """
         Initialize the UsageManager.
@@ -133,6 +135,9 @@ class UsageManager:
                 via key-level cooldown to avoid repeated selection attempts.
             auto_disable_long_unavailable: Dict mapping provider -> bool toggle for
                 long-unavailable auto-disable behavior.
+            provider_runtime_types: Dict mapping provider alias -> runtime provider_type.
+                Used when provider plugins should be resolved by provider_type rather
+                than by credential namespace (e.g., admin channel ids).
         """
         # Resolve file_path - use default if not provided
         if file_path is None:
@@ -162,6 +167,11 @@ class UsageManager:
         self._cycle_exhausted: Dict[str, Dict[str, Dict[str, Dict[str, Any]]]] = {}
         self.auto_disable_unavailable_hours = auto_disable_unavailable_hours or {}
         self.auto_disable_long_unavailable = auto_disable_long_unavailable or {}
+        self.provider_runtime_types = {
+            (k or "").strip().lower(): (v or "").strip().lower()
+            for k, v in (provider_runtime_types or {}).items()
+            if (k or "").strip() and (v or "").strip()
+        }
 
         self._data_lock = asyncio.Lock()
         self._usage_data: Optional[Dict] = None
@@ -1009,6 +1019,82 @@ class UsageManager:
 
         return None
 
+    def _get_runtime_provider(self, provider: Optional[str]) -> Optional[str]:
+        if not provider:
+            return provider
+        provider_lower = provider.lower()
+        return self.provider_runtime_types.get(provider_lower, provider_lower)
+
+    @staticmethod
+    def _extract_env_key_index(env_key: str) -> Optional[int]:
+        import re
+
+        m = re.match(r"^[A-Z0-9_]+_API_KEY(?:_(\d+))?$", env_key)
+        if not m:
+            return None
+        if m.group(1) is None:
+            return 1
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+
+    def _resolve_identifier_from_env(self, provider: str, credential: str) -> Optional[str]:
+        provider_upper = provider.upper()
+        for env_key in sorted(os.environ.keys()):
+            if not env_key.startswith(f"{provider_upper}_API_KEY"):
+                continue
+            if "_API_KEY_ID_" in env_key:
+                continue
+
+            idx = self._extract_env_key_index(env_key)
+            if idx is None:
+                continue
+            if os.environ.get(env_key) != credential:
+                continue
+
+            key_id = (os.environ.get(f"{provider_upper}_API_KEY_ID_{idx}") or "").strip()
+            if key_id:
+                return f"key:{provider}/{key_id}"
+            return f"env:{provider}/{idx}"
+        return None
+
+    def _build_public_credential_identifier(self, provider: str, credential: str) -> str:
+        provider = (provider or "unknown").lower()
+
+        if credential.startswith("env://"):
+            parts = credential[6:].split("/")
+            provider_from_uri = (parts[0] if parts else provider).lower()
+            idx = 1
+            if len(parts) > 1:
+                try:
+                    idx = int(parts[1])
+                except Exception:
+                    idx = 1
+            key_id = (
+                os.getenv(f"{provider_from_uri.upper()}_API_KEY_ID_{idx}") or ""
+            ).strip()
+            if key_id:
+                return f"key:{provider_from_uri}/{key_id}"
+            return f"env:{provider_from_uri}/{idx}"
+
+        env_identifier = self._resolve_identifier_from_env(provider, credential)
+        if env_identifier:
+            return env_identifier
+
+        normalized = credential.replace("\\", "/")
+        if normalized.endswith(".json"):
+            return f"oauth:{provider}/{Path(normalized).name}"
+
+        digest = hashlib.sha256(credential.encode("utf-8")).hexdigest()[:12]
+        return f"cred:{provider}/{digest}"
+
+    def _build_public_full_path(self, credential: str) -> Optional[str]:
+        normalized = credential.replace("\\", "/")
+        if credential.startswith("env://") or normalized.endswith(".json"):
+            return credential
+        return None
+
     def _get_provider_instance(self, provider: str) -> Optional[Any]:
         """
         Get or create a provider plugin instance.
@@ -1022,7 +1108,8 @@ class UsageManager:
         if not provider:
             return None
 
-        plugin_class = self.provider_plugins.get(provider)
+        runtime_provider = self._get_runtime_provider(provider)
+        plugin_class = self.provider_plugins.get(runtime_provider)
         if not plugin_class:
             return None
 
@@ -1030,7 +1117,10 @@ class UsageManager:
         if provider not in self._provider_instances:
             # Instantiate the plugin if it's a class, or use it directly if already an instance
             if isinstance(plugin_class, type):
-                self._provider_instances[provider] = plugin_class()
+                try:
+                    self._provider_instances[provider] = plugin_class()
+                except TypeError:
+                    self._provider_instances[provider] = plugin_class(provider)
             else:
                 self._provider_instances[provider] = plugin_class
 
@@ -1193,16 +1283,17 @@ class UsageManager:
         # Determine usage field based on provider
         # Some providers (antigravity) count failed requests against quota
         provider = self._get_provider_from_credential(key)
+        runtime_provider = self._get_runtime_provider(provider)
         usage_field = (
             "request_count"
-            if provider in self._REQUEST_COUNT_PROVIDERS
+            if runtime_provider in self._REQUEST_COUNT_PROVIDERS
             else "success_count"
         )
 
         # For providers with synced quota groups (antigravity), request_count
         # is already synced across all models in the group, so just read directly.
         # For other providers, we still need to sum success_count across group.
-        if provider in self._REQUEST_COUNT_PROVIDERS:
+        if runtime_provider in self._REQUEST_COUNT_PROVIDERS:
             # request_count is synced - just read the model's value
             return self._get_usage_count(key, model, usage_field)
 
@@ -1242,8 +1333,9 @@ class UsageManager:
             Formatted string for logging
         """
         provider = self._get_provider_from_credential(key)
+        runtime_provider = self._get_runtime_provider(provider)
 
-        if provider not in self._REQUEST_COUNT_PROVIDERS:
+        if runtime_provider not in self._REQUEST_COUNT_PROVIDERS:
             # Non-antigravity: just show usage count
             usage = self._get_usage_count(key, model, "success_count")
             return f"usage: {usage}"
@@ -3849,16 +3941,14 @@ class UsageManager:
                 cred_global_tokens["output"] += cred_tokens["output"]
                 cred_global_cost += cred_cost
 
-                # Build credential entry
-                # Mask credential identifier for display
-                if credential.startswith("env://"):
-                    identifier = credential
-                else:
-                    identifier = Path(credential).name
+                # Build credential entry (stable and redacted public identity)
+                identifier = self._build_public_credential_identifier(provider, credential)
+                public_full_path = self._build_public_full_path(credential)
 
                 cred_entry = {
                     "identifier": identifier,
-                    "full_path": credential,
+                    "runtime_credential_id": identifier,
+                    "full_path": public_full_path,
                     "status": status,
                     "last_used_ts": cred_data.get("last_used_ts"),
                     "requests": cred_requests,

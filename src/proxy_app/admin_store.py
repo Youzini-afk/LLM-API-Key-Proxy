@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 import sys
-from typing import Dict
+from typing import Dict, Optional
 
 from proxy_app.admin_schemas import AdminConfig
 
@@ -22,6 +23,28 @@ def get_default_root() -> Path:
 
 MASK = "********"
 
+_LAST_LOAD_ERROR: Optional[str] = None
+_LAST_CORRUPT_EVIDENCE_PATH: Optional[str] = None
+
+
+def _set_store_health(error: Optional[str], evidence_path: Optional[str]) -> None:
+    global _LAST_LOAD_ERROR, _LAST_CORRUPT_EVIDENCE_PATH
+    _LAST_LOAD_ERROR = error
+    _LAST_CORRUPT_EVIDENCE_PATH = evidence_path
+
+
+def _capture_corrupt_evidence(path: Path) -> Optional[str]:
+    if not path.exists() or not path.is_file():
+        return None
+
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    evidence_path = path.with_name(f"{path.stem}.corrupt.{timestamp}{path.suffix}")
+    try:
+        shutil.copy2(path, evidence_path)
+        return str(evidence_path)
+    except Exception:
+        return None
+
 
 def _config_path() -> Path:
     root = get_default_root()
@@ -30,20 +53,54 @@ def _config_path() -> Path:
     return data_dir / "admin_config.json"
 
 
+def get_admin_store_health() -> Dict[str, Optional[str] | bool]:
+    p = _config_path()
+    return {
+        "ok": _LAST_LOAD_ERROR is None,
+        "error": _LAST_LOAD_ERROR,
+        "config_path": str(p),
+        "corrupt_evidence_path": _LAST_CORRUPT_EVIDENCE_PATH,
+    }
+
+
 def load_admin_config() -> AdminConfig:
     p = _config_path()
     if not p.exists():
+        _set_store_health(None, None)
         return AdminConfig()
 
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as e:
+        evidence_path = _capture_corrupt_evidence(p)
+        _set_store_health(
+            f"admin_config.json is corrupted and cannot be parsed: {e}",
+            evidence_path,
+        )
         return AdminConfig()
 
-    return AdminConfig(**data)
+    try:
+        cfg = AdminConfig(**data)
+    except Exception as e:
+        evidence_path = _capture_corrupt_evidence(p)
+        _set_store_health(
+            f"admin_config.json is invalid and failed schema validation: {e}",
+            evidence_path,
+        )
+        return AdminConfig()
+
+    _set_store_health(None, None)
+    return cfg
 
 
 def save_admin_config(cfg: AdminConfig) -> AdminConfig:
+    health = get_admin_store_health()
+    if not health.get("ok"):
+        raise RuntimeError(
+            "admin_config.json is in corrupted read-only protection mode. "
+            f"error={health.get('error')}; evidence={health.get('corrupt_evidence_path')}"
+        )
+
     # bump metadata
     cfg.metadata.version = int(cfg.metadata.version) + 1
     cfg.metadata.updated_at = datetime.utcnow().isoformat() + "Z"
@@ -56,6 +113,7 @@ def save_admin_config(cfg: AdminConfig) -> AdminConfig:
         encoding="utf-8",
     )
     os.replace(tmp, p)
+    _set_store_health(None, None)
 
     return cfg
 

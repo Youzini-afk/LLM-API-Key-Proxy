@@ -53,6 +53,7 @@ docker run -d \
   -v $(pwd)/.env:/app/.env:ro \
   -v $(pwd)/oauth_creds:/app/oauth_creds \
   -v $(pwd)/logs:/app/logs \
+  -v $(pwd)/data:/app/data \
   -e SKIP_OAUTH_INIT_CHECK=true \
   ghcr.io/mirrowel/llm-api-key-proxy:latest
 ```
@@ -69,6 +70,7 @@ docker compose up -d
 > **Important:** You must create both `.env` and `key_usage.json` files before running Docker Compose. If `key_usage.json` doesn't exist, Docker will create it as a directory instead of a file, causing errors.
 
 > **Note:** For OAuth providers, complete authentication locally first using the credential tool, then mount the `oauth_creds/` directory or export credentials to environment variables.
+> **Note:** For WebUI/Admin management durability, mount `./data:/app/data` so `data/admin_config.json` persists across container restarts.
 
 ### From Source
 

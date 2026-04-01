@@ -278,3 +278,84 @@ def test_admin_service_add_key_auto_dedup_by_value(monkeypatch, tmp_path):
     assert len(ch.api_keys) == 1
     assert ch.api_keys[0].id == "k1"
     assert ch.api_keys[0].enabled is True
+
+
+
+def test_admin_service_runtime_overlay_skips_disabled_and_cleans_virtuals(monkeypatch, tmp_path):
+    _, admin_service_mod = _reload_modules(monkeypatch, tmp_path)
+    service = admin_service_mod.AdminService()
+
+    service.create_channel(
+        admin_service_mod.ChannelCreateRequest(
+            id="enabled_a",
+            api_base="https://enabled.example.com/v1",
+            provider_type="openai_compatible",
+            provided_models=["m1"],
+            api_keys=[admin_service_mod.ChannelKeyConfig(id="k1", value="sk-enabled")],
+            enabled=True,
+        )
+    )
+    service.create_channel(
+        admin_service_mod.ChannelCreateRequest(
+            id="disabled_b",
+            api_base="https://disabled.example.com/v1",
+            provider_type="openai_compatible",
+            provided_models=["m2"],
+            api_keys=[admin_service_mod.ChannelKeyConfig(id="k1", value="sk-disabled")],
+            enabled=False,
+        )
+    )
+
+    from proxy_app.admin_schemas import VirtualModelAdminConfig, VirtualTargetConfig
+
+    service.create_or_update_virtual_model(
+        "vm_enabled",
+        VirtualModelAdminConfig(
+            enabled=True,
+            strategy="sequential",
+            targets=[VirtualTargetConfig(model="enabled_a/m1")],
+        ),
+    )
+
+    overlay = service.build_runtime_env_overlay()
+    assert "ENABLED_A_API_BASE" in overlay
+    assert "DISABLED_B_API_BASE" not in overlay
+    assert "VIRTUAL_MODELS" in overlay
+
+    apply1 = service.apply_runtime_overlay()
+    assert "ENABLED_A_API_BASE" in apply1["overlay_keys"]
+
+    service.create_or_update_virtual_model(
+        "vm_enabled",
+        VirtualModelAdminConfig(enabled=False, strategy="sequential", targets=[VirtualTargetConfig(model="enabled_a/m1")]),
+    )
+    service.update_channel("enabled_a", admin_service_mod.ChannelUpdateRequest(enabled=False))
+    apply2 = service.apply_runtime_overlay()
+    assert "ENABLED_A_API_BASE" in apply2["removed_stale_keys"]
+    assert "VIRTUAL_MODELS" in apply2["removed_stale_keys"]
+
+
+def test_admin_service_corrupted_config_readonly_protection(monkeypatch, tmp_path):
+    admin_store, admin_service_mod = _reload_modules(monkeypatch, tmp_path)
+
+    config_path = admin_store.get_default_root() / "data" / "admin_config.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("{bad json", encoding="utf-8")
+
+    service = admin_service_mod.AdminService()
+    masked = service.get_config_masked()
+    store_health = masked.get("_store_health", {})
+    assert store_health.get("ok") is False
+    assert store_health.get("corrupt_evidence_path")
+
+    try:
+        service.create_channel(
+            admin_service_mod.ChannelCreateRequest(
+                id="blocked_write",
+                api_base="https://example.com/v1",
+                provider_type="openai_compatible",
+            )
+        )
+        assert False, "expected readonly protection to block writes"
+    except ValueError as e:
+        assert "只读模式" in str(e)

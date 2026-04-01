@@ -648,10 +648,31 @@ class ProviderConfig:
                 api_base="http://...", custom_llm_provider="openai"
     """
 
-    def __init__(self):
+    def __init__(self, provider_type_overrides: Optional[Dict[str, str]] = None):
         self._api_bases: Dict[str, str] = {}
         self._custom_providers: Set[str] = set()
+        self._provider_type_overrides: Dict[str, str] = {}
+
+        for provider, runtime_provider in (provider_type_overrides or {}).items():
+            p = (provider or "").strip().lower()
+            rt = (runtime_provider or "").strip().lower()
+            if p and rt:
+                self._provider_type_overrides[p] = rt
+
         self._load_api_bases()
+        self._load_provider_type_overrides_from_env()
+
+    def _load_provider_type_overrides_from_env(self) -> None:
+        for key, value in os.environ.items():
+            if not key.startswith("PROVIDER_TYPE_") or not value:
+                continue
+            provider = key.replace("PROVIDER_TYPE_", "", 1).strip().lower()
+            runtime_provider = value.strip().lower()
+            if provider and runtime_provider:
+                self._provider_type_overrides[provider] = runtime_provider
+                lib_logger.info(
+                    f"Provider type override loaded: {provider} -> {runtime_provider}"
+                )
 
     def _load_api_bases(self) -> None:
         """
@@ -681,8 +702,17 @@ class ProviderConfig:
         """Check if provider is known to LiteLLM."""
         return provider.lower() in KNOWN_PROVIDERS
 
+    def get_runtime_provider(self, provider: str) -> str:
+        provider_lower = (provider or "").strip().lower()
+        if not provider_lower:
+            return provider_lower
+        return self._provider_type_overrides.get(provider_lower, provider_lower)
+
     def is_custom_provider(self, provider: str) -> bool:
         """Check if provider is a custom OpenAI-compatible provider."""
+        runtime_provider = self.get_runtime_provider(provider)
+        if runtime_provider in {"custom", "openai_compatible"}:
+            return True
         return provider.lower() in self._custom_providers
 
     def get_api_base(self, provider: str) -> Optional[str]:
@@ -714,30 +744,37 @@ class ProviderConfig:
 
         # Extract provider from model string (e.g., "openai/gpt-4" → "openai")
         provider = model.split("/")[0].lower()
-        api_base = self._api_bases.get(provider)
-
-        if not api_base:
-            # No override configured for this provider
-            return kwargs
+        runtime_provider = self.get_runtime_provider(provider)
+        api_base = self._api_bases.get(provider) or self._api_bases.get(runtime_provider)
 
         # Create a copy to avoid modifying the original
         kwargs = kwargs.copy()
 
-        if provider in KNOWN_PROVIDERS:
-            # Known provider - just add api_base override
-            kwargs["api_base"] = api_base
-            lib_logger.debug(
-                f"Applying api_base override for known provider {provider}: {api_base}"
-            )
-        else:
-            # Custom provider - route through OpenAI-compatible endpoint
-            model_name = model.split("/", 1)[1] if "/" in model else model
-            kwargs["model"] = f"openai/{model_name}"
-            kwargs["api_base"] = api_base
-            kwargs["custom_llm_provider"] = "openai"
-            lib_logger.debug(
-                f"Routing custom provider {provider} through openai: "
-                f"model={kwargs['model']}, api_base={api_base}"
-            )
+        # Provider type is a first-class runtime concept:
+        # channel-id prefixes can map to a real runtime provider_type.
+        if runtime_provider and runtime_provider not in {"custom", "openai_compatible"}:
+            if runtime_provider != provider:
+                model_name = model.split("/", 1)[1] if "/" in model else model
+                kwargs["model"] = f"{runtime_provider}/{model_name}"
+                provider = runtime_provider
+
+            if provider in KNOWN_PROVIDERS:
+                if api_base:
+                    kwargs["api_base"] = api_base
+                return kwargs
+
+        # Custom provider - route through OpenAI-compatible endpoint
+        # (requires api_base to be meaningful).
+        if not api_base:
+            return kwargs
+
+        model_name = kwargs["model"].split("/", 1)[1] if "/" in kwargs["model"] else kwargs["model"]
+        kwargs["model"] = f"openai/{model_name}"
+        kwargs["api_base"] = api_base
+        kwargs["custom_llm_provider"] = "openai"
+        lib_logger.debug(
+            f"Routing custom provider {provider} through openai: "
+            f"model={kwargs['model']}, api_base={api_base}"
+        )
 
         return kwargs

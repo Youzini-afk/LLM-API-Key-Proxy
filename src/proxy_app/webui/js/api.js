@@ -160,6 +160,12 @@ class ProxyAPI {
     });
   }
 
+  async discoverModelsForChannel(channelId) {
+    return this.request(`/admin/channels/${encodeURIComponent(channelId)}/discover-models`, {
+      method: 'POST',
+    });
+  }
+
   async getVirtualModels() {
     return this.request('/admin/virtual-models');
   }

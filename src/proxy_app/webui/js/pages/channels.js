@@ -851,9 +851,9 @@ export async function renderChannels(container) {
               className: 'btn btn-ghost btn-sm',
               onClick: async () => {
                 try {
-                  const firstEnabledKey = (ch.api_keys || []).find(k => k.enabled)?.value || '';
-                  const res = await api.discoverModels(ch.api_base, firstEnabledKey);
-                  await api.updateChannel(ch.id, { provided_models: normalizeModelList(res.models || []) });
+                  const res = await api.discoverModelsForChannel(ch.id);
+                  const nextProvidedModels = normalizeModelList(res.models || []);
+                  await api.updateChannel(ch.id, { provided_models: nextProvidedModels });
                   showToast(`已拉取 ${res.models?.length || 0} 个实际上游模型`, 'success');
                   renderChannels(container);
                 } catch (e) {

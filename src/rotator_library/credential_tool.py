@@ -1117,21 +1117,18 @@ def clear_screen(subtitle: str = "Interactive Credential Setup"):
 
 def ensure_env_defaults():
     """
-    Ensures the .env file exists and contains essential default values like PROXY_API_KEY.
+    Ensures the .env file exists.
+
+    Security note:
+    - This helper intentionally does NOT write a default PROXY_API_KEY.
+    - Authentication defaults are fail-closed unless explicitly overridden by
+      ALLOW_INSECURE_NO_AUTH=true.
     """
     if not _get_env_file().is_file():
         _get_env_file().touch()
         console.print(
             f"Creating a new [bold yellow]{_get_env_file().name}[/bold yellow] file..."
         )
-
-    # Check for PROXY_API_KEY, similar to setup_env.bat
-    if get_key(str(_get_env_file()), "PROXY_API_KEY") is None:
-        default_key = "VerysecretKey"
-        console.print(
-            f"Adding default [bold cyan]PROXY_API_KEY[/bold cyan] to [bold yellow]{_get_env_file().name}[/bold yellow]..."
-        )
-        set_key(str(_get_env_file()), "PROXY_API_KEY", default_key)
 
 
 # =============================================================================
