@@ -1095,6 +1095,33 @@ async def verify_anthropic_api_key(
     raise HTTPException(status_code=401, detail="Invalid or missing API Key")
 
 
+def _status_code_for_proxy_error(error: dict) -> int:
+    """Map structured proxy error payloads to HTTP status codes."""
+    if not isinstance(error, dict):
+        return 500
+
+    explicit_code = error.get("code")
+    if isinstance(explicit_code, int) and 100 <= explicit_code <= 599:
+        return explicit_code
+
+    error_type = (error.get("type") or "").strip().lower()
+    if error_type in {"invalid_request", "context_window_exceeded"}:
+        return 400
+    if error_type == "authentication":
+        return 401
+    if error_type == "rate_limit":
+        return 429
+    if error_type in {"proxy_busy", "proxy_all_credentials_exhausted", "virtual_model_exhausted"}:
+        return 503
+    if error_type == "proxy_timeout":
+        return 504
+    if error_type == "proxy_internal_error":
+        return 500
+    if error_type in {"api_connection", "server_error"}:
+        return 503
+    return 502
+
+
 async def streaming_response_wrapper(
     request: Request,
     request_data: dict,
@@ -1390,10 +1417,7 @@ async def chat_completions(
 
                 # If result is an error dict, return as JSON error
                 if isinstance(result, dict) and "error" in result:
-                    status_code = 502
-                    err_type = result["error"].get("type", "")
-                    if err_type == "virtual_model_exhausted":
-                        status_code = 502
+                    status_code = _status_code_for_proxy_error(result["error"])
                     return JSONResponse(content=result, status_code=status_code, headers=resp_headers)
 
                 return result
@@ -1409,6 +1433,15 @@ async def chat_completions(
             )
         else:
             response = await client.acompletion(request=request, **request_data)
+            if isinstance(response, dict) and "error" in response:
+                status_code = _status_code_for_proxy_error(response["error"])
+                if raw_logger:
+                    raw_logger.log_final_response(
+                        status_code=status_code,
+                        headers=None,
+                        body=response,
+                    )
+                return JSONResponse(content=response, status_code=status_code)
             if raw_logger:
                 # Assuming response has status_code and headers attributes
                 # This might need adjustment based on the actual response object

@@ -134,3 +134,23 @@ async def test_verify_anthropic_api_key_fail_closed_without_key(monkeypatch):
         await main_mod.verify_anthropic_api_key(x_api_key=None, auth=None)
 
     assert exc.value.status_code == 503
+
+
+def test_status_code_for_proxy_error_timeout(monkeypatch):
+    main_mod = _reload_main(monkeypatch)
+
+    status = main_mod._status_code_for_proxy_error(
+        {"type": "proxy_timeout", "message": "timed out"}
+    )
+
+    assert status == 504
+
+
+def test_status_code_for_proxy_error_credentials_exhausted(monkeypatch):
+    main_mod = _reload_main(monkeypatch)
+
+    status = main_mod._status_code_for_proxy_error(
+        {"type": "proxy_all_credentials_exhausted", "message": "all exhausted"}
+    )
+
+    assert status == 503

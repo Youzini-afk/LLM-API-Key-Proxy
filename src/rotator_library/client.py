@@ -1114,6 +1114,7 @@ class RotatingClient:
         request: Optional[Any] = None,
         provider_plugin: Optional[Any] = None,
         initial_timeout: Optional[float] = None,
+        deadline: Optional[float] = None,
     ) -> AsyncGenerator[Any, None]:
         """
         A hybrid wrapper for streaming that buffers fragmented JSON, handles client disconnections gracefully,
@@ -1132,6 +1133,7 @@ class RotatingClient:
         accumulated_finish_reason = None  # Track strongest finish_reason across chunks
         has_tool_calls = False  # Track if ANY tool calls were seen in stream
         waiting_for_first_chunk = True
+        provider = model.split("/")[0] if "/" in model else ""
 
         try:
             while True:
@@ -1147,7 +1149,54 @@ class RotatingClient:
                             stream_iterator.__anext__(), timeout=initial_timeout
                         )
                     else:
-                        chunk = await stream_iterator.__anext__()
+                        chunk_timeout = None
+                        if deadline is not None:
+                            try:
+                                chunk_timeout = self._compute_attempt_timeout(
+                                    deadline, streaming=True
+                                )
+                            except TimeoutError:
+                                timeout_message = (
+                                    f"Streaming response for {model} exceeded the global timeout budget."
+                                )
+                                lib_logger.warning(timeout_message)
+                                classified_error = classify_error(
+                                    TimeoutError(timeout_message), provider=provider
+                                )
+                                await self.usage_manager.record_failure(
+                                    key,
+                                    model,
+                                    classified_error,
+                                    increment_consecutive_failures=False,
+                                )
+                                yield f"data: {json.dumps({'error': {'message': timeout_message, 'type': 'proxy_timeout'}})}\n\n"
+                                yield "data: [DONE]\n\n"
+                                return
+
+                        if chunk_timeout is not None:
+                            try:
+                                chunk = await asyncio.wait_for(
+                                    stream_iterator.__anext__(), timeout=chunk_timeout
+                                )
+                            except asyncio.TimeoutError:
+                                timeout_message = (
+                                    f"Streaming response for {model} stalled and exceeded the remaining timeout budget."
+                                )
+                                lib_logger.warning(timeout_message)
+                                classified_error = classify_error(
+                                    TimeoutError(timeout_message), provider=provider
+                                )
+                                await self.usage_manager.record_failure(
+                                    key,
+                                    model,
+                                    classified_error,
+                                    increment_consecutive_failures=False,
+                                )
+                                yield f"data: {json.dumps({'error': {'message': timeout_message, 'type': 'proxy_timeout'}})}\n\n"
+                                yield "data: [DONE]\n\n"
+                                return
+                        else:
+                            chunk = await stream_iterator.__anext__()
                     waiting_for_first_chunk = False
                     if json_buffer:
                         lib_logger.warning(
@@ -2410,6 +2459,7 @@ class RotatingClient:
                                     initial_timeout=self._compute_attempt_timeout(
                                         deadline, streaming=True
                                     ),
+                                    deadline=deadline,
                                 )
 
                                 # Wrap with transaction logging
@@ -2672,6 +2722,7 @@ class RotatingClient:
                                 initial_timeout=self._compute_attempt_timeout(
                                     deadline, streaming=True
                                 ),
+                                deadline=deadline,
                             )
 
                             # Wrap with transaction logging
