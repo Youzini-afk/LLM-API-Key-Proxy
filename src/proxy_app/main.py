@@ -1496,7 +1496,8 @@ async def list_models(
         for ch in cfg.channels:
             if not ch.enabled:
                 continue
-            for model_name in (ch.models or {}).keys():
+            effective_models = admin_service._build_effective_models(ch)
+            for model_name in effective_models.keys():
                 configured_model_ids.append(f"{ch.id}/{model_name}")
     except Exception as e:
         logging.debug(f"Failed to collect admin-configured models fallback: {e}")
@@ -1928,7 +1929,16 @@ async def admin_test_channel(
     if not enabled_keys:
         return {"ok": False, "message": "No enabled key in this channel"}
 
-    selected_models = (body.models if body else None) or list(channel.models.keys())
+    inferred_upstream_models = list(channel.provided_models or [])
+    if not inferred_upstream_models:
+        effective_models = admin_service._build_effective_models(channel)
+        inferred_upstream_models = list(
+            dict.fromkeys(
+                (cfg.get("id") or model_name) for model_name, cfg in effective_models.items()
+            )
+        )
+
+    selected_models = (body.models if body else None) or inferred_upstream_models
     if not selected_models:
         return {
             "ok": False,

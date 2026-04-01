@@ -12,6 +12,18 @@ RouteStrategy = Literal["sequential", "primary_backup", "weighted_random"]
 RotationMode = Literal["balanced", "sequential"]
 
 
+def _normalize_string_list(values: Optional[List[str]]) -> List[str]:
+    normalized: List[str] = []
+    seen = set()
+    for item in values or []:
+        s = (item or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        normalized.append(s)
+    return normalized
+
+
 class AdminMeta(BaseModel):
     version: int = 1
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
@@ -39,8 +51,14 @@ class ChannelConfig(BaseModel):
     enabled: bool = True
     api_base: str = Field(..., min_length=1)
     api_keys: List[ChannelKeyConfig] = Field(default_factory=list)
+    provided_models: List[str] = Field(default_factory=list)
     models: Dict[str, dict] = Field(default_factory=dict)
     settings: ChannelSettingsConfig = Field(default_factory=ChannelSettingsConfig)
+
+    @field_validator("provided_models")
+    @classmethod
+    def validate_provided_models(cls, v: List[str]) -> List[str]:
+        return _normalize_string_list(v)
 
     @field_validator("id")
     @classmethod
@@ -117,6 +135,7 @@ class ChannelCreateRequest(BaseModel):
     enabled: bool = True
     api_base: str = Field(..., min_length=1)
     api_keys: List[ChannelKeyConfig] = Field(default_factory=list)
+    provided_models: List[str] = Field(default_factory=list)
     models: Dict[str, dict] = Field(default_factory=dict)
     settings: ChannelSettingsConfig = Field(default_factory=ChannelSettingsConfig)
 
@@ -128,6 +147,11 @@ class ChannelCreateRequest(BaseModel):
             raise ValueError("provider_type cannot be empty")
         return s
 
+    @field_validator("provided_models")
+    @classmethod
+    def validate_provided_models(cls, v: List[str]) -> List[str]:
+        return _normalize_string_list(v)
+
 
 
 
@@ -137,6 +161,7 @@ class ChannelUpdateRequest(BaseModel):
     display_name: Optional[str] = None
     enabled: Optional[bool] = None
     api_base: Optional[str] = None
+    provided_models: Optional[List[str]] = None
     models: Optional[Dict[str, dict]] = None
     settings: Optional[ChannelSettingsConfig] = None
 
@@ -149,6 +174,15 @@ class ChannelUpdateRequest(BaseModel):
         if not s:
             raise ValueError("provider_type cannot be empty")
         return s
+
+    @field_validator("provided_models")
+    @classmethod
+    def validate_provided_models(
+        cls, v: Optional[List[str]]
+    ) -> Optional[List[str]]:
+        if v is None:
+            return None
+        return _normalize_string_list(v)
 
 
 class KeyCreateRequest(BaseModel):

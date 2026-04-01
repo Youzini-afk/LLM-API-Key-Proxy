@@ -72,6 +72,63 @@ class AdminService:
             idx += 1
         return f"{base}_{idx}"
 
+    @staticmethod
+    def _dedupe_channel_keys(keys: List[ChannelKeyConfig]) -> List[ChannelKeyConfig]:
+        deduped: List[ChannelKeyConfig] = []
+        seen_ids = set()
+        value_index: Dict[str, int] = {}
+
+        for item in keys or []:
+            if isinstance(item, ChannelKeyConfig):
+                key = item
+            else:
+                payload = item.model_dump() if hasattr(item, "model_dump") else item
+                key = ChannelKeyConfig(**payload)
+            key_id = (key.id or "").strip()
+            key_value = (key.value or "").strip()
+
+            if not key_id or not key_value:
+                continue
+
+            if key_id in seen_ids:
+                raise ValueError(f"Duplicate key id '{key_id}' is not allowed in the same channel")
+
+            if key_value in value_index:
+                existing_idx = value_index[key_value]
+                existing = deduped[existing_idx]
+                deduped[existing_idx] = existing.model_copy(
+                    update={"enabled": existing.enabled or key.enabled}
+                )
+                continue
+
+            normalized = key.model_copy(update={"id": key_id, "value": key_value})
+            seen_ids.add(key_id)
+            value_index[key_value] = len(deduped)
+            deduped.append(normalized)
+
+        return deduped
+
+    @staticmethod
+    def _build_effective_models(channel: ChannelConfig) -> Dict[str, dict]:
+        effective: Dict[str, dict] = {}
+
+        for model_name in channel.provided_models or []:
+            if model_name:
+                effective[model_name] = {"id": model_name}
+
+        for alias, cfg in (channel.models or {}).items():
+            alias_name = (alias or "").strip()
+            if not alias_name:
+                continue
+            if isinstance(cfg, str):
+                effective[alias_name] = {"id": cfg}
+                continue
+            data = dict(cfg or {})
+            data["id"] = (data.get("id") or alias_name).strip()
+            effective[alias_name] = data
+
+        return effective
+
     # -----------------------
     # Basic getters
     # -----------------------
@@ -107,8 +164,9 @@ class AdminService:
         for ch in cfg.channels:
             if ch.enabled and not ch.api_keys:
                 warnings.append(f"Enabled channel '{ch.id}' has no API keys")
-            if ch.enabled and not ch.models:
-                warnings.append(f"Enabled channel '{ch.id}' has empty models mapping")
+            effective_models = self._build_effective_models(ch)
+            if ch.enabled and not effective_models:
+                warnings.append(f"Enabled channel '{ch.id}' has no provided models or mappings")
 
         # Virtual model target checks
         for vm_name, vm in cfg.virtual_models.items():
@@ -139,6 +197,9 @@ class AdminService:
 
         payload = req.model_dump()
         payload["id"] = channel_id
+        payload["api_keys"] = [
+            key.model_dump() for key in self._dedupe_channel_keys(req.api_keys)
+        ]
         payload["api_base"] = self._normalize_api_base(payload.get("api_base") or "")
 
         cfg.channels.append(ChannelConfig(**payload))
@@ -222,10 +283,12 @@ class AdminService:
         target = next((c for c in cfg.channels if c.id == channel_id), None)
         if not target:
             raise ValueError(f"Channel '{channel_id}' not found")
+
         if any(k.id == req.id for k in target.api_keys):
             raise ValueError(f"Key id '{req.id}' already exists in channel '{channel_id}'")
 
         target.api_keys.append(req)
+        target.api_keys = self._dedupe_channel_keys(target.api_keys)
         self._cfg = save_admin_config(cfg)
         return self.get_config_masked()
 
@@ -243,6 +306,8 @@ class AdminService:
             key.value = merge_masked_key_value(key.value, upd["value"])
         if "enabled" in upd:
             key.enabled = upd["enabled"]
+
+        ch.api_keys = self._dedupe_channel_keys(ch.api_keys)
 
         self._cfg = save_admin_config(cfg)
         return self.get_config_masked()
@@ -298,14 +363,15 @@ class AdminService:
             env[f"{prefix}_API_BASE"] = ch.api_base
 
             # keys
-            enabled_keys = [k for k in ch.api_keys if k.enabled]
+            enabled_keys = [k for k in self._dedupe_channel_keys(ch.api_keys) if k.enabled]
             for idx, k in enumerate(enabled_keys, start=1):
                 env[f"{prefix}_API_KEY_{idx}"] = k.value
 
-            # models mapping
-            if ch.models:
+            # effective models mapping = provided models(identity) + alias mappings
+            effective_models = self._build_effective_models(ch)
+            if effective_models:
                 import json
-                env[f"{prefix}_MODELS"] = json.dumps(ch.models, ensure_ascii=False)
+                env[f"{prefix}_MODELS"] = json.dumps(effective_models, ensure_ascii=False)
 
             # settings
             env[f"ROTATION_MODE_{prefix}"] = ch.settings.rotation_mode

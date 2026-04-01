@@ -145,6 +145,7 @@ def test_admin_service_runtime_overlay(monkeypatch, tmp_path):
     assert overlay["DASHSCOPE_A_API_BASE"] == "https://example.com/v1"
     assert overlay["DASHSCOPE_A_API_KEY_1"] == "abc123"
     assert "DASHSCOPE_A_MODELS" in overlay
+    assert '"kimi2.5": {"id": "kimi-k2"}' in overlay["DASHSCOPE_A_MODELS"]
     assert overlay["AUTO_DISABLE_LONG_UNAVAILABLE_DASHSCOPE_A"] == "true"
     assert overlay["AUTO_DISABLE_UNAVAILABLE_HOURS_DASHSCOPE_A"] == "12"
 
@@ -191,3 +192,86 @@ def test_admin_service_update_channel_id_and_custom_provider(monkeypatch, tmp_pa
     assert channel.provider_type == "infini_custom"
     assert channel.display_name == "安安干饭"
     assert cfg.virtual_models["kimi2.5"].targets[0].model == "infini_custom_a/kimi2.5"
+
+
+def test_admin_service_provided_models_are_separate_from_alias_mapping(monkeypatch, tmp_path):
+    _, admin_service_mod = _reload_modules(monkeypatch, tmp_path)
+    service = admin_service_mod.AdminService()
+
+    from proxy_app.admin_schemas import ChannelKeyConfig
+
+    service.create_channel(
+        admin_service_mod.ChannelCreateRequest(
+            id="custom_a",
+            api_base="https://example.com/v1",
+            provider_type="custom",
+            provided_models=["glm-5", "kimi-k2.5"],
+            models={"[喵喵] glm-5": {"id": "glm-5"}},
+            api_keys=[ChannelKeyConfig(id="k1", value="abc123")],
+        )
+    )
+
+    cfg = service.get_config()
+    ch = next(c for c in cfg.channels if c.id == "custom_a")
+    assert ch.provided_models == ["glm-5", "kimi-k2.5"]
+    assert ch.models == {"[喵喵] glm-5": {"id": "glm-5"}}
+
+    overlay = service.build_runtime_env_overlay()
+    assert '"glm-5": {"id": "glm-5"}' in overlay["CUSTOM_A_MODELS"]
+    assert '"kimi-k2.5": {"id": "kimi-k2.5"}' in overlay["CUSTOM_A_MODELS"]
+    assert '"[喵喵] glm-5": {"id": "glm-5"}' in overlay["CUSTOM_A_MODELS"]
+
+
+def test_admin_service_auto_dedup_channel_key_pool_by_value(monkeypatch, tmp_path):
+    _, admin_service_mod = _reload_modules(monkeypatch, tmp_path)
+    service = admin_service_mod.AdminService()
+
+    from proxy_app.admin_schemas import ChannelKeyConfig
+
+    service.create_channel(
+        admin_service_mod.ChannelCreateRequest(
+            id="custom_a",
+            api_base="https://example.com/v1",
+            provider_type="custom",
+            provided_models=["glm-5"],
+            api_keys=[
+                ChannelKeyConfig(id="k1", value=" sk-dup ", enabled=False),
+                ChannelKeyConfig(id="k2", value="sk-dup", enabled=True),
+                ChannelKeyConfig(id="k3", value="sk-unique", enabled=True),
+            ],
+        )
+    )
+
+    cfg = service.get_config()
+    ch = next(c for c in cfg.channels if c.id == "custom_a")
+    assert len(ch.api_keys) == 2
+    assert ch.api_keys[0].id == "k1"
+    assert ch.api_keys[0].value == "sk-dup"
+    assert ch.api_keys[0].enabled is True
+    assert ch.api_keys[1].id == "k3"
+
+    overlay = service.build_runtime_env_overlay()
+    assert overlay["CUSTOM_A_API_KEY_1"] == "sk-dup"
+    assert overlay["CUSTOM_A_API_KEY_2"] == "sk-unique"
+
+
+def test_admin_service_add_key_auto_dedup_by_value(monkeypatch, tmp_path):
+    _, admin_service_mod = _reload_modules(monkeypatch, tmp_path)
+    service = admin_service_mod.AdminService()
+
+    service.create_channel(
+        admin_service_mod.ChannelCreateRequest(
+            id="custom_a",
+            api_base="https://example.com/v1",
+            provider_type="custom",
+            provided_models=["glm-5"],
+        )
+    )
+    service.add_key("custom_a", admin_service_mod.KeyCreateRequest(id="k1", value="sk-dup", enabled=False))
+    service.add_key("custom_a", admin_service_mod.KeyCreateRequest(id="k2", value=" sk-dup ", enabled=True))
+
+    cfg = service.get_config()
+    ch = next(c for c in cfg.channels if c.id == "custom_a")
+    assert len(ch.api_keys) == 1
+    assert ch.api_keys[0].id == "k1"
+    assert ch.api_keys[0].enabled is True

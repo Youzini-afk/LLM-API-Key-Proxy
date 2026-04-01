@@ -52,10 +52,67 @@ function inferTemplateByUrl(url) {
   ];
 }
 
+function normalizeModelList(items) {
+  const seen = new Set();
+  const result = [];
+  (items || []).forEach((item) => {
+    const value = (item || '').trim();
+    if (!value || seen.has(value)) return;
+    seen.add(value);
+    result.push(value);
+  });
+  return result;
+}
+
+function extractProvidedModels(initial) {
+  const explicit = normalizeModelList(initial?.provided_models || []);
+  if (explicit.length > 0) return explicit;
+  const inferred = modelsToPairs(initial?.models || {}).map((p) => p.value);
+  return normalizeModelList(inferred);
+}
+
+function extractAliasPairs(initial, providedModels) {
+  const provided = new Set(normalizeModelList(providedModels));
+  const aliases = modelsToPairs(initial?.models || {}).filter((p) => {
+    const key = (p.key || '').trim();
+    const value = (p.value || '').trim();
+    if (!key || !value) return false;
+    if (key === value && provided.has(value)) return false;
+    return true;
+  });
+  return aliases.length > 0 ? aliases : [{ key: '', value: '' }];
+}
+
+function pairsToAliasModels(pairs) {
+  return pairsToModels((pairs || []).filter((p) => (p.key || '').trim() && (p.value || '').trim()));
+}
+
+function normalizeKeyPool(items) {
+  const result = [];
+  const seenValues = new Set();
+  const seenIds = new Set();
+
+  (items || []).forEach((item) => {
+    const id = (item?.id || '').trim();
+    const value = (item?.value || '').trim();
+    if (!id || !value || seenIds.has(id)) return;
+    if (seenValues.has(value)) {
+      const existing = result.find((x) => x.value === value);
+      if (existing) existing.enabled = existing.enabled || (item?.enabled !== false);
+      return;
+    }
+    seenIds.add(id);
+    seenValues.add(value);
+    result.push({ id, value, enabled: item?.enabled !== false });
+  });
+
+  return result;
+}
+
 function createChannelFormModal({ title = '新增渠道', initial = null, onSubmit }) {
   let mode = 'visual';
-  let pairs = modelsToPairs(initial?.models || {});
-  if (pairs.length === 0) pairs = [{ key: '', value: '' }];
+  let providedModels = extractProvidedModels(initial);
+  let pairs = extractAliasPairs(initial, providedModels);
 
   // 渠道级 Key 池（仅在新增时编辑；编辑场景保持原有 key 管理入口）
   let keyPool = (initial?.api_keys || []).map(k => ({
@@ -115,12 +172,14 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
         )),
 
         h('div', { id: 'provider-custom-wrap', className: 'mt-sm', style: `display:${providerMatched ? 'none' : 'block'}` },
+          h('label', { className: 'input-label' }, '自定义 Provider Type（可选）'),
           h('input', {
             id: 'ch-provider-type-custom',
             className: 'input-field',
             value: providerMatched ? '' : initialProviderType,
-            placeholder: '自定义 provider_type（例如 infini_custom）',
-          })
+            placeholder: '可选：自定义 Provider Type（不填则默认为 custom）',
+          }),
+          h('div', { className: 'text-muted mt-sm' }, '自定义渠道主要由完整 URL 决定；这里仅用于分类标识，可留空')
         ),
 
         !initial ? h('div', { className: 'mt-md', style: 'border:1px solid rgba(70,72,79,.25); border-radius:12px; padding:12px;' },
@@ -164,7 +223,7 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
 
         h('div', { className: 'mt-md', style: 'border:1px solid rgba(70,72,79,.25); border-radius:12px; padding:12px;' },
           h('div', { className: 'flex items-center justify-between mb-sm' },
-            h('div', { className: 'font-headline' }, '模型重定向'),
+            h('div', { className: 'font-headline' }, '模型配置'),
             h('div', { className: 'flex gap-sm' },
               h('button', {
                 className: 'btn btn-ghost btn-sm',
@@ -178,9 +237,10 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
                       showToast('未拉取到模型，请检查 URL / API Key', 'warning');
                       return;
                     }
-                    pairs = res.models.map(m => ({ key: m, value: m }));
+                    providedModels = normalizeModelList(res.models);
+                    renderProvidedModels();
                     renderPairs();
-                    showToast(`已拉取 ${res.models.length} 个模型`, 'success');
+                    showToast(`已拉取 ${providedModels.length} 个实际上游模型`, 'success');
                   } catch (e) {
                     showToast(`拉取模型失败: ${e.message}`, 'error');
                   }
@@ -191,12 +251,41 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
                 type: 'button',
                 onClick: () => {
                   const apiBase = document.getElementById('ch-api-base').value;
-                  pairs = inferTemplateByUrl(apiBase);
+                  const templatePairs = inferTemplateByUrl(apiBase);
+                  providedModels = normalizeModelList(templatePairs.map((p) => p.value));
+                  pairs = templatePairs.filter((p) => (p.key || '').trim() !== (p.value || '').trim());
+                  if (pairs.length === 0) pairs = [{ key: '', value: '' }];
+                  renderProvidedModels();
                   renderPairs();
                 },
               }, '填入模板')
             )
           ),
+          h('div', { className: 'font-headline mb-sm' }, '实际上游模型'),
+          h('div', { className: 'flex gap-sm items-center mb-sm' },
+            h('input', {
+              id: 'provided-model-input',
+              className: 'input-field',
+              style: { flex: '1' },
+              placeholder: '输入一个或多个实际上游模型，支持逗号分隔',
+            }),
+            h('button', {
+              className: 'btn btn-ghost btn-sm',
+              type: 'button',
+              onClick: () => {
+                const input = modal.querySelector('#provided-model-input');
+                const values = (input?.value || '').split(/[\n,]/g).map((x) => x.trim()).filter(Boolean);
+                providedModels = normalizeModelList([...(providedModels || []), ...values]);
+                if (input) input.value = '';
+                renderProvidedModels();
+                renderPairs();
+              }
+            }, '添加模型')
+          ),
+          h('div', { id: 'provided-models-list', className: 'mb-sm' }),
+          h('div', { id: 'provided-model-count', className: 'text-muted mb-md' }, '已选 0 个实际上游模型'),
+
+          h('div', { className: 'font-headline mb-sm' }, '模型重定向 / 别名映射'),
           h('div', { className: 'mb-sm' },
             h('button', {
               id: 'mode-visual', className: 'btn btn-ghost btn-sm', type: 'button',
@@ -210,6 +299,7 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
           ),
 
           h('div', { id: 'models-visual-wrap' },
+            h('datalist', { id: 'provided-model-options' }),
             h('div', { id: 'models-pairs' }),
             h('button', {
               className: 'btn btn-ghost btn-sm mt-sm',
@@ -218,8 +308,8 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
                 pairs.push({ key: '', value: '' });
                 renderPairs();
               }
-            }, '+ 添加键值对'),
-            h('div', { className: 'text-muted mt-sm' }, '键为请求中的模型名，值为要替换的模型名')
+            }, '+ 添加映射'),
+            h('div', { className: 'text-muted mt-sm' }, '实际模型在上方单独维护；这里仅配置别名/重定向（请求模型名 -> 实际上游模型）')
           ),
 
           h('div', { id: 'models-raw-wrap', style: 'display:none' },
@@ -227,7 +317,8 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
               id: 'ch-models-raw',
               className: 'input-field',
               style: { minHeight: '160px', fontFamily: 'JetBrains Mono, monospace' },
-            }, JSON.stringify(pairsToModels(pairs), null, 2))
+            }, JSON.stringify(pairsToAliasModels(pairs), null, 2)),
+            h('div', { className: 'text-muted mt-sm' }, '手动编辑的是别名映射 JSON；实际上游模型请在上方单独维护')
           )
         ),
 
@@ -249,19 +340,16 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
             try {
               const selectVal = document.getElementById('ch-provider-type-select').value;
               const customProviderType = (document.getElementById('ch-provider-type-custom').value || '').trim();
-              if (selectVal === '__custom__' && !customProviderType) {
-                throw new Error('请选择“自定义...”时，必须填写自定义 Provider Type');
-              }
-
-              const providerType = selectVal === '__custom__' ? customProviderType : selectVal;
+              const providerType = selectVal === '__custom__' ? (customProviderType || 'custom') : selectVal;
 
               let models;
               if (mode === 'visual') {
-                models = pairsToModels(pairs);
+                models = pairsToAliasModels(pairs);
               } else {
                 const raw = document.getElementById('ch-models-raw').value;
                 models = raw.trim() ? JSON.parse(raw) : {};
               }
+              const normalizedProvidedModels = normalizeModelList(providedModels);
 
               const autoDisableHours = Number.parseInt((document.getElementById('ch-auto-disable-hours').value || '8').trim(), 10);
               const normalizedAutoDisableHours = Number.isFinite(autoDisableHours)
@@ -275,8 +363,9 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
                 api_base: (document.getElementById('ch-api-base').value || '').trim(),
                 provider_type: providerType,
                 enabled: document.getElementById('ch-enabled').checked,
+                provided_models: normalizedProvidedModels,
                 models,
-                api_keys: initial ? (initial.api_keys || []) : keyPool.filter(k => k.id?.trim() && k.value?.trim()),
+                api_keys: initial ? (initial.api_keys || []) : normalizeKeyPool(keyPool),
                 settings: {
                   ...(initial?.settings || { rotation_mode: 'balanced', max_concurrent_requests_per_key: 1, ignore_models: [], whitelist_models: [] }),
                   auto_disable_long_unavailable: autoDisableEnabled,
@@ -296,6 +385,42 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
     )
   );
 
+  function renderProvidedModels() {
+    providedModels = normalizeModelList(providedModels);
+    const box = modal.querySelector('#provided-models-list');
+    const countEl = modal.querySelector('#provided-model-count');
+    const optionsEl = modal.querySelector('#provided-model-options');
+    if (!box) return;
+
+    box.innerHTML = '';
+    if (optionsEl) optionsEl.innerHTML = '';
+
+    if (providedModels.length === 0) {
+      box.appendChild(h('div', { className: 'text-muted' }, '未添加实际上游模型；可手动输入，或使用“拉取模型”')); 
+    } else {
+      providedModels.forEach((modelName, idx) => {
+        box.appendChild(h('span', {
+          className: 'badge badge-sm badge-outline',
+          style: 'margin:0 8px 8px 0; gap:8px; align-items:center;'
+        },
+          h('span', { className: 'text-mono' }, modelName),
+          h('button', {
+            className: 'btn btn-ghost btn-sm',
+            type: 'button',
+            style: 'padding:0 4px; min-height:auto; line-height:1;',
+            onClick: () => {
+              providedModels.splice(idx, 1);
+              renderProvidedModels();
+            }
+          }, '×')
+        ));
+      });
+      if (optionsEl) providedModels.forEach((modelName) => optionsEl.appendChild(h('option', { value: modelName })));
+    }
+
+    if (countEl) countEl.textContent = `已选 ${providedModels.length} 个实际上游模型`;
+  }
+
   function renderPairs() {
     const box = modal.querySelector('#models-pairs');
     box.innerHTML = '';
@@ -312,7 +437,8 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
           className: 'input-field',
           style: { flex: '1' },
           value: p.value,
-          placeholder: '目标模型名（value）',
+          placeholder: '目标实际上游模型（value）',
+          list: 'provided-model-options',
           onInput: (e) => { p.value = e.target.value; }
         }),
         h('button', {
@@ -377,22 +503,35 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
     if (mode === 'visual') {
       const raw = modal.querySelector('#ch-models-raw').value;
       try {
-        pairs = modelsToPairs(JSON.parse(raw || '{}'));
+        const parsedPairs = modelsToPairs(JSON.parse(raw || '{}'));
+        const identityModels = parsedPairs
+          .filter((p) => (p.key || '').trim() && (p.key || '').trim() === (p.value || '').trim())
+          .map((p) => p.value);
+        if (identityModels.length > 0) {
+          providedModels = normalizeModelList([...(providedModels || []), ...identityModels]);
+        }
+        pairs = parsedPairs.filter((p) => {
+          const key = (p.key || '').trim();
+          const value = (p.value || '').trim();
+          return key && value && key !== value;
+        });
         if (pairs.length === 0) pairs = [{ key: '', value: '' }];
       } catch (_) {
         // keep current pairs if JSON invalid
       }
+      renderProvidedModels();
       renderPairs();
       v.style.display = '';
       r.style.display = 'none';
     } else {
-      modal.querySelector('#ch-models-raw').value = JSON.stringify(pairsToModels(pairs), null, 2);
+      modal.querySelector('#ch-models-raw').value = JSON.stringify(pairsToAliasModels(pairs), null, 2);
       v.style.display = 'none';
       r.style.display = '';
     }
   }
 
   renderKeyPool();
+  renderProvidedModels();
   renderPairs();
   syncTabs();
   return modal;
@@ -442,7 +581,11 @@ function createKeyModal({ channelId, onSubmit }) {
 }
 
 function createChannelModelTestModal({ channel, onBatchTest }) {
-  const allModels = Object.keys(channel?.models || {});
+  const allModels = normalizeModelList(
+    (channel?.provided_models && channel.provided_models.length > 0)
+      ? channel.provided_models
+      : Object.values(channel?.models || {}).map((cfg) => (cfg && typeof cfg === 'object' ? (cfg.id || '') : String(cfg || '')))
+  );
   let query = '';
   const selected = new Set();
   const resultMap = {};
@@ -681,6 +824,7 @@ export async function renderChannels(container) {
                       enabled: payload.enabled,
                       api_base: payload.api_base,
                       provider_type: payload.provider_type,
+                      provided_models: payload.provided_models,
                       models: payload.models,
                       settings: payload.settings,
                     });
@@ -722,12 +866,8 @@ export async function renderChannels(container) {
                 try {
                   const firstEnabledKey = (ch.api_keys || []).find(k => k.enabled)?.value || '';
                   const res = await api.discoverModels(ch.api_base, firstEnabledKey);
-                  const models = (res.models || []).reduce((acc, m) => {
-                    acc[m] = { id: m };
-                    return acc;
-                  }, {});
-                  await api.updateChannel(ch.id, { models });
-                  showToast(`已拉取 ${res.models?.length || 0} 个模型并更新映射`, 'success');
+                  await api.updateChannel(ch.id, { provided_models: normalizeModelList(res.models || []) });
+                  showToast(`已拉取 ${res.models?.length || 0} 个实际上游模型`, 'success');
                   renderChannels(container);
                 } catch (e) {
                   showToast(`拉取模型失败: ${e.message}`, 'error');
