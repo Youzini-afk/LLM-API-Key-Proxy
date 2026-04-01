@@ -1605,17 +1605,28 @@ async def list_models(
         当前按管理策略仅暴露虚拟模型，不再对外暴露 provider 原始模型列表。
     """
     # 仅返回虚拟模型名（含自动生成虚拟模型）
-    from proxy_app.virtual_models import get_all_virtual_model_names
+    # 优先使用 admin_service 的“有效虚拟模型”视图，避免依赖 runtime env 已应用。
+    try:
+        virtual_models_map = admin_service.list_virtual_models() or {}
+        model_ids = list(dict.fromkeys(list(virtual_models_map.keys())))
+    except Exception as e:
+        logging.warning(f"Failed to load effective virtual models from admin config: {e}")
+        from proxy_app.virtual_models import get_all_virtual_model_names
 
-    virtual_names = get_all_virtual_model_names()
-    model_ids = list(dict.fromkeys(virtual_names))
+        virtual_names = get_all_virtual_model_names()
+        model_ids = list(dict.fromkeys(virtual_names))
 
     if enriched and hasattr(request.app.state, "model_info_service"):
         model_info_service = request.app.state.model_info_service
         if model_info_service.is_ready:
-            # Return enriched model data (对虚拟模型可回退到基础信息)
-            enriched_data = model_info_service.enrich_model_list(model_ids)
-            return {"object": "list", "data": enriched_data}
+            try:
+                # Return enriched model data (对虚拟模型可回退到基础信息)
+                enriched_data = model_info_service.enrich_model_list(model_ids)
+                return {"object": "list", "data": enriched_data}
+            except Exception as e:
+                logging.warning(
+                    f"Model enrichment failed for /v1/models, falling back to minimal cards: {e}"
+                )
 
     # Fallback to basic model cards
     model_cards = [
