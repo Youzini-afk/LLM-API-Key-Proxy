@@ -1600,60 +1600,20 @@ async def list_models(
     Query Parameters:
         enriched: If True (default), returns detailed model info with pricing and capabilities.
                   If False, returns minimal OpenAI-compatible response.
+
+    Note:
+        当前按管理策略仅暴露虚拟模型，不再对外暴露 provider 原始模型列表。
     """
-    # Get provider models discovered from upstream /models
-    provider_model_ids = await client.get_all_available_models(grouped=False)
-
-    # Fallback/补充：有些渠道不支持 /models，仍应展示管理端已配置的模型映射
-    configured_model_ids = []
-    try:
-        cfg = admin_service.get_config()
-        for ch in cfg.channels:
-            if not ch.enabled:
-                continue
-            effective_models = admin_service._build_effective_models(ch)
-            for model_name in effective_models.keys():
-                configured_model_ids.append(f"{ch.id}/{model_name}")
-    except Exception as e:
-        logging.debug(f"Failed to collect admin-configured models fallback: {e}")
-
-    # 再补一层：如果运行时已有加载的 model definitions，也一并合入
-    try:
-        model_definitions = getattr(client, "model_definitions", None)
-        providers = list(getattr(client, "all_credentials", {}).keys())
-        if model_definitions:
-            for provider in providers:
-                configured_model_ids.extend(model_definitions.get_all_provider_models(provider))
-    except Exception as e:
-        logging.debug(f"Failed to collect client model definitions fallback: {e}")
-
-    # 合并去重：先保留运行时探测结果，再补充配置模型
-    existing_set = set(provider_model_ids)
-    configured_to_add = [m for m in configured_model_ids if m not in existing_set]
-    model_ids = provider_model_ids + configured_to_add
-
-    if configured_to_add:
-        logging.debug(
-            f"Added {len(configured_to_add)} configured model(s) as fallback: {configured_to_add}"
-        )
-
-    # Append virtual model names
+    # 仅返回虚拟模型名（含自动生成虚拟模型）
     from proxy_app.virtual_models import get_all_virtual_model_names
-    virtual_names = get_all_virtual_model_names()
-    # Deduplicate: only add virtual names not already present as provider models
-    existing_set = set(model_ids)
-    virtual_to_add = [vm for vm in virtual_names if vm not in existing_set]
-    model_ids = model_ids + virtual_to_add
 
-    if virtual_to_add:
-        logging.debug(
-            f"Added {len(virtual_to_add)} virtual model(s) to model list: {virtual_to_add}"
-        )
+    virtual_names = get_all_virtual_model_names()
+    model_ids = list(dict.fromkeys(virtual_names))
 
     if enriched and hasattr(request.app.state, "model_info_service"):
         model_info_service = request.app.state.model_info_service
         if model_info_service.is_ready:
-            # Return enriched model data
+            # Return enriched model data (对虚拟模型可回退到基础信息)
             enriched_data = model_info_service.enrich_model_list(model_ids)
             return {"object": "list", "data": enriched_data}
 
