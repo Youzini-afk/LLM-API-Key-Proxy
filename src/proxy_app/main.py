@@ -895,6 +895,29 @@ def get_rotating_client(request: Request) -> RotatingClient:
     return request.app.state.rotating_client
 
 
+def _refresh_virtual_models_registry_from_admin() -> Dict[str, Any]:
+    """
+    Keep virtual model runtime registry in sync with current admin effective config.
+
+    This avoids drift where /v1/models and request routing see different virtual model sets.
+    """
+    from proxy_app.virtual_models import load_virtual_models
+
+    try:
+        overlay = admin_service.build_runtime_env_overlay()
+        vm_raw = (overlay.get("VIRTUAL_MODELS") or "").strip()
+        if vm_raw:
+            os.environ["VIRTUAL_MODELS"] = vm_raw
+        else:
+            os.environ.pop("VIRTUAL_MODELS", None)
+    except Exception as e:
+        logging.warning(
+            f"Failed to sync VIRTUAL_MODELS from admin overlay, fallback to existing env: {e}"
+        )
+
+    return load_virtual_models()
+
+
 def _key_status_from_cred_entry(cred: Dict[str, Any]) -> str:
     """Map usage credential entry status to frontend key status labels."""
     status = (cred.get("status") or "active").strip().lower()
@@ -1161,10 +1184,12 @@ async def chat_completions(
     raw_logger = RawIOLogger() if ENABLE_RAW_LOGGING else None
     try:
         # Import virtual model support
-        from proxy_app.virtual_models import is_virtual_model
+        from proxy_app.virtual_models import is_virtual_model, get_virtual_model
         from proxy_app.aggregate_router import (
             execute_virtual_completion, execute_virtual_completion_streaming,
         )
+
+        _refresh_virtual_models_registry_from_admin()
         # Read and parse the request body only once at the beginning.
         try:
             request_data = await request.json()
@@ -1224,7 +1249,7 @@ async def chat_completions(
         is_streaming = request_data.get("stream", False)
 
         # ── Virtual Model Aggregation ──────────────────────────────────
-        if model and is_virtual_model(model):
+        if model and (is_virtual_model(model) or get_virtual_model(model) is not None):
             logging.info(f"[VirtualModel] Routing '{model}' through aggregation layer")
 
             if is_streaming:
@@ -1606,6 +1631,9 @@ async def list_models(
     """
     # 仅返回虚拟模型名（含自动生成虚拟模型）
     # 优先使用 admin_service 的“有效虚拟模型”视图，避免依赖 runtime env 已应用。
+    # 同时同步一次 runtime registry，保证列表展示与请求路由命中一致。
+    _refresh_virtual_models_registry_from_admin()
+
     try:
         virtual_models_map = admin_service.list_virtual_models() or {}
         model_ids = list(dict.fromkeys(list(virtual_models_map.keys())))
