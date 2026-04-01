@@ -120,6 +120,7 @@ export function getStrategyLabel(strategy) {
   const map = {
     sequential: '顺序路由',
     primary_backup: '主备模式',
+    balanced: '均衡负载',
     weighted_random: '加权随机',
   };
   return map[strategy] || strategy;

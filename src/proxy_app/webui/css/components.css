@@ -620,7 +620,7 @@
 }
 
 .channel-accordion-open .channel-accordion-body {
-  max-height: 1000px;
+  max-height: 2000px;
   padding: 0 var(--space-xl) var(--space-xl);
 }
 

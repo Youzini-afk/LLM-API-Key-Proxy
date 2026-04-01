@@ -109,6 +109,13 @@ function normalizeKeyPool(items) {
   return result;
 }
 
+function generateNextKeyId(existingIds = []) {
+  const used = new Set((existingIds || []).map((x) => (x || '').trim()).filter(Boolean));
+  let i = 1;
+  while (used.has(`key_${i}`)) i += 1;
+  return `key_${i}`;
+}
+
 function createChannelFormModal({ title = '新增渠道', initial = null, onSubmit }) {
   let mode = 'visual';
   let providedModels = extractProvidedModels(initial);
@@ -177,12 +184,16 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
               className: 'btn btn-ghost btn-sm',
               type: 'button',
               onClick: () => {
-                keyPool.push({ id: `key_${keyPool.length + 1}`, value: '', enabled: true });
+                keyPool.push({
+                  id: generateNextKeyId(keyPool.map((x) => x.id)),
+                  value: '',
+                  enabled: true
+                });
                 renderKeyPool();
               }
             }, '+ 添加 Key')
           ),
-          h('div', { id: 'channel-key-pool' }),
+          h('div', { id: 'channel-key-pool', style: { maxHeight: '260px', overflowY: 'auto', paddingRight: '4px' } }),
           h('div', { className: 'text-muted mt-sm' }, '每个渠道有自己的 key 池，后续轮询/故障切换都在该池内进行')
         ) : h('div', { className: 'text-muted mt-md' }, '编辑模式下 Key 池请在渠道详情中管理（新增/启停/删除）'),
 
@@ -524,20 +535,34 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
   return modal;
 }
 
-function createKeyModal({ channelId, onSubmit }) {
+function createKeyModal({ channelId, onSubmit, initialKey = null, existingKeyIds = [] }) {
+  const isEdit = !!initialKey;
+  const defaultKeyId = initialKey?.id || generateNextKeyId(existingKeyIds);
+
   const modal = h('div', { className: 'modal-overlay' },
     h('div', { className: 'modal-card', style: { width: '520px', maxWidth: '95vw' } },
       h('div', { className: 'modal-header' },
         h('span', { className: 'modal-icon' }, icon('key', 24)),
-        h('h3', { className: 'modal-title' }, `新增 Key - ${channelId}`),
+        h('h3', { className: 'modal-title' }, `${isEdit ? '编辑' : '新增'} Key - ${channelId}`),
       ),
       h('div', { className: 'modal-body' },
         h('label', { className: 'input-label' }, 'Key ID'),
-        h('input', { id: 'key-id', className: 'input-field', placeholder: 'key_1' }),
+        h('input', {
+          id: 'key-id',
+          className: 'input-field',
+          placeholder: '留空自动生成（例如 key_1）',
+          value: defaultKeyId,
+        }),
+        h('div', { className: 'text-muted mt-sm' }, '留空时后端会自动分配下一个可用 key_id'),
         h('label', { className: 'input-label mt-md' }, 'Key Value'),
-        h('input', { id: 'key-val', className: 'input-field', placeholder: 'sk-xxx' }),
+        h('input', {
+          id: 'key-val',
+          className: 'input-field',
+          placeholder: 'sk-xxx',
+          value: initialKey?.value || '',
+        }),
         h('label', { className: 'input-checkbox-label mt-md' },
-          h('input', { id: 'key-enabled', type: 'checkbox', checked: true }),
+          h('input', { id: 'key-enabled', type: 'checkbox', checked: initialKey?.enabled !== false }),
           h('span', {}, ' 启用')
         ),
         h('div', { id: 'key-form-error', className: 'auth-error-msg', style: 'display:none' })
@@ -549,7 +574,7 @@ function createKeyModal({ channelId, onSubmit }) {
           onClick: async () => {
             try {
               await onSubmit({
-                id: document.getElementById('key-id').value.trim(),
+                id: document.getElementById('key-id').value.trim() || null,
                 value: document.getElementById('key-val').value.trim(),
                 enabled: document.getElementById('key-enabled').checked,
               });
@@ -838,12 +863,14 @@ export async function renderChannels(container) {
               onClick: () => {
                 const modal = createKeyModal({
                   channelId: ch.id,
+                  existingKeyIds: (ch.api_keys || []).map((x) => x.id),
                   onSubmit: async (payload) => {
                     await api.addChannelKey(ch.id, payload);
                     showToast('Key 已添加', 'success');
                     renderChannels(container);
                   }
                 });
+
                 document.body.appendChild(modal);
               }
             }, '新增 Key'),
@@ -911,21 +938,23 @@ export async function renderChannels(container) {
             )
             : null,
 
-          KeyTable({
-            credentials: (ch.api_keys || []).map(k => ({
-              credential: `${k.id}:${k.value}`,
-              status: (k.runtime_status || (k.enabled ? 'active' : 'disabled')),
-              requests: 0,
-              tokens: {},
-              approx_cost: 0,
-              cooldown_until: k.key_cooldown_until || null,
-            })),
-            onForceRefresh: async () => {
-              await api.refreshQuota('force_refresh', 'provider', ch.id);
-              showToast('配额刷新完成', 'success');
-              renderChannels(container);
-            }
-          }),
+          h('div', { style: { maxHeight: '420px', overflow: 'auto' } },
+            KeyTable({
+              credentials: (ch.api_keys || []).map(k => ({
+                credential: `${k.id}:${k.value}`,
+                status: (k.runtime_status || (k.enabled ? 'active' : 'disabled')),
+                requests: 0,
+                tokens: {},
+                approx_cost: 0,
+                cooldown_until: k.key_cooldown_until || null,
+              })),
+              onForceRefresh: async () => {
+                await api.refreshQuota('force_refresh', 'provider', ch.id);
+                showToast('配额刷新完成', 'success');
+                renderChannels(container);
+              }
+            })
+          ),
 
           (ch.api_keys || []).length > 0
             ? h('div', { className: 'mt-md' },
@@ -933,6 +962,22 @@ export async function renderChannels(container) {
               ...ch.api_keys.map(k =>
                 h('div', { className: 'flex items-center gap-sm mb-sm' },
                   h('code', { className: 'text-mono' }, `${k.id} (${k.enabled ? '启用' : '停用'})`),
+                  h('button', {
+                    className: 'btn btn-ghost btn-sm',
+                    onClick: () => {
+                      const modal = createKeyModal({
+                        channelId: ch.id,
+                        initialKey: { id: k.id, value: k.value, enabled: k.enabled },
+                        existingKeyIds: (ch.api_keys || []).filter((x) => x.id !== k.id).map((x) => x.id),
+                        onSubmit: async (payload) => {
+                          await api.updateChannelKey(ch.id, k.id, payload);
+                          showToast('Key 已更新', 'success');
+                          renderChannels(container);
+                        }
+                      });
+                      document.body.appendChild(modal);
+                    }
+                  }, '编辑'),
                   h('button', {
                     className: 'btn btn-ghost btn-sm',
                     onClick: async () => {

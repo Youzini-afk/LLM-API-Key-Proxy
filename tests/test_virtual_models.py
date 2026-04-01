@@ -229,6 +229,13 @@ class TestRouteStrategy:
             assert result[0].model == "prov_0/model"
             assert len(result) == 5
 
+    def test_balanced_returns_all(self):
+        cfg = self._make_config("balanced")
+        result = resolve_targets(cfg)
+        assert len(result) == 3
+        models = {t.model for t in result}
+        assert models == {"prov_0/model", "prov_1/model", "prov_2/model"}
+
     def test_weighted_random_returns_all(self):
         cfg = self._make_config("weighted_random")
         result = resolve_targets(cfg)

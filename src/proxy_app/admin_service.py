@@ -157,6 +157,46 @@ class AdminService:
 
         return effective
 
+    @staticmethod
+    def _build_auto_virtual_models(cfg: AdminConfig) -> Dict[str, VirtualModelAdminConfig]:
+        """
+        自动聚合：当同名模型在 2 个及以上启用渠道中都存在时，
+        生成同名虚拟模型，默认使用 balanced（均衡）策略。
+        """
+        model_targets: Dict[str, List[dict]] = {}
+
+        for ch in cfg.channels:
+            if not ch.enabled:
+                continue
+            effective_models = AdminService._build_effective_models(ch)
+            for model_name in effective_models.keys():
+                model_targets.setdefault(model_name, []).append(
+                    {
+                        "model": f"{ch.id}/{model_name}",
+                        "enabled": True,
+                        "weight": 100,
+                    }
+                )
+
+        auto_vms: Dict[str, VirtualModelAdminConfig] = {}
+        for model_name, targets in model_targets.items():
+            if len(targets) < 2:
+                continue
+            stable_targets = sorted(targets, key=lambda t: t["model"])
+            auto_vms[model_name] = VirtualModelAdminConfig(
+                enabled=True,
+                strategy="balanced",
+                targets=stable_targets,
+            )
+
+        return auto_vms
+
+    def _get_effective_virtual_models(self, cfg: AdminConfig) -> Dict[str, VirtualModelAdminConfig]:
+        auto_vms = self._build_auto_virtual_models(cfg)
+        # 手动配置优先：同名时覆盖自动生成结果
+        auto_vms.update(cfg.virtual_models)
+        return auto_vms
+
     # -----------------------
     # Basic getters
     # -----------------------
@@ -174,7 +214,12 @@ class AdminService:
         return self.get_config_masked().get("channels", [])
 
     def list_virtual_models(self) -> Dict[str, dict]:
-        return self.get_config_masked().get("virtual_models", {})
+        cfg = self.get_config()
+        effective_vms = self._get_effective_virtual_models(cfg)
+        return {
+            name: vm.model_dump()
+            for name, vm in effective_vms.items()
+        }
 
     # -----------------------
     # Validation
@@ -313,6 +358,16 @@ class AdminService:
         self._cfg = save_admin_config(cfg)
         return self.get_config_masked()
 
+    @staticmethod
+    def _generate_next_key_id(existing_keys: List[ChannelKeyConfig]) -> str:
+        existing_ids = {((k.id or "").strip()) for k in (existing_keys or [])}
+        idx = 1
+        while True:
+            candidate = f"key_{idx}"
+            if candidate not in existing_ids:
+                return candidate
+            idx += 1
+
     # -----------------------
     # Key CRUD
     # -----------------------
@@ -323,10 +378,20 @@ class AdminService:
         if not target:
             raise ValueError(f"Channel '{channel_id}' not found")
 
-        if any(k.id == req.id for k in target.api_keys):
-            raise ValueError(f"Key id '{req.id}' already exists in channel '{channel_id}'")
+        req_id = (req.id or "").strip()
+        if not req_id:
+            req_id = self._generate_next_key_id(target.api_keys)
 
-        target.api_keys.append(req)
+        if any(k.id == req_id for k in target.api_keys):
+            raise ValueError(f"Key id '{req_id}' already exists in channel '{channel_id}'")
+
+        target.api_keys.append(
+            ChannelKeyConfig(
+                id=req_id,
+                value=req.value,
+                enabled=req.enabled,
+            )
+        )
         target.api_keys = self._dedupe_channel_keys(target.api_keys)
         self._cfg = save_admin_config(cfg)
         return self.get_config_masked()
@@ -342,6 +407,19 @@ class AdminService:
             raise ValueError(f"Key '{key_id}' not found in channel '{channel_id}'")
 
         upd = req.model_dump(exclude_none=True)
+        next_key_id = key_id
+        if "id" in upd:
+            requested_id = (upd.pop("id") or "").strip()
+            if not requested_id:
+                raise ValueError("Key id cannot be empty")
+            if requested_id != key_id:
+                if any(k.id == requested_id for k in ch.api_keys):
+                    raise ValueError(
+                        f"Key id '{requested_id}' already exists in channel '{channel_id}'"
+                    )
+                next_key_id = requested_id
+
+        key.id = next_key_id
         if "value" in upd:
             key.value = merge_masked_key_value(key.value, upd["value"])
         if "enabled" in upd:
@@ -450,12 +528,13 @@ class AdminService:
             env.update(self._build_channel_overlay(ch))
 
         # virtual models -> VIRTUAL_MODELS (only enabled virtual models)
-        if cfg.virtual_models:
+        effective_vms = self._get_effective_virtual_models(cfg)
+        if effective_vms:
             import json
 
             enabled_vms = {
                 name: vm.model_dump()
-                for name, vm in cfg.virtual_models.items()
+                for name, vm in effective_vms.items()
                 if vm.enabled
             }
             if enabled_vms:
@@ -506,7 +585,8 @@ class AdminService:
         cfg = self.get_config()
         health = self._current_store_health()
         channels_enabled = sum(1 for c in cfg.channels if c.enabled)
-        virtual_enabled = sum(1 for _, v in cfg.virtual_models.items() if v.enabled)
+        effective_vms = self._get_effective_virtual_models(cfg)
+        virtual_enabled = sum(1 for _, v in effective_vms.items() if v.enabled)
         return RuntimeStatus(
             loaded=bool(health.get("ok")),
             config_version=cfg.metadata.version,

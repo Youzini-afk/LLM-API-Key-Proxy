@@ -8,7 +8,7 @@ from typing import Dict, List, Literal, Optional
 from pydantic import BaseModel, Field, field_validator
 
 
-RouteStrategy = Literal["sequential", "primary_backup", "weighted_random"]
+RouteStrategy = Literal["sequential", "primary_backup", "weighted_random", "balanced"]
 RotationMode = Literal["balanced", "sequential"]
 
 
@@ -186,12 +186,13 @@ class ChannelUpdateRequest(BaseModel):
 
 
 class KeyCreateRequest(BaseModel):
-    id: str = Field(..., min_length=1)
+    id: Optional[str] = None
     value: str = Field(..., min_length=1)
     enabled: bool = True
 
 
 class KeyUpdateRequest(BaseModel):
+    id: Optional[str] = None
     value: Optional[str] = None
     enabled: Optional[bool] = None
 

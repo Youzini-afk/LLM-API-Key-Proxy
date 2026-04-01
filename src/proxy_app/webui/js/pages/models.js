@@ -72,9 +72,10 @@ function vmModal({ title = '新增虚拟模型', initialName = '', initialConfig
           className: 'select-field',
           onChange: (e) => { cfg.strategy = e.target.value; }
         },
-          h('option', { value: 'sequential', selected: cfg.strategy === 'sequential' }, 'sequential'),
-          h('option', { value: 'primary_backup', selected: cfg.strategy === 'primary_backup' }, 'primary_backup'),
-          h('option', { value: 'weighted_random', selected: cfg.strategy === 'weighted_random' }, 'weighted_random')
+          h('option', { value: 'sequential', selected: cfg.strategy === 'sequential' }, '顺序路由（sequential）'),
+          h('option', { value: 'primary_backup', selected: cfg.strategy === 'primary_backup' }, '主备模式（primary_backup）'),
+          h('option', { value: 'balanced', selected: cfg.strategy === 'balanced' }, '均衡负载（balanced）'),
+          h('option', { value: 'weighted_random', selected: cfg.strategy === 'weighted_random' }, '加权随机（weighted_random）')
         ),
         h('label', { className: 'input-checkbox-label mt-md' },
           h('input', {

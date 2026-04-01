@@ -11,7 +11,7 @@ logger = logging.getLogger("proxy_app.virtual_models")
 # ---------------------------------------------------------------------------
 # Allowed strategies
 # ---------------------------------------------------------------------------
-ALLOWED_STRATEGIES = ("sequential", "primary_backup", "weighted_random")
+ALLOWED_STRATEGIES = ("sequential", "primary_backup", "weighted_random", "balanced")
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +59,7 @@ class VirtualModelConfig(BaseModel):
     enabled: bool = Field(default=True, description="Whether this virtual model is active")
     strategy: str = Field(
         default="sequential",
-        description="Routing strategy: sequential, primary_backup, weighted_random",
+        description="Routing strategy: sequential, primary_backup, weighted_random, balanced",
     )
     timeout_seconds: int = Field(
         default=90, ge=1, description="Per-target timeout budget in seconds"

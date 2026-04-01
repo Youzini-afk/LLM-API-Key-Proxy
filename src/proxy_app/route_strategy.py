@@ -21,6 +21,8 @@ def resolve_targets(config: VirtualModelConfig) -> List[RouteTarget]:
       shuffled so backup load is distributed.
     * **weighted_random** – targets are shuffled with probability proportional
       to their weight.
+    * **balanced** – alias of weighted_random for equal-load semantics (uses
+      weight when provided, equal chance when weights are equal).
 
     Only *enabled* targets are returned.  If ``max_target_attempts`` is set,
     the list is truncated to that length.
@@ -43,7 +45,7 @@ def resolve_targets(config: VirtualModelConfig) -> List[RouteTarget]:
             random.shuffle(backups)
             ordered = [primary] + backups
 
-    elif strategy == "weighted_random":
+    elif strategy in {"weighted_random", "balanced"}:
         # Weighted shuffle: repeatedly pick from remaining pool proportional to weight
         pool = list(targets)
         ordered = []

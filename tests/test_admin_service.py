@@ -280,6 +280,42 @@ def test_admin_service_add_key_auto_dedup_by_value(monkeypatch, tmp_path):
     assert ch.api_keys[0].enabled is True
 
 
+def test_admin_service_add_key_auto_generates_id_when_missing(monkeypatch, tmp_path):
+    _, admin_service_mod = _reload_modules(monkeypatch, tmp_path)
+    service = admin_service_mod.AdminService()
+
+    service.create_channel(
+        admin_service_mod.ChannelCreateRequest(
+            id="custom_a",
+            api_base="https://example.com/v1",
+            provider_type="custom",
+            provided_models=["glm-5"],
+        )
+    )
+    service.add_key("custom_a", admin_service_mod.KeyCreateRequest(id=None, value="sk-auto-1", enabled=True))
+    service.add_key("custom_a", admin_service_mod.KeyCreateRequest(id=None, value="sk-auto-2", enabled=True))
+
+    cfg = service.get_config()
+    ch = next(c for c in cfg.channels if c.id == "custom_a")
+    assert [k.id for k in ch.api_keys] == ["key_1", "key_2"]
+
+
+def test_admin_service_update_key_supports_renaming_id(monkeypatch, tmp_path):
+    _, admin_service_mod = _reload_modules(monkeypatch, tmp_path)
+    service = admin_service_mod.AdminService()
+
+    service.create_channel(admin_service_mod.ChannelCreateRequest(id="custom_a", api_base="https://example.com/v1"))
+    service.add_key("custom_a", admin_service_mod.KeyCreateRequest(id="k1", value="sk-1", enabled=True))
+
+    service.update_key("custom_a", "k1", admin_service_mod.KeyUpdateRequest(id="k_renamed", value="sk-1-updated", enabled=False))
+
+    cfg = service.get_config()
+    ch = next(c for c in cfg.channels if c.id == "custom_a")
+    assert ch.api_keys[0].id == "k_renamed"
+    assert ch.api_keys[0].value == "sk-1-updated"
+    assert ch.api_keys[0].enabled is False
+
+
 
 def test_admin_service_runtime_overlay_skips_disabled_and_cleans_virtuals(monkeypatch, tmp_path):
     _, admin_service_mod = _reload_modules(monkeypatch, tmp_path)
@@ -333,6 +369,59 @@ def test_admin_service_runtime_overlay_skips_disabled_and_cleans_virtuals(monkey
     apply2 = service.apply_runtime_overlay()
     assert "ENABLED_A_API_BASE" in apply2["removed_stale_keys"]
     assert "VIRTUAL_MODELS" in apply2["removed_stale_keys"]
+
+
+def test_admin_service_auto_virtual_model_balanced(monkeypatch, tmp_path):
+    _, admin_service_mod = _reload_modules(monkeypatch, tmp_path)
+    service = admin_service_mod.AdminService()
+
+    service.create_channel(
+        admin_service_mod.ChannelCreateRequest(
+            id="inf",
+            api_base="https://inf.example.com/v1",
+            provider_type="openai_compatible",
+            provided_models=["kimi-k2.5", "glm-5"],
+            api_keys=[admin_service_mod.ChannelKeyConfig(id="k1", value="sk-inf")],
+            enabled=True,
+        )
+    )
+    service.create_channel(
+        admin_service_mod.ChannelCreateRequest(
+            id="ali",
+            api_base="https://ali.example.com/v1",
+            provider_type="openai_compatible",
+            provided_models=["kimi-k2.5"],
+            api_keys=[admin_service_mod.ChannelKeyConfig(id="k1", value="sk-ali")],
+            enabled=True,
+        )
+    )
+
+    vms = service.list_virtual_models()
+    assert "kimi-k2.5" in vms
+    assert vms["kimi-k2.5"]["strategy"] == "balanced"
+    target_models = {t["model"] for t in vms["kimi-k2.5"]["targets"]}
+    assert target_models == {"inf/kimi-k2.5", "ali/kimi-k2.5"}
+
+    overlay = service.build_runtime_env_overlay()
+    assert "VIRTUAL_MODELS" in overlay
+    assert '"strategy": "balanced"' in overlay["VIRTUAL_MODELS"]
+
+
+def test_admin_service_manual_virtual_model_overrides_auto(monkeypatch, tmp_path):
+    _, admin_service_mod = _reload_modules(monkeypatch, tmp_path)
+    service = admin_service_mod.AdminService()
+
+    service.create_channel(admin_service_mod.ChannelCreateRequest(id="a", api_base="https://a.example.com/v1", provided_models=["m1"]))
+    service.create_channel(admin_service_mod.ChannelCreateRequest(id="b", api_base="https://b.example.com/v1", provided_models=["m1"]))
+
+    from proxy_app.admin_schemas import VirtualModelAdminConfig, VirtualTargetConfig
+    service.create_or_update_virtual_model(
+        "m1",
+        VirtualModelAdminConfig(enabled=True, strategy="sequential", targets=[VirtualTargetConfig(model="a/m1")]),
+    )
+
+    vms = service.list_virtual_models()
+    assert vms["m1"]["strategy"] == "sequential"
 
 
 def test_admin_service_corrupted_config_readonly_protection(monkeypatch, tmp_path):
