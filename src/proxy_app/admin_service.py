@@ -54,13 +54,16 @@ class AdminService:
     @staticmethod
     def _sanitize_channel_id(v: str) -> str:
         s = (v or "").strip().lower()
-        s = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in s)
+        # 仅允许 ASCII: a-z, 0-9, _
+        # 注意: Python 的 str.isalnum() 对中文也会返回 True，这会导致后续 schema 校验失败。
+        allowed = "abcdefghijklmnopqrstuvwxyz0123456789_"
+        s = "".join(ch if ch in allowed else "_" for ch in s)
         while "__" in s:
             s = s.replace("__", "_")
         return s.strip("_")
 
     def _generate_channel_id(self, req: ChannelCreateRequest, cfg: AdminConfig) -> str:
-        base = self._sanitize_channel_id(req.display_name or req.provider_type or "channel") or "channel"
+        base = self._sanitize_channel_id(req.display_name or req.provider_type or "channel") or self._sanitize_channel_id(req.provider_type or "") or "channel"
         existing = {c.id for c in cfg.channels}
         if base not in existing:
             return base

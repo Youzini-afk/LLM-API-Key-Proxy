@@ -69,6 +69,22 @@ def test_admin_service_auto_channel_id_and_api_base_normalize(monkeypatch, tmp_p
     assert out2.get("created_channel_id") == "infini_coding_2"
 
 
+def test_admin_service_auto_channel_id_with_non_ascii_name(monkeypatch, tmp_path):
+    _, admin_service_mod = _reload_modules(monkeypatch, tmp_path)
+    service = admin_service_mod.AdminService()
+
+    # 非 ASCII 显示名会被清洗为空，应该回退到 provider_type 生成合法 id
+    out = service.create_channel(
+        admin_service_mod.ChannelCreateRequest(
+            id=None,
+            display_name="无问",
+            provider_type="openai_compatible",
+            api_base="https://example.com/v1",
+        )
+    )
+    assert out.get("created_channel_id") == "openai_compatible"
+
+
 def test_admin_service_channel_virtual_crud(monkeypatch, tmp_path):
     _, admin_service_mod = _reload_modules(monkeypatch, tmp_path)
     service = admin_service_mod.AdminService()
