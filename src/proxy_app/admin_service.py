@@ -33,7 +33,7 @@ class AdminService:
         self._last_reload_at = None
 
     @staticmethod
-    def _normalize_api_base(raw_api_base: str) -> str:
+    def _validate_api_base(raw_api_base: str) -> str:
         s = (raw_api_base or "").strip().rstrip("/")
         if not s:
             raise ValueError("api_base is required")
@@ -41,12 +41,25 @@ class AdminService:
             raise ValueError("api_base must start with http:// or https://")
 
         parsed = urlparse(s)
+        if not parsed.scheme or not parsed.netloc:
+            raise ValueError("api_base must be a valid absolute URL")
+        return s
+
+    @staticmethod
+    def _normalize_api_base(raw_api_base: str) -> str:
+        s = AdminService._validate_api_base(raw_api_base)
+
+        parsed = urlparse(s)
         path = parsed.path or ""
-        # If user pasted full completions endpoint, normalize to provider base
+
+        # 运行时仍需要标准 API base；如果用户粘贴了完整 endpoint，
+        # 在真正写入 env overlay / 拉取 /models 时再派生为 provider base。
         if path.endswith("/chat/completions"):
             path = path[: -len("/chat/completions")]
         if path.endswith("/embeddings"):
             path = path[: -len("/embeddings")]
+        if path.endswith("/responses"):
+            path = path[: -len("/responses")]
 
         normalized = f"{parsed.scheme}://{parsed.netloc}{path}".rstrip("/")
         return normalized
@@ -200,7 +213,7 @@ class AdminService:
         payload["api_keys"] = [
             key.model_dump() for key in self._dedupe_channel_keys(req.api_keys)
         ]
-        payload["api_base"] = self._normalize_api_base(payload.get("api_base") or "")
+        payload["api_base"] = self._validate_api_base(payload.get("api_base") or "")
 
         cfg.channels.append(ChannelConfig(**payload))
         result = self.validate_config(cfg)
@@ -229,7 +242,7 @@ class AdminService:
                 next_channel_id = requested_id
 
         if "api_base" in upd:
-            upd["api_base"] = self._normalize_api_base(upd["api_base"])
+            upd["api_base"] = self._validate_api_base(upd["api_base"])
 
         updated_payload = target.model_dump()
         updated_payload.update(upd)
@@ -360,7 +373,7 @@ class AdminService:
 
         for ch in cfg.channels:
             prefix = ch.id.upper()
-            env[f"{prefix}_API_BASE"] = ch.api_base
+            env[f"{prefix}_API_BASE"] = self._normalize_api_base(ch.api_base)
 
             # keys
             enabled_keys = [k for k in self._dedupe_channel_keys(ch.api_keys) if k.enabled]

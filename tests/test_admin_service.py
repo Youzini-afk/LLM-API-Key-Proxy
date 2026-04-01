@@ -38,7 +38,7 @@ def test_admin_store_save_load_mask(monkeypatch, tmp_path):
     assert "..." in masked["channels"][0]["api_keys"][0]["value"]
 
 
-def test_admin_service_auto_channel_id_and_api_base_normalize(monkeypatch, tmp_path):
+def test_admin_service_auto_channel_id_and_runtime_api_base_normalize(monkeypatch, tmp_path):
     _, admin_service_mod = _reload_modules(monkeypatch, tmp_path)
     service = admin_service_mod.AdminService()
 
@@ -59,8 +59,11 @@ def test_admin_service_auto_channel_id_and_api_base_normalize(monkeypatch, tmp_p
     cfg = service.get_config()
     ch = next((c for c in cfg.channels if c.id == created_id), None)
     assert ch is not None
-    # 自动去掉 /chat/completions，保留 API base
-    assert ch.api_base == "https://cloud.infini-ai.com/maas/coding/v1"
+    # 管理配置中保留用户填入的完整 URL，避免编辑时被“裁掉”
+    assert ch.api_base == "https://cloud.infini-ai.com/maas/coding/v1/chat/completions"
+
+    overlay = service.build_runtime_env_overlay()
+    assert overlay["INFINI_CODING_API_BASE"] == "https://cloud.infini-ai.com/maas/coding/v1"
 
     # 再创建一个同名 display_name，自动加后缀
     out2 = service.create_channel(

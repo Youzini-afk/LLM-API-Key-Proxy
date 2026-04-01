@@ -13,7 +13,7 @@ const PROVIDER_OPTIONS = [
   { value: 'anthropic', label: 'Anthropic' },
   { value: 'gemini', label: 'Gemini' },
   { value: 'openrouter', label: 'OpenRouter' },
-  { value: '__custom__', label: '自定义...' },
+  { value: '__custom__', label: '完全自定义（仅填 URL）' },
 ];
 
 function modelsToPairs(models) {
@@ -123,7 +123,7 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
   if (!initial && keyPool.length === 0) keyPool = [{ id: 'key_1', value: '', enabled: true }];
 
   const initialProviderType = initial?.provider_type || 'openai_compatible';
-  const providerMatched = PROVIDER_OPTIONS.some((x) => x.value === initialProviderType);
+  const initialProviderSelectValue = PROVIDER_OPTIONS.some((x) => x.value === initialProviderType) ? initialProviderType : '__custom__';
 
   const modal = h('div', { className: 'modal-overlay' },
     h('div', { className: 'modal-card', style: { width: '860px', maxWidth: '96vw' } },
@@ -148,39 +148,27 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
           placeholder: 'Infini Coding',
         }),
 
-        h('label', { className: 'input-label mt-md' }, '渠道 URL / API Base'),
+        h('label', { className: 'input-label mt-md' }, '完整渠道 URL / API Base'),
         h('input', {
           id: 'ch-api-base',
           className: 'input-field',
           value: initial?.api_base || '',
           placeholder: '支持粘贴完整地址，如 https://cloud.infini-ai.com/maas/coding/v1/chat/completions',
         }),
+        h('div', { className: 'text-muted mt-sm' }, '这里会保留你填写的完整 URL；运行时会自动识别并兼容 OpenAI 风格 endpoint'),
 
         h('label', { className: 'input-label mt-md' }, 'Provider Type'),
         h('select', {
           id: 'ch-provider-type-select',
           className: 'select-field',
-          onChange: (e) => {
-            const isCustom = e.target.value === '__custom__';
-            modal.querySelector('#provider-custom-wrap').style.display = isCustom ? 'block' : 'none';
-          },
         }, ...PROVIDER_OPTIONS.map((opt) =>
           h('option', {
             value: opt.value,
-            selected: providerMatched ? initialProviderType === opt.value : opt.value === '__custom__',
+            selected: initialProviderSelectValue === opt.value,
           }, opt.label)
         )),
 
-        h('div', { id: 'provider-custom-wrap', className: 'mt-sm', style: `display:${providerMatched ? 'none' : 'block'}` },
-          h('label', { className: 'input-label' }, '自定义 Provider Type（可选）'),
-          h('input', {
-            id: 'ch-provider-type-custom',
-            className: 'input-field',
-            value: providerMatched ? '' : initialProviderType,
-            placeholder: '可选：自定义 Provider Type（不填则默认为 custom）',
-          }),
-          h('div', { className: 'text-muted mt-sm' }, '自定义渠道主要由完整 URL 决定；这里仅用于分类标识，可留空')
-        ),
+        h('div', { className: 'text-muted mt-sm' }, '选“完全自定义”时只需要填写完整 URL；不会再要求额外填写自定义 Provider Type'),
 
         !initial ? h('div', { className: 'mt-md', style: 'border:1px solid rgba(70,72,79,.25); border-radius:12px; padding:12px;' },
           h('div', { className: 'flex items-center justify-between mb-sm' },
@@ -339,8 +327,7 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
           onClick: async () => {
             try {
               const selectVal = document.getElementById('ch-provider-type-select').value;
-              const customProviderType = (document.getElementById('ch-provider-type-custom').value || '').trim();
-              const providerType = selectVal === '__custom__' ? (customProviderType || 'custom') : selectVal;
+              const providerType = selectVal === '__custom__' ? 'custom' : selectVal;
 
               let models;
               if (mode === 'visual') {
