@@ -119,3 +119,34 @@ async def test_acquire_key_wakes_when_any_key_is_released(
         await release_task
 
     assert acquired == "key_b"
+
+
+@pytest.mark.asyncio
+async def test_save_usage_is_deferred_off_request_path(
+    monkeypatch, tmp_path, usage_manager_modules
+):
+    _, UsageManager = usage_manager_modules
+    monkeypatch.setenv("USAGE_SAVE_DEBOUNCE_SECONDS", "0")
+
+    usage_manager = UsageManager(file_path=tmp_path / "usage.json")
+    usage_manager._usage_data = {"key_a": {"models": {}}}
+    usage_manager._initialized.set()
+
+    writes = []
+
+    def fake_write(data):
+        time.sleep(0.05)
+        writes.append(data)
+
+    usage_manager._state_writer.write = fake_write
+
+    start = time.perf_counter()
+    await usage_manager._save_usage()
+    elapsed = time.perf_counter() - start
+
+    assert elapsed < 0.03
+
+    await asyncio.sleep(0.1)
+    assert writes
+
+    await usage_manager.shutdown()

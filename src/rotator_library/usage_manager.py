@@ -8,6 +8,7 @@ import logging
 import asyncio
 import random
 import hashlib
+import copy
 from datetime import date, datetime, timezone, time as dt_time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -181,11 +182,17 @@ class UsageManager:
         self._timeout_lock = asyncio.Lock()
         self._claimed_on_timeout: Set[str] = set()
         self._availability_condition = asyncio.Condition()
+        self._save_event = asyncio.Event()
+        self._save_task: Optional[asyncio.Task] = None
+        self._save_shutdown = False
         self.busy_wait_interval_seconds = self._get_env_float(
             "KEY_BUSY_WAIT_INTERVAL_SECONDS", 1.0, minimum=0.1
         )
         self.busy_wait_max_attempts = self._get_env_int(
             "KEY_BUSY_WAIT_MAX_ATTEMPTS", 0, minimum=0
+        )
+        self.save_debounce_seconds = self._get_env_float(
+            "USAGE_SAVE_DEBOUNCE_SECONDS", 0.5, minimum=0.0
         )
 
         # Resilient writer for usage data persistence
@@ -1745,23 +1752,88 @@ class UsageManager:
                 self._deserialize_cycle_state(fair_cycle_data)
 
     async def _save_usage(self):
-        """Saves the current usage data using the resilient state writer."""
-        if self._usage_data is None:
+        """
+        Schedule a persisted usage-state save without blocking request completion.
+
+        The in-memory state has already been updated under _data_lock by the
+        caller. We only need to coalesce disk writes in the background.
+        """
+        if self._usage_data is None or self._save_shutdown:
             return
 
+        self._ensure_save_worker_started()
+        self._save_event.set()
+
+    def _ensure_save_worker_started(self) -> None:
+        """Start the background save worker lazily when the event loop is active."""
+        if self._save_shutdown:
+            return
+        if self._save_task is None or self._save_task.done():
+            self._save_task = asyncio.create_task(self._save_worker())
+
+    async def _build_usage_snapshot_for_save(self) -> Optional[Dict[str, Any]]:
+        """
+        Create an immutable snapshot for persistence.
+
+        This keeps disk serialization/writes outside the request-critical lock.
+        """
         async with self._data_lock:
-            # Add human-readable timestamp fields before saving
-            self._add_readable_timestamps(self._usage_data)
+            if self._usage_data is None:
+                return None
 
-            # Persist fair cycle state (separate from credential data)
+            snapshot = copy.deepcopy(self._usage_data)
+
             if self._cycle_exhausted:
-                self._usage_data["__fair_cycle__"] = self._serialize_cycle_state()
-            elif "__fair_cycle__" in self._usage_data:
-                # Clean up empty cycle data
-                del self._usage_data["__fair_cycle__"]
+                snapshot["__fair_cycle__"] = self._serialize_cycle_state()
+            elif "__fair_cycle__" in snapshot:
+                del snapshot["__fair_cycle__"]
 
-            # Hand off to resilient writer - handles retries and disk failures
-            self._state_writer.write(self._usage_data)
+        self._add_readable_timestamps(snapshot)
+        return snapshot
+
+    async def _flush_usage_snapshot(self) -> None:
+        """Persist the latest usage snapshot on a worker thread."""
+        snapshot = await self._build_usage_snapshot_for_save()
+        if snapshot is None:
+            return
+        await asyncio.to_thread(self._state_writer.write, snapshot)
+
+    async def _save_worker(self) -> None:
+        """
+        Coalesce frequent state updates into fewer disk writes.
+
+        This avoids holding request completion on JSON serialization + file I/O.
+        """
+        while True:
+            await self._save_event.wait()
+            self._save_event.clear()
+
+            if self._save_shutdown:
+                await self._flush_usage_snapshot()
+                return
+
+            if self.save_debounce_seconds > 0:
+                await asyncio.sleep(self.save_debounce_seconds)
+                if self._save_shutdown:
+                    await self._flush_usage_snapshot()
+                    return
+
+            # If more updates arrived during the debounce window, coalesce them
+            # and let the next loop iteration flush the newest state.
+            if self._save_event.is_set():
+                continue
+
+            await self._flush_usage_snapshot()
+
+    async def shutdown(self) -> None:
+        """Flush pending usage state and stop the background save worker."""
+        self._save_shutdown = True
+        self._save_event.set()
+        if self._save_task is not None:
+            try:
+                await self._save_task
+            finally:
+                self._save_task = None
 
     async def _get_usage_data_snapshot(self) -> Dict[str, Any]:
         """

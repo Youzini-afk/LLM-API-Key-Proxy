@@ -819,6 +819,8 @@ class RotatingClient:
 
     async def close(self):
         """Close the HTTP client to prevent resource leaks."""
+        if hasattr(self, "usage_manager") and self.usage_manager:
+            await self.usage_manager.shutdown()
         if hasattr(self, "http_client") and self.http_client:
             await self.http_client.aclose()
 
