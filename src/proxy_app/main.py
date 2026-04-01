@@ -2098,12 +2098,31 @@ async def admin_test_channel(
     model_results = []
     success_count = 0
     try:
+        def _extract_result_error(resp: Any):
+            """Return (has_error, message, status_code) for RotatingClient-like responses."""
+            if not isinstance(resp, dict):
+                return (False, "", None)
+            err = resp.get("error")
+            if not isinstance(err, dict):
+                return (False, "", None)
+
+            message = str(err.get("message") or "")
+            status_code = None
+            details = err.get("details")
+            if isinstance(details, dict):
+                raw_status = details.get("status_code")
+                try:
+                    status_code = int(raw_status) if raw_status is not None else None
+                except Exception:
+                    status_code = None
+            return (True, message, status_code)
+
         for m in selected_models:
             started = time.perf_counter()
             status = "failed"
             err_msg = ""
             try:
-                await isolated_client.acompletion(
+                result = await isolated_client.acompletion(
                     request=request,
                     model=f"{channel_id}/{m}",
                     messages=[{"role": "user", "content": "ping"}],
@@ -2111,8 +2130,16 @@ async def admin_test_channel(
                     stream=False,
                     timeout=20,
                 )
-                status = "success"
-                success_count += 1
+
+                has_error, result_err_msg, status_code = _extract_result_error(result)
+                if has_error:
+                    status = "failed"
+                    code_part = f"HTTP {status_code}: " if status_code else ""
+                    err_msg = f"{code_part}{result_err_msg or 'unknown upstream error'}"
+                else:
+                    status = "success"
+                    success_count += 1
+
             except Exception as e:
                 status = "failed"
                 err_msg = str(e)

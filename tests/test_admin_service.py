@@ -424,6 +424,44 @@ def test_admin_service_manual_virtual_model_overrides_auto(monkeypatch, tmp_path
     assert vms["m1"]["strategy"] == "sequential"
 
 
+def test_admin_service_auto_virtual_model_exposes_single_channel_model(monkeypatch, tmp_path):
+    _, admin_service_mod = _reload_modules(monkeypatch, tmp_path)
+    service = admin_service_mod.AdminService()
+
+    service.create_channel(
+        admin_service_mod.ChannelCreateRequest(
+            id="single",
+            api_base="https://single.example.com/v1",
+            provider_type="openai_compatible",
+            provided_models=["deepseek-v3.2"],
+            enabled=True,
+        )
+    )
+
+    vms = service.list_virtual_models()
+    assert "deepseek-v3.2" in vms
+    assert vms["deepseek-v3.2"]["strategy"] == "balanced"
+    assert [t["model"] for t in vms["deepseek-v3.2"]["targets"]] == ["single/deepseek-v3.2"]
+
+
+def test_admin_service_auto_virtual_model_normalizes_lightweight_names(monkeypatch, tmp_path):
+    _, admin_service_mod = _reload_modules(monkeypatch, tmp_path)
+    service = admin_service_mod.AdminService()
+
+    service.create_channel(
+        admin_service_mod.ChannelCreateRequest(id="a", api_base="https://a.example.com/v1", provided_models=["glm5"])
+    )
+    service.create_channel(
+        admin_service_mod.ChannelCreateRequest(id="b", api_base="https://b.example.com/v1", provided_models=["glm-5"])
+    )
+
+    vms = service.list_virtual_models()
+    assert "glm-5" in vms
+    targets = {t["model"] for t in vms["glm-5"]["targets"]}
+    assert targets == {"a/glm5", "b/glm-5"}
+    assert "glm5" not in vms
+
+
 def test_admin_service_corrupted_config_readonly_protection(monkeypatch, tmp_path):
     admin_store, admin_service_mod = _reload_modules(monkeypatch, tmp_path)
 

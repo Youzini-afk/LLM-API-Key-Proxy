@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
@@ -158,35 +159,69 @@ class AdminService:
         return effective
 
     @staticmethod
+    def _normalize_model_name_for_auto_virtual(model_name: str) -> str:
+        """轻量归一化：忽略大小写与常见分隔符差异（-, _, ., 空格）。"""
+        raw = (model_name or "").strip().lower()
+        if not raw:
+            return ""
+        return re.sub(r"[-_\.\s]+", "", raw)
+
+    @staticmethod
+    def _pick_display_model_name(candidates: List[str]) -> str:
+        """优先保留带分隔符的可读名称，其次按长度和字典序稳定选择。"""
+        cleaned = [c for c in candidates if (c or "").strip()]
+        if not cleaned:
+            return ""
+        with_separator = [c for c in cleaned if re.search(r"[-_\.]", c)]
+        pool = with_separator or cleaned
+        return sorted(pool, key=lambda x: (-len(x), x))[0]
+
+    @staticmethod
     def _build_auto_virtual_models(cfg: AdminConfig) -> Dict[str, VirtualModelAdminConfig]:
         """
-        自动聚合：当同名模型在 2 个及以上启用渠道中都存在时，
-        生成同名虚拟模型，默认使用 balanced（均衡）策略。
+        自动聚合：
+        1) 只要启用渠道里出现的模型，都暴露为公用模型（即使只有 1 个渠道）；
+        2) 使用轻量归一化聚合同一模型（如 glm-5 / glm_5 / glm5）；
+        3) 默认使用 balanced（均衡）策略。
         """
-        model_targets: Dict[str, List[dict]] = {}
+        normalized_buckets: Dict[str, Dict[str, object]] = {}
 
         for ch in cfg.channels:
             if not ch.enabled:
                 continue
             effective_models = AdminService._build_effective_models(ch)
             for model_name in effective_models.keys():
-                model_targets.setdefault(model_name, []).append(
+                normalized = AdminService._normalize_model_name_for_auto_virtual(model_name)
+                if not normalized:
+                    continue
+                bucket = normalized_buckets.setdefault(
+                    normalized,
                     {
-                        "model": f"{ch.id}/{model_name}",
-                        "enabled": True,
-                        "weight": 100,
+                        "names": set(),
+                        "targets": [],
                     }
                 )
+                bucket["names"].add(model_name)
+                bucket["targets"].append(f"{ch.id}/{model_name}")
 
         auto_vms: Dict[str, VirtualModelAdminConfig] = {}
-        for model_name, targets in model_targets.items():
-            if len(targets) < 2:
+        for _, bucket in normalized_buckets.items():
+            names = sorted(list(bucket.get("names") or []))
+            targets = sorted(set(bucket.get("targets") or []))
+            if not targets:
                 continue
-            stable_targets = sorted(targets, key=lambda t: t["model"])
-            auto_vms[model_name] = VirtualModelAdminConfig(
+
+            display_name = AdminService._pick_display_model_name(names)
+            if not display_name:
+                continue
+
+            auto_vms[display_name] = VirtualModelAdminConfig(
                 enabled=True,
                 strategy="balanced",
-                targets=stable_targets,
+                targets=[
+                    {"model": t, "enabled": True, "weight": 100}
+                    for t in targets
+                ],
             )
 
         return auto_vms
