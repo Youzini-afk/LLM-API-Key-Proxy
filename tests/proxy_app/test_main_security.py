@@ -154,3 +154,41 @@ def test_status_code_for_proxy_error_credentials_exhausted(monkeypatch):
     )
 
     assert status == 503
+
+
+@pytest.mark.asyncio
+async def test_streaming_response_wrapper_closes_underlying_stream_on_disconnect(
+    monkeypatch,
+):
+    main_mod = _reload_main(monkeypatch)
+
+    class _DummyRequest:
+        async def is_disconnected(self):
+            return True
+
+    class _DummyStream:
+        def __init__(self):
+            self.closed = False
+            self._yielded = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._yielded:
+                raise StopAsyncIteration
+            self._yielded = True
+            return 'data: {"id":"x","choices":[]}\n\n'
+
+        async def aclose(self):
+            self.closed = True
+
+    stream = _DummyStream()
+    wrapped = main_mod.streaming_response_wrapper(_DummyRequest(), {}, stream)
+
+    collected = []
+    async for item in wrapped:
+        collected.append(item)
+
+    assert collected == []
+    assert stream.closed is True

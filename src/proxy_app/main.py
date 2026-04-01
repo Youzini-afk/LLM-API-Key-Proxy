@@ -1134,6 +1134,7 @@ async def streaming_response_wrapper(
     """
     response_chunks = []
     full_response = {}
+    stream_closed = False
 
     try:
         async for chunk_str in response_stream:
@@ -1170,6 +1171,14 @@ async def streaming_response_wrapper(
             )
         return  # Stop further processing
     finally:
+        close_stream = getattr(response_stream, "aclose", None)
+        if callable(close_stream) and not stream_closed:
+            try:
+                await close_stream()
+                stream_closed = True
+            except Exception as close_exc:
+                logging.warning(f"Failed to close response stream cleanly: {close_exc}")
+
         if response_chunks:
             # --- Aggregation Logic ---
             final_message = {"role": "assistant"}
