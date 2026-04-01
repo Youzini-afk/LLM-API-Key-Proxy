@@ -180,6 +180,13 @@ class UsageManager:
 
         self._timeout_lock = asyncio.Lock()
         self._claimed_on_timeout: Set[str] = set()
+        self._availability_condition = asyncio.Condition()
+        self.busy_wait_interval_seconds = self._get_env_float(
+            "KEY_BUSY_WAIT_INTERVAL_SECONDS", 1.0, minimum=0.1
+        )
+        self.busy_wait_max_attempts = self._get_env_int(
+            "KEY_BUSY_WAIT_MAX_ATTEMPTS", 0, minimum=0
+        )
 
         # Resilient writer for usage data persistence
         self._state_writer = ResilientStateWriter(file_path, lib_logger)
@@ -191,6 +198,84 @@ class UsageManager:
             )
         else:
             self.daily_reset_time_utc = None
+
+    @staticmethod
+    def _get_env_int(key: str, default: int, *, minimum: int = 0) -> int:
+        raw = os.environ.get(key)
+        if raw is None or not raw.strip():
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            lib_logger.warning(
+                f"Invalid integer for {key}: {raw}. Using default {default}."
+            )
+            return default
+        if value < minimum:
+            lib_logger.warning(
+                f"Invalid value for {key}: {value}. Must be >= {minimum}. Using default {default}."
+            )
+            return default
+        return value
+
+    @staticmethod
+    def _get_env_float(key: str, default: float, *, minimum: float = 0.0) -> float:
+        raw = os.environ.get(key)
+        if raw is None or not raw.strip():
+            return default
+        try:
+            value = float(raw)
+        except ValueError:
+            lib_logger.warning(
+                f"Invalid float for {key}: {raw}. Using default {default}."
+            )
+            return default
+        if value < minimum:
+            lib_logger.warning(
+                f"Invalid value for {key}: {value}. Must be >= {minimum}. Using default {default}."
+            )
+            return default
+        return value
+
+    def _reserve_busy_wait_attempt(
+        self,
+        wait_attempts: int,
+        remaining_budget: float,
+        *,
+        reason: str,
+    ) -> Tuple[Optional[float], int, Optional[str]]:
+        """
+        Reserve one bounded wait attempt when all credentials are busy/unavailable.
+        """
+        if remaining_budget <= 0:
+            return (None, wait_attempts, None)
+
+        if (
+            self.busy_wait_max_attempts > 0
+            and wait_attempts >= self.busy_wait_max_attempts
+        ):
+            return (
+                None,
+                wait_attempts,
+                f"{reason} after {wait_attempts} wait attempt(s)",
+            )
+
+        wait_attempts += 1
+        wait_timeout = min(self.busy_wait_interval_seconds, remaining_budget)
+        return (wait_timeout, wait_attempts, None)
+
+    async def _wait_for_any_availability(self, timeout: float) -> None:
+        """
+        Wait until any credential signals availability or the timeout expires.
+        """
+        try:
+            async with self._availability_condition:
+                await asyncio.wait_for(
+                    self._availability_condition.wait(), timeout=timeout
+                )
+            lib_logger.info("Availability signal received. Re-evaluating...")
+        except asyncio.TimeoutError:
+            lib_logger.info("Availability wait timed out. Re-evaluating...")
 
     def _get_rotation_mode(self, provider: str) -> str:
         """
@@ -2385,6 +2470,8 @@ class UsageManager:
         )
 
         # This loop continues as long as the global deadline has not been met.
+        wait_attempts = 0
+        wait_exhaustion_reason: Optional[str] = None
         while time.time() < deadline:
             now = time.time()
 
@@ -2576,36 +2663,74 @@ class UsageManager:
                         lib_logger.warning(
                             "No keys eligible and no cooldowns active. Re-evaluating..."
                         )
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(self.busy_wait_interval_seconds)
                         continue
 
                     remaining_budget = deadline - time.time()
                     wait_needed = soonest_end - time.time()
 
-                    if wait_needed > remaining_budget:
-                        # Fail fast - no credential will be available in time
-                        lib_logger.warning(
-                            f"All credentials on cooldown. Soonest available in {wait_needed:.1f}s, "
-                            f"but only {remaining_budget:.1f}s budget remaining. Failing fast."
+                    wait_timeout, wait_attempts, exhaustion_reason = (
+                        self._reserve_busy_wait_attempt(
+                            wait_attempts,
+                            remaining_budget,
+                            reason="All credentials stayed on cooldown",
                         )
-                        break  # Exit loop, will raise NoAvailableKeysError
-
-                    # Wait for the credential to become available
-                    lib_logger.info(
-                        f"All credentials on cooldown. Waiting {wait_needed:.1f}s for soonest credential..."
                     )
-                    await asyncio.sleep(min(wait_needed + 0.1, remaining_budget))
+                    if exhaustion_reason:
+                        wait_exhaustion_reason = exhaustion_reason
+                        lib_logger.warning(
+                            f"{wait_exhaustion_reason} for model {model}. "
+                            f"Soonest credential reports availability in {max(0.0, wait_needed):.1f}s."
+                        )
+                        break
+
+                    if wait_timeout is None:
+                        break
+
+                    lib_logger.info(
+                        f"All credentials on cooldown. Soonest credential reports availability "
+                        f"in {max(0.0, wait_needed):.1f}s. Waiting {wait_timeout:.1f}s "
+                        f"before retrying (attempt {wait_attempts}"
+                        + (
+                            f"/{self.busy_wait_max_attempts}"
+                            if self.busy_wait_max_attempts > 0
+                            else ""
+                        )
+                        + ")."
+                    )
+                    await asyncio.sleep(wait_timeout)
                     continue
 
                 # Wait for the highest priority key with lowest usage
-                best_priority = min(priority_groups.keys())
-                best_priority_keys = priority_groups[best_priority]
-                best_wait_key = min(best_priority_keys, key=lambda x: x[1])[0]
-                wait_condition = self.key_states[best_wait_key]["condition"]
-
-                lib_logger.info(
-                    f"All Priority-{best_priority} keys are busy. Waiting for highest priority credential to become available..."
+                remaining_budget = deadline - time.time()
+                wait_timeout, wait_attempts, exhaustion_reason = (
+                    self._reserve_busy_wait_attempt(
+                        wait_attempts,
+                        remaining_budget,
+                        reason="All eligible credentials stayed busy",
+                    )
                 )
+                if exhaustion_reason:
+                    wait_exhaustion_reason = exhaustion_reason
+                    lib_logger.warning(
+                        f"{wait_exhaustion_reason} for model {model}."
+                    )
+                    break
+                if wait_timeout is None:
+                    break
+                best_priority = min(priority_groups.keys())
+                lib_logger.info(
+                    f"All Priority-{best_priority} keys are busy. Waiting up to {wait_timeout:.1f}s "
+                    f"before retrying (attempt {wait_attempts}"
+                    + (
+                        f"/{self.busy_wait_max_attempts}"
+                        if self.busy_wait_max_attempts > 0
+                        else ""
+                    )
+                    + ")."
+                )
+                await self._wait_for_any_availability(wait_timeout)
+                continue
 
             else:
                 # Original logic when no priorities specified
@@ -2622,7 +2747,7 @@ class UsageManager:
                 )
                 effective_max_concurrent = max_concurrent * multiplier
 
-                tier1_keys, tier2_keys = [], []
+                eligible_keys = []
 
                 # First, filter the list of available keys to exclude any on cooldown.
                 async with self._data_lock:
@@ -2639,17 +2764,7 @@ class UsageManager:
                         # Prioritize keys based on their current usage to ensure load balancing.
                         # Uses grouped usage if model is in a quota group
                         usage_count = self._get_grouped_usage_count(key, model)
-                        key_state = self.key_states[key]
-
-                        # Tier 1: Completely idle keys (preferred).
-                        if not key_state["models_in_use"]:
-                            tier1_keys.append((key, usage_count))
-                        # Tier 2: Keys that can accept more concurrent requests for this model.
-                        elif (
-                            key_state["models_in_use"].get(model, 0)
-                            < effective_max_concurrent
-                        ):
-                            tier2_keys.append((key, usage_count))
+                        eligible_keys.append((key, usage_count))
 
                 # Fair cycle filtering (non-priority case)
                 if provider and self._is_fair_cycle_enabled(provider, rotation_mode):
@@ -2674,27 +2789,33 @@ class UsageManager:
                         tier_key,
                         tracking_key,
                         all_tier_creds,
-                        available_not_on_cooldown=[
-                            key for key, _ in (tier1_keys + tier2_keys)
-                        ],
+                        available_not_on_cooldown=[key for key, _ in eligible_keys],
                     ):
                         self._reset_cycle(provider, tier_key, tracking_key)
 
-                    # Filter out exhausted credentials from both tiers
-                    tier1_keys = [
+                    # Filter out exhausted credentials before concurrency checks so
+                    # "all keys busy" is not mistaken for "no eligible keys".
+                    eligible_keys = [
                         (key, usage)
-                        for key, usage in tier1_keys
+                        for key, usage in eligible_keys
                         if not self._is_credential_exhausted_in_cycle(
                             key, provider, tier_key, tracking_key
                         )
                     ]
-                    tier2_keys = [
-                        (key, usage)
-                        for key, usage in tier2_keys
-                        if not self._is_credential_exhausted_in_cycle(
-                            key, provider, tier_key, tracking_key
-                        )
-                    ]
+
+                tier1_keys, tier2_keys = [], []
+                for key, usage_count in eligible_keys:
+                    key_state = self.key_states[key]
+
+                    # Tier 1: Completely idle keys (preferred).
+                    if not key_state["models_in_use"]:
+                        tier1_keys.append((key, usage_count))
+                    # Tier 2: Keys that can accept more concurrent requests for this model.
+                    elif (
+                        key_state["models_in_use"].get(model, 0)
+                        < effective_max_concurrent
+                    ):
+                        tier2_keys.append((key, usage_count))
 
                 if rotation_mode == "sequential":
                     # Sequential mode: sort credentials by priority, usage, recency
@@ -2770,12 +2891,7 @@ class UsageManager:
                             )
                             return key
 
-                # If all eligible keys are locked, wait for a key to be released.
-                lib_logger.info(
-                    "All eligible keys are currently locked for this model. Waiting..."
-                )
-
-                all_potential_keys = tier1_keys + tier2_keys
+                all_potential_keys = eligible_keys
                 if not all_potential_keys:
                     # All credentials are on cooldown - check if waiting makes sense
                     soonest_end = await self.get_soonest_cooldown_end(
@@ -2787,46 +2903,78 @@ class UsageManager:
                         lib_logger.warning(
                             "No keys eligible and no cooldowns active. Re-evaluating..."
                         )
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(self.busy_wait_interval_seconds)
                         continue
 
                     remaining_budget = deadline - time.time()
                     wait_needed = soonest_end - time.time()
 
-                    if wait_needed > remaining_budget:
-                        # Fail fast - no credential will be available in time
-                        lib_logger.warning(
-                            f"All credentials on cooldown. Soonest available in {wait_needed:.1f}s, "
-                            f"but only {remaining_budget:.1f}s budget remaining. Failing fast."
+                    wait_timeout, wait_attempts, exhaustion_reason = (
+                        self._reserve_busy_wait_attempt(
+                            wait_attempts,
+                            remaining_budget,
+                            reason="All credentials stayed on cooldown",
                         )
-                        break  # Exit loop, will raise NoAvailableKeysError
-
-                    # Wait for the credential to become available
-                    lib_logger.info(
-                        f"All credentials on cooldown. Waiting {wait_needed:.1f}s for soonest credential..."
                     )
-                    await asyncio.sleep(min(wait_needed + 0.1, remaining_budget))
+                    if exhaustion_reason:
+                        wait_exhaustion_reason = exhaustion_reason
+                        lib_logger.warning(
+                            f"{wait_exhaustion_reason} for model {model}. "
+                            f"Soonest credential reports availability in {max(0.0, wait_needed):.1f}s."
+                        )
+                        break
+
+                    if wait_timeout is None:
+                        break
+
+                    lib_logger.info(
+                        f"All credentials on cooldown. Soonest credential reports availability "
+                        f"in {max(0.0, wait_needed):.1f}s. Waiting {wait_timeout:.1f}s "
+                        f"before retrying (attempt {wait_attempts}"
+                        + (
+                            f"/{self.busy_wait_max_attempts}"
+                            if self.busy_wait_max_attempts > 0
+                            else ""
+                        )
+                        + ")."
+                    )
+                    await asyncio.sleep(wait_timeout)
                     continue
 
-                # Wait on the condition of the key with the lowest current usage.
-                best_wait_key = min(all_potential_keys, key=lambda x: x[1])[0]
-                wait_condition = self.key_states[best_wait_key]["condition"]
-
-            try:
-                async with wait_condition:
-                    remaining_budget = deadline - time.time()
-                    if remaining_budget <= 0:
-                        break  # Exit if the budget has already been exceeded.
-                    # Wait for a notification, but no longer than the remaining budget or 1 second.
-                    await asyncio.wait_for(
-                        wait_condition.wait(), timeout=min(1, remaining_budget)
+                remaining_budget = deadline - time.time()
+                wait_timeout, wait_attempts, exhaustion_reason = (
+                    self._reserve_busy_wait_attempt(
+                        wait_attempts,
+                        remaining_budget,
+                        reason="All eligible credentials stayed busy",
                     )
-                lib_logger.info("Notified that a key was released. Re-evaluating...")
-            except asyncio.TimeoutError:
-                # This is not an error, just a timeout for the wait. The main loop will re-evaluate.
-                lib_logger.info("Wait timed out. Re-evaluating for any available key.")
+                )
+                if exhaustion_reason:
+                    wait_exhaustion_reason = exhaustion_reason
+                    lib_logger.warning(
+                        f"{wait_exhaustion_reason} for model {model}."
+                    )
+                    break
+                if wait_timeout is None:
+                    break
+                lib_logger.info(
+                    "All eligible keys are currently locked for this model. "
+                    f"Waiting up to {wait_timeout:.1f}s before retrying (attempt {wait_attempts}"
+                    + (
+                        f"/{self.busy_wait_max_attempts}"
+                        if self.busy_wait_max_attempts > 0
+                        else ""
+                    )
+                    + ")."
+                )
+                await self._wait_for_any_availability(wait_timeout)
+                continue
 
         # If the loop exits, it means the deadline was exceeded.
+        if wait_exhaustion_reason:
+            raise NoAvailableKeysError(
+                f"{wait_exhaustion_reason} for model {model}."
+            )
         raise NoAvailableKeysError(
             f"Could not acquire a key for model {model} within the global time budget."
         )
@@ -2855,6 +3003,8 @@ class UsageManager:
         # Notify all tasks waiting on this key's condition
         async with state["condition"]:
             state["condition"].notify_all()
+        async with self._availability_condition:
+            self._availability_condition.notify_all()
 
     async def record_success(
         self,
