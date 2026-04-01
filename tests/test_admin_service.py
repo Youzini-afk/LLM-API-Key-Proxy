@@ -147,3 +147,47 @@ def test_admin_service_runtime_overlay(monkeypatch, tmp_path):
     assert "DASHSCOPE_A_MODELS" in overlay
     assert overlay["AUTO_DISABLE_LONG_UNAVAILABLE_DASHSCOPE_A"] == "true"
     assert overlay["AUTO_DISABLE_UNAVAILABLE_HOURS_DASHSCOPE_A"] == "12"
+
+
+def test_admin_service_update_channel_id_and_custom_provider(monkeypatch, tmp_path):
+    _, admin_service_mod = _reload_modules(monkeypatch, tmp_path)
+    service = admin_service_mod.AdminService()
+
+    service.create_channel(
+        admin_service_mod.ChannelCreateRequest(
+            id="dashscope_a",
+            api_base="https://example.com/v1",
+            provider_type="openai_compatible",
+            models={"kimi2.5": {"id": "kimi-k2"}},
+            api_keys=[],
+        )
+    )
+
+    from proxy_app.admin_schemas import VirtualModelAdminConfig, VirtualTargetConfig
+
+    service.create_or_update_virtual_model(
+        "kimi2.5",
+        VirtualModelAdminConfig(
+            enabled=True,
+            strategy="sequential",
+            targets=[VirtualTargetConfig(model="dashscope_a/kimi2.5")],
+        ),
+    )
+
+    out = service.update_channel(
+        "dashscope_a",
+        admin_service_mod.ChannelUpdateRequest(
+            id="infini_custom_a",
+            provider_type="infini_custom",
+            display_name="安安干饭",
+        ),
+    )
+
+    assert out.get("updated_channel_id") == "infini_custom_a"
+
+    cfg = service.get_config()
+    channel = next((c for c in cfg.channels if c.id == "infini_custom_a"), None)
+    assert channel is not None
+    assert channel.provider_type == "infini_custom"
+    assert channel.display_name == "安安干饭"
+    assert cfg.virtual_models["kimi2.5"].targets[0].model == "infini_custom_a/kimi2.5"

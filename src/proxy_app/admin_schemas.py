@@ -120,16 +120,35 @@ class ChannelCreateRequest(BaseModel):
     models: Dict[str, dict] = Field(default_factory=dict)
     settings: ChannelSettingsConfig = Field(default_factory=ChannelSettingsConfig)
 
+    @field_validator("provider_type")
+    @classmethod
+    def validate_provider_type(cls, v: str) -> str:
+        s = (v or "").strip()
+        if not s:
+            raise ValueError("provider_type cannot be empty")
+        return s
+
 
 
 
 class ChannelUpdateRequest(BaseModel):
+    id: Optional[str] = None
     provider_type: Optional[str] = None
     display_name: Optional[str] = None
     enabled: Optional[bool] = None
     api_base: Optional[str] = None
     models: Optional[Dict[str, dict]] = None
     settings: Optional[ChannelSettingsConfig] = None
+
+    @field_validator("provider_type")
+    @classmethod
+    def validate_provider_type(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        s = v.strip()
+        if not s:
+            raise ValueError("provider_type cannot be empty")
+        return s
 
 
 class KeyCreateRequest(BaseModel):

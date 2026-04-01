@@ -75,13 +75,12 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
         h('h3', { className: 'modal-title' }, title),
       ),
       h('div', { className: 'modal-body' },
-        h('label', { className: 'input-label' }, '渠道 ID（可留空自动生成）'),
+        h('label', { className: 'input-label' }, initial ? '渠道 ID（可手动修改）' : '渠道 ID（可留空自动生成）'),
         h('input', {
           id: 'ch-id',
           className: 'input-field',
           value: initial?.id || '',
-          disabled: !!initial,
-          placeholder: '留空自动生成，例如：openai_compatible_2',
+          placeholder: initial ? '支持手动修改，例如：infini_custom_a' : '留空自动生成，例如：openai_compatible_2',
         }),
 
         h('label', { className: 'input-label mt-md' }, '显示名称'),
@@ -250,10 +249,11 @@ function createChannelFormModal({ title = '新增渠道', initial = null, onSubm
             try {
               const selectVal = document.getElementById('ch-provider-type-select').value;
               const customProviderType = (document.getElementById('ch-provider-type-custom').value || '').trim();
-              // 自定义渠道如果不填 provider_type，默认按 openai_compatible 保存，避免无法提交
-              const providerType = selectVal === '__custom__'
-                ? (customProviderType || 'openai_compatible')
-                : selectVal;
+              if (selectVal === '__custom__' && !customProviderType) {
+                throw new Error('请选择“自定义...”时，必须填写自定义 Provider Type');
+              }
+
+              const providerType = selectVal === '__custom__' ? customProviderType : selectVal;
 
               let models;
               if (mode === 'visual') {
@@ -675,7 +675,8 @@ export async function renderChannels(container) {
                   title: `编辑渠道 - ${ch.id}`,
                   initial: ch,
                   onSubmit: async (payload) => {
-                    await api.updateChannel(ch.id, {
+                    const res = await api.updateChannel(ch.id, {
+                      id: payload.id,
                       display_name: payload.display_name,
                       enabled: payload.enabled,
                       api_base: payload.api_base,
@@ -683,7 +684,8 @@ export async function renderChannels(container) {
                       models: payload.models,
                       settings: payload.settings,
                     });
-                    showToast('渠道已更新', 'success');
+                    const updatedId = res?.config?.updated_channel_id || res?.updated_channel_id || payload.id || ch.id;
+                    showToast(updatedId !== ch.id ? `渠道已更新并重命名为: ${updatedId}` : '渠道已更新', 'success');
                     renderChannels(container);
                   }
                 });

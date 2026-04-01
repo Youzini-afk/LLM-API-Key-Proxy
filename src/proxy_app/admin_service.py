@@ -152,23 +152,49 @@ class AdminService:
 
     def update_channel(self, channel_id: str, req: ChannelUpdateRequest) -> Dict:
         cfg = self.get_config()
-        target = next((c for c in cfg.channels if c.id == channel_id), None)
+        target_idx = next((idx for idx, c in enumerate(cfg.channels) if c.id == channel_id), None)
+        target = cfg.channels[target_idx] if target_idx is not None else None
         if not target:
             raise ValueError(f"Channel '{channel_id}' not found")
 
         upd = req.model_dump(exclude_none=True)
+        next_channel_id = channel_id
+
+        if "id" in upd:
+            requested_id = self._sanitize_channel_id(upd.pop("id") or "")
+            if requested_id and requested_id != channel_id:
+                if any(c.id == requested_id and c.id != channel_id for c in cfg.channels):
+                    raise ValueError(f"Channel '{requested_id}' already exists")
+                next_channel_id = requested_id
+
         if "api_base" in upd:
             upd["api_base"] = self._normalize_api_base(upd["api_base"])
 
-        for k, v in upd.items():
-            setattr(target, k, v)
+        updated_payload = target.model_dump()
+        updated_payload.update(upd)
+        updated_payload["id"] = next_channel_id
+        updated_channel = ChannelConfig(**updated_payload)
+
+        if next_channel_id != channel_id:
+            for _, vm in cfg.virtual_models.items():
+                new_targets = []
+                for t in vm.targets:
+                    if t.model.startswith(f"{channel_id}/"):
+                        _, model_name = t.model.split("/", 1)
+                        t = t.model_copy(update={"model": f"{next_channel_id}/{model_name}"})
+                    new_targets.append(t)
+                vm.targets = new_targets
+
+        cfg.channels[target_idx] = updated_channel
 
         result = self.validate_config(cfg)
         if not result.ok:
             raise ValueError("; ".join(result.errors))
 
         self._cfg = save_admin_config(cfg)
-        return self.get_config_masked()
+        out = self.get_config_masked()
+        out["updated_channel_id"] = next_channel_id
+        return out
 
     def delete_channel(self, channel_id: str) -> Dict:
         cfg = self.get_config()
