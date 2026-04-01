@@ -595,6 +595,9 @@ class RotatingClient:
         self.ignore_models = ignore_models or {}
         self.whitelist_models = whitelist_models or {}
         self.enable_request_logging = enable_request_logging
+        self.enable_litellm_success_debug_logs = self._env_flag_true(
+            "ENABLE_LITELLM_SUCCESS_DEBUG_LOGS", False
+        )
         self.model_definitions = ModelDefinitions()
 
         # Store and validate max concurrent requests per key
@@ -788,6 +791,8 @@ class RotatingClient:
 
         # For successful calls or pre-call logs, a simple debug message is enough.
         if not log_data.get("exception"):
+            if not self.enable_litellm_success_debug_logs:
+                return
             sanitized_log = self._sanitize_litellm_log(log_data)
             # We log it at the DEBUG level to ensure it goes to the debug file
             # and not the console, based on the main.py configuration.
@@ -1369,7 +1374,7 @@ class RotatingClient:
             # This block now runs regardless of how the stream terminates (completion, client disconnect, etc.).
             # The primary goal is to ensure usage is always logged internally.
             await self.usage_manager.release_key(key, model)
-            lib_logger.info(
+            lib_logger.debug(
                 f"STREAM FINISHED and lock released for credential {mask_credential(key)}."
             )
 
@@ -1672,7 +1677,7 @@ class RotatingClient:
                     # Retry loop for custom providers - mirrors streaming path error handling
                     for attempt in range(self.max_retries):
                         try:
-                            lib_logger.info(
+                            lib_logger.debug(
                                 f"Attempting call with credential {mask_credential(current_cred)} (Attempt {attempt + 1}/{self.max_retries})"
                             )
 
@@ -1909,7 +1914,7 @@ class RotatingClient:
 
                     for attempt in range(self.max_retries):
                         try:
-                            lib_logger.info(
+                            lib_logger.debug(
                                 f"Attempting call with credential {mask_credential(current_cred)} (Attempt {attempt + 1}/{self.max_retries})"
                             )
 
@@ -2419,7 +2424,7 @@ class RotatingClient:
 
                         for attempt in range(self.max_retries):
                             try:
-                                lib_logger.info(
+                                lib_logger.debug(
                                     f"Attempting stream with credential {mask_credential(current_cred)} (Attempt {attempt + 1}/{self.max_retries})"
                                 )
 
@@ -2673,7 +2678,7 @@ class RotatingClient:
 
                     for attempt in range(self.max_retries):
                         try:
-                            lib_logger.info(
+                            lib_logger.debug(
                                 f"Attempting stream with credential {mask_credential(current_cred)} (Attempt {attempt + 1}/{self.max_retries})"
                             )
 

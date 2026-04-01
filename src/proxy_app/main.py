@@ -11,6 +11,8 @@ from pathlib import Path
 import sys
 import argparse
 import logging
+import queue
+from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
 
 # --- Argument Parsing (BEFORE heavy imports) ---
 parser = argparse.ArgumentParser(description="API Key Proxy Server")
@@ -316,19 +318,39 @@ formatter = colorlog.ColoredFormatter(
 )
 console_handler.setFormatter(formatter)
 
+# Configure rotating file handlers so long-running instances do not accumulate
+# unbounded log files or block the event loop on large synchronous writes.
+LOG_FILE_MAX_BYTES = max(
+    1,
+    int(os.getenv("PROXY_LOG_MAX_BYTES", str(20 * 1024 * 1024))),
+)
+LOG_FILE_BACKUP_COUNT = max(1, int(os.getenv("PROXY_LOG_BACKUP_COUNT", "3")))
+
 # Configure a file handler for INFO-level logs and higher
-info_file_handler = logging.FileHandler(LOG_DIR / "proxy.log", encoding="utf-8")
+info_file_handler = RotatingFileHandler(
+    LOG_DIR / "proxy.log",
+    maxBytes=LOG_FILE_MAX_BYTES,
+    backupCount=LOG_FILE_BACKUP_COUNT,
+    encoding="utf-8",
+)
 info_file_handler.setLevel(logging.INFO)
 info_file_handler.setFormatter(
     logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 )
+info_file_handler._proxy_owned = True
 
 # Configure a dedicated file handler for all DEBUG-level logs
-debug_file_handler = logging.FileHandler(LOG_DIR / "proxy_debug.log", encoding="utf-8")
+debug_file_handler = RotatingFileHandler(
+    LOG_DIR / "proxy_debug.log",
+    maxBytes=LOG_FILE_MAX_BYTES,
+    backupCount=LOG_FILE_BACKUP_COUNT,
+    encoding="utf-8",
+)
 debug_file_handler.setLevel(logging.DEBUG)
 debug_file_handler.setFormatter(
     logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 )
+debug_file_handler._proxy_owned = True
 
 
 # Create a filter to ensure the debug handler ONLY gets DEBUG messages from the rotator_library
@@ -355,6 +377,7 @@ formatter = colorlog.ColoredFormatter(
     },
 )
 console_handler.setFormatter(formatter)
+console_handler._proxy_owned = True
 
 
 # Add a filter to prevent any LiteLLM logs from cluttering the console
@@ -369,10 +392,30 @@ console_handler.addFilter(NoLiteLLMLogFilter())
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.DEBUG)
 
-# Add all handlers to the root logger
-root_logger.addHandler(info_file_handler)
-root_logger.addHandler(console_handler)
-root_logger.addHandler(debug_file_handler)
+# Replace any prior proxy-owned handlers so config reloads do not duplicate output.
+for existing_handler in list(root_logger.handlers):
+    if getattr(existing_handler, "_proxy_owned", False):
+        root_logger.removeHandler(existing_handler)
+        try:
+            existing_handler.close()
+        except Exception:
+            pass
+
+# Route logs through a queue so async request handling is not blocked by file I/O.
+_log_queue = queue.SimpleQueue()
+queue_handler = QueueHandler(_log_queue)
+queue_handler.setLevel(logging.DEBUG)
+queue_handler._proxy_owned = True
+root_logger.addHandler(queue_handler)
+
+LOG_QUEUE_LISTENER = QueueListener(
+    _log_queue,
+    info_file_handler,
+    console_handler,
+    debug_file_handler,
+    respect_handler_level=True,
+)
+LOG_QUEUE_LISTENER.start()
 
 # Silence other noisy loggers by setting their level higher than root
 logging.getLogger("uvicorn").setLevel(logging.WARNING)
@@ -842,6 +885,9 @@ async def lifespan(app: FastAPI):
         logging.info("RotatingClient and EmbeddingBatcher closed.")
     else:
         logging.info("RotatingClient closed.")
+
+    if LOG_QUEUE_LISTENER:
+        LOG_QUEUE_LISTENER.stop()
 
 
 # --- FastAPI App Setup ---

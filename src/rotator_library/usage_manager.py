@@ -2693,7 +2693,7 @@ class UsageManager:
                                     else "unknown"
                                 )
                                 quota_display = self._get_quota_display(key, model)
-                                lib_logger.info(
+                                lib_logger.debug(
                                     f"Acquired key {mask_credential(key)} for model {model} "
                                     f"(tier: {tier_name}, priority: {priority_level}, selection: {selection_method}, {quota_display})"
                                 )
@@ -2712,7 +2712,7 @@ class UsageManager:
                                     else "unknown"
                                 )
                                 quota_display = self._get_quota_display(key, model)
-                                lib_logger.info(
+                                lib_logger.debug(
                                     f"Acquired key {mask_credential(key)} for model {model} "
                                     f"(tier: {tier_name}, priority: {priority_level}, selection: {selection_method}, concurrent: {state['models_in_use'][model]}/{effective_max_concurrent}, {quota_display})"
                                 )
@@ -2937,7 +2937,7 @@ class UsageManager:
                             )
                             tier_info = f"tier: {tier_name}, " if tier_name else ""
                             quota_display = self._get_quota_display(key, model)
-                            lib_logger.info(
+                            lib_logger.debug(
                                 f"Acquired key {mask_credential(key)} for model {model} "
                                 f"({tier_info}selection: {selection_method}, {quota_display})"
                             )
@@ -2957,7 +2957,7 @@ class UsageManager:
                             )
                             tier_info = f"tier: {tier_name}, " if tier_name else ""
                             quota_display = self._get_quota_display(key, model)
-                            lib_logger.info(
+                            lib_logger.debug(
                                 f"Acquired key {mask_credential(key)} for model {model} "
                                 f"({tier_info}selection: {selection_method}, concurrent: {state['models_in_use'][model]}/{effective_max_concurrent}, {quota_display})"
                             )
@@ -3063,7 +3063,7 @@ class UsageManager:
                 remaining = state["models_in_use"][model]
                 if remaining <= 0:
                     del state["models_in_use"][model]  # Clean up when count reaches 0
-                lib_logger.info(
+                lib_logger.debug(
                     f"Released credential {mask_credential(key)} from model {model} "
                     f"(remaining concurrent: {max(0, remaining)})"
                 )
@@ -3277,7 +3277,7 @@ class UsageManager:
                 usage_data_ref["completion_tokens"] += getattr(
                     usage, "completion_tokens", 0
                 )
-                lib_logger.info(
+                lib_logger.debug(
                     f"Recorded usage from response object for key {mask_credential(key)}"
                 )
                 try:
