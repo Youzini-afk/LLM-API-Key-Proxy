@@ -870,6 +870,13 @@ class RotatingClient:
         """
         return self.provider_config.is_custom_provider(provider_name)
 
+    @staticmethod
+    def _instantiate_provider_plugin(provider_name: str, provider_class):
+        """Instantiate provider plugin classes, including generic OpenAI-compatible providers."""
+        if provider_class is OpenAICompatibleProvider:
+            return provider_class(provider_name)
+        return provider_class()
+
     def _get_provider_instance(self, provider_name: str):
         """
         Lazily initializes and returns a provider instance.
@@ -900,10 +907,9 @@ class RotatingClient:
             return None
 
         if provider_name not in self._provider_instances:
-            if provider_name in self._provider_plugins:
-                self._provider_instances[provider_name] = self._provider_plugins[
-                    provider_name
-                ]()
+            provider_class = self._provider_plugins.get(provider_name)
+            if provider_class:
+                self._provider_instances[provider_name] = self._instantiate_provider_plugin(provider_name, provider_class)
             elif self._is_custom_openai_compatible_provider(provider_name):
                 # Create a generic OpenAI-compatible provider for custom providers
                 try:
@@ -3073,9 +3079,10 @@ class RotatingClient:
                 continue
 
             # Get or create provider instance
+            provider_instance_key = provider
             if provider not in self._provider_instances:
-                self._provider_instances[provider] = provider_class()
-            provider_instance = self._provider_instances[provider]
+                self._provider_instances[provider] = self._instantiate_provider_plugin(provider, provider_class)
+            provider_instance = self._provider_instances[provider_instance_key]
 
             # Check if provider has quota tracking (like Antigravity)
             if hasattr(provider_instance, "_get_effective_quota_groups"):
@@ -3415,9 +3422,10 @@ class RotatingClient:
                 continue
 
             # Get or create provider instance
+            provider_instance_key = prov
             if prov not in self._provider_instances:
-                self._provider_instances[prov] = provider_class()
-            provider_instance = self._provider_instances[prov]
+                self._provider_instances[prov] = self._instantiate_provider_plugin(prov, provider_class)
+            provider_instance = self._provider_instances[provider_instance_key]
 
             # Check if provider supports quota refresh (like Antigravity)
             if hasattr(provider_instance, "fetch_initial_baselines"):
