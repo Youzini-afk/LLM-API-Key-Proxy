@@ -1398,16 +1398,39 @@ async def list_models(
         enriched: If True (default), returns detailed model info with pricing and capabilities.
                   If False, returns minimal OpenAI-compatible response.
     """
-    # Get provider models
+    # Get provider models discovered from upstream /models
     provider_model_ids = await client.get_all_available_models(grouped=False)
+
+    # Fallback/补充：有些渠道不支持 /models，仍应展示已配置的 *_MODELS
+    configured_model_ids = []
+    try:
+        model_definitions = getattr(client, "model_definitions", None)
+        providers = list(getattr(client, "all_credentials", {}).keys())
+        if model_definitions:
+            for provider in providers:
+                configured_model_ids.extend(
+                    model_definitions.get_all_provider_models(provider)
+                )
+    except Exception as e:
+        logging.debug(f"Failed to collect configured models fallback: {e}")
+
+    # 合并去重：先保留运行时探测结果，再补充配置模型
+    existing_set = set(provider_model_ids)
+    configured_to_add = [m for m in configured_model_ids if m not in existing_set]
+    model_ids = provider_model_ids + configured_to_add
+
+    if configured_to_add:
+        logging.debug(
+            f"Added {len(configured_to_add)} configured model(s) as fallback: {configured_to_add}"
+        )
 
     # Append virtual model names
     from proxy_app.virtual_models import get_all_virtual_model_names
     virtual_names = get_all_virtual_model_names()
     # Deduplicate: only add virtual names not already present as provider models
-    existing_set = set(provider_model_ids)
+    existing_set = set(model_ids)
     virtual_to_add = [vm for vm in virtual_names if vm not in existing_set]
-    model_ids = provider_model_ids + virtual_to_add
+    model_ids = model_ids + virtual_to_add
 
     if virtual_to_add:
         logging.debug(
@@ -1785,8 +1808,18 @@ async def admin_delete_channel_key(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+class ChannelModelTestRequest(BaseModel):
+    models: list[str] = []
+
+
 @app.post("/admin/channels/{channel_id}/test")
-async def admin_test_channel(channel_id: str, _=Depends(verify_admin_api_key)):
+async def admin_test_channel(
+    request: Request,
+    channel_id: str,
+    body: ChannelModelTestRequest | None = None,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_admin_api_key),
+):
     cfg = admin_service.get_config()
     channel = next((c for c in cfg.channels if c.id == channel_id), None)
     if not channel:
@@ -1796,12 +1829,67 @@ async def admin_test_channel(channel_id: str, _=Depends(verify_admin_api_key)):
     if not enabled_keys:
         return {"ok": False, "message": "No enabled key in this channel"}
 
+    selected_models = (body.models if body else None) or list(channel.models.keys())
+    if not selected_models:
+        return {
+            "ok": False,
+            "message": "No models to test",
+            "channel": channel_id,
+            "enabled_keys": len(enabled_keys),
+            "models": [],
+            "results": [],
+        }
+
+    model_results = []
+    success_count = 0
+    for m in selected_models:
+        started = time.perf_counter()
+        status = "failed"
+        err_msg = ""
+        try:
+            await client.acompletion(
+                request=request,
+                model=f"{channel_id}/{m}",
+                messages=[{"role": "user", "content": "ping"}],
+                max_tokens=1,
+                stream=False,
+                timeout=20,
+            )
+            status = "success"
+            success_count += 1
+        except Exception as e:
+            status = "failed"
+            err_msg = str(e)
+
+        elapsed = round(time.perf_counter() - started, 3)
+        model_results.append(
+            {
+                "model": m,
+                "status": status,
+                "latency_seconds": elapsed,
+                "error": err_msg,
+            }
+        )
+
+    all_ok = success_count == len(selected_models)
+    msg = (
+        f"全部成功（{success_count}/{len(selected_models)}）"
+        if all_ok
+        else f"部分成功（{success_count}/{len(selected_models)}）"
+    )
+
     return {
-        "ok": True,
-        "message": "Channel looks valid",
+        "ok": all_ok,
+        "message": msg,
         "channel": channel_id,
         "enabled_keys": len(enabled_keys),
-        "models": list(channel.models.keys()),
+        "models": selected_models,
+        "results": model_results,
+        "summary": {
+            "total": len(selected_models),
+            "success": success_count,
+            "failed": len(selected_models) - success_count,
+        },
     }
 
 

@@ -140,11 +140,15 @@ class ProxyAPI {
     });
   }
 
-  async testChannel(channelId) {
+  async testChannel(channelId, payload = null) {
     return this.request(`/admin/channels/${encodeURIComponent(channelId)}/test`, {
       method: 'POST',
+      ...(payload ? {
+        body: JSON.stringify(payload),
+      } : {}),
     });
   }
+
 
   async discoverModels(apiBase, apiKey = '') {
     return this.request('/admin/discover-models', {

@@ -441,6 +441,139 @@ function createKeyModal({ channelId, onSubmit }) {
   return modal;
 }
 
+function createChannelModelTestModal({ channel, onBatchTest }) {
+  const allModels = Object.keys(channel?.models || {});
+  let query = '';
+  const selected = new Set();
+  const resultMap = {};
+
+  const modal = h('div', { className: 'modal-overlay' },
+    h('div', { className: 'modal-card', style: { width: '980px', maxWidth: '96vw' } },
+      h('div', { className: 'modal-header' },
+        h('span', { className: 'modal-icon' }, icon('check', 24)),
+        h('h3', { className: 'modal-title' }, `${channel?.display_name || channel?.id || '渠道'}的模型测试`),
+        h('span', { className: 'text-muted' }, `共 ${allModels.length} 个模型`)
+      ),
+      h('div', { className: 'modal-body' },
+        h('div', { className: 'flex gap-sm items-center mb-md' },
+          h('input', {
+            id: 'ch-model-test-search',
+            className: 'input-field',
+            style: { flex: '1' },
+            placeholder: '搜索模型...',
+            onInput: (e) => { query = (e.target.value || '').toLowerCase(); renderRows(); }
+          }),
+          h('button', {
+            className: 'btn btn-ghost btn-sm',
+            onClick: async () => {
+              const text = Array.from(selected).join('\n');
+              if (!text) {
+                showToast('请先选择模型', 'warning');
+                return;
+              }
+              try {
+                await navigator.clipboard.writeText(text);
+                showToast('已复制已选模型', 'success');
+              } catch (_) {
+                showToast('复制失败，请手动复制', 'warning');
+              }
+            }
+          }, '复制已选')
+        ),
+        h('div', { id: 'ch-model-test-table-wrap' }),
+        h('div', { className: 'text-muted mt-sm', id: 'ch-model-test-count' })
+      ),
+      h('div', { className: 'modal-footer' },
+        h('button', { className: 'btn btn-ghost', onClick: () => modal.remove() }, '取消'),
+        h('button', {
+          className: 'btn btn-primary',
+          onClick: async () => {
+            const models = Array.from(selected);
+            if (models.length === 0) {
+              showToast('请至少选择一个模型', 'warning');
+              return;
+            }
+            try {
+              await onBatchTest(models, resultMap, renderRows);
+            } catch (e) {
+              showToast(e.message || '批量测试失败', 'error');
+            }
+          }
+        }, `批量测试${selected.size || ''}个模型`)
+      )
+    )
+  );
+
+  function renderRows() {
+    const wrap = modal.querySelector('#ch-model-test-table-wrap');
+    const countEl = modal.querySelector('#ch-model-test-count');
+    if (!wrap) return;
+    wrap.innerHTML = '';
+
+    const filtered = allModels.filter(m => !query || m.toLowerCase().includes(query));
+    if (countEl) {
+      countEl.textContent = `显示第 1 条-第 ${filtered.length} 条，共 ${filtered.length} 条`;
+    }
+
+    const table = h('table', { className: 'key-table' },
+      h('thead', {},
+        h('tr', {},
+          h('th', {}, h('input', {
+            type: 'checkbox',
+            checked: filtered.length > 0 && filtered.every(m => selected.has(m)),
+            onChange: (e) => {
+              if (e.target.checked) filtered.forEach(m => selected.add(m));
+              else filtered.forEach(m => selected.delete(m));
+              renderRows();
+            }
+          })),
+          h('th', {}, '模型名称'),
+          h('th', {}, '状态'),
+          h('th', {}, '操作')
+        )
+      ),
+      h('tbody', {},
+        ...filtered.map((m) => {
+          const r = resultMap[m] || null;
+          const statusText = !r
+            ? '-'
+            : (r.status === 'success'
+              ? `成功 请求时长: ${r.latency_seconds}s`
+              : `失败 ${r.error || ''}`);
+          return h('tr', {},
+            h('td', {}, h('input', {
+              type: 'checkbox',
+              checked: selected.has(m),
+              onChange: (e) => {
+                if (e.target.checked) selected.add(m);
+                else selected.delete(m);
+              }
+            })),
+            h('td', { className: 'text-mono' }, m),
+            h('td', {}, statusText),
+            h('td', {}, h('button', {
+              className: 'btn btn-ghost btn-sm',
+              onClick: async () => {
+                const resp = await api.testChannel(channel.id, { models: [m] });
+                const one = (resp.results || [])[0];
+                if (one) resultMap[m] = one;
+                renderRows();
+              }
+            }, '测试'))
+          );
+        })
+      )
+    );
+
+    wrap.appendChild(table);
+    const batchBtn = modal.querySelector('.modal-footer .btn-primary');
+    if (batchBtn) batchBtn.textContent = `批量测试${selected.size || 0}个模型`;
+  }
+
+  renderRows();
+  return modal;
+}
+
 export async function renderChannels(container) {
   clearChildren(container);
   container.appendChild(h('div', { className: 'page-loading' }, '加载中...'));
@@ -602,10 +735,27 @@ export async function renderChannels(container) {
             h('button', {
               className: 'btn btn-ghost btn-sm',
               onClick: async () => {
-                const result = await api.testChannel(ch.id);
-                showToast(result.message || '测试完成', result.ok ? 'success' : 'warning');
+                const modal = createChannelModelTestModal({
+                  channel: ch,
+                  onBatchTest: async (models, resultMap, rerender) => {
+                    const result = await api.testChannel(ch.id, { models });
+                    (result.results || []).forEach((item) => {
+                      if (item?.model) resultMap[item.model] = item;
+                    });
+                    rerender();
+                    if (result?.summary) {
+                      showToast(
+                        `测试完成：成功 ${result.summary.success} / ${result.summary.total}`,
+                        result.ok ? 'success' : 'warning'
+                      );
+                    } else {
+                      showToast(result.message || '测试完成', result.ok ? 'success' : 'warning');
+                    }
+                  }
+                });
+                document.body.appendChild(modal);
               }
-            }, '测试渠道')
+            }, '模型测试')
           ),
 
           (ch.api_keys || []).length > 0
