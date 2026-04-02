@@ -64,6 +64,65 @@ function normalizeModelList(items) {
   return result;
 }
 
+function mapRuntimeStatus(rawStatus, enabled) {
+  const status = (rawStatus || (enabled ? 'active' : 'disabled')).toLowerCase();
+  if (status === 'active') {
+    return { label: '运行: 可用', badgeClass: 'badge-success' };
+  }
+  if (status === 'cooldown') {
+    return { label: '运行: 冷却', badgeClass: 'badge-warning' };
+  }
+  if (status === 'exhausted') {
+    return { label: '运行: 耗尽', badgeClass: 'badge-error' };
+  }
+  return { label: '运行: 禁用', badgeClass: 'badge-outline' };
+}
+
+function mapSchedulerState(rawState) {
+  const state = (rawState || '').toLowerCase();
+  if (state === 'hot') {
+    return { label: '调度: 热池', badgeClass: 'badge-success' };
+  }
+  if (state === 'warm') {
+    return { label: '调度: 预热', badgeClass: 'badge-info' };
+  }
+  if (state === 'cooling') {
+    return { label: '调度: 冷却', badgeClass: 'badge-warning' };
+  }
+  if (state === 'suspect_expired') {
+    return { label: '调度: 疑似失效', badgeClass: 'badge-error' };
+  }
+  if (state === 'disabled') {
+    return { label: '调度: 禁用', badgeClass: 'badge-outline' };
+  }
+  return { label: '调度: 未知', badgeClass: 'badge-outline' };
+}
+
+function mapHealthScore(score) {
+  if (typeof score !== 'number' || Number.isNaN(score)) {
+    return { label: '健康: 未知', badgeClass: 'badge-outline', scoreText: '-' };
+  }
+  const v = Math.max(0, Math.min(1, score));
+  const scoreText = v.toFixed(3);
+  if (v >= 0.9) {
+    return { label: `健康: 优秀 (${scoreText})`, badgeClass: 'badge-success', scoreText };
+  }
+  if (v >= 0.75) {
+    return { label: `健康: 良好 (${scoreText})`, badgeClass: 'badge-primary', scoreText };
+  }
+  if (v >= 0.55) {
+    return { label: `健康: 可用 (${scoreText})`, badgeClass: 'badge-warning', scoreText };
+  }
+  return { label: `健康: 风险 (${scoreText})`, badgeClass: 'badge-error', scoreText };
+}
+
+function toLocaleTime(tsSeconds) {
+  if (!tsSeconds) return '';
+  const ms = Number(tsSeconds) * 1000;
+  if (!Number.isFinite(ms) || ms <= 0) return '';
+  return new Date(ms).toLocaleString('zh-CN');
+}
+
 function extractProvidedModels(initial) {
   const explicit = normalizeModelList(initial?.provided_models || []);
   if (explicit.length > 0) return explicit;
@@ -610,6 +669,9 @@ function createChannelModelTestModal({ channel, onBatchTest }) {
         h('span', { className: 'text-muted' }, `共 ${allModels.length} 个模型`)
       ),
       h('div', { className: 'modal-body' },
+        h('div', { className: 'text-muted mb-md' },
+          '提示：模型测试是连通性抽检（短请求）。只要有可用 key 能成功，不代表高并发或长时间稳定性。'
+        ),
         h('div', { className: 'flex gap-sm items-center mb-md' },
           h('input', {
             id: 'ch-model-test-search',
@@ -919,6 +981,9 @@ export async function renderChannels(container) {
 
           (ch.api_keys || []).length > 0
             ? h('div', { className: 'mt-sm mb-md' },
+              h('div', { className: 'text-muted text-body-sm mb-xs' },
+                '说明：运行状态反映当前可用性；调度状态反映是否在热池；健康分是成功率/时延综合分，不是额度。'
+              ),
               ...ch.api_keys.map((k) => {
                 const rt = k.runtime_status || (k.enabled ? 'active' : 'disabled');
                 const autoDisabled = !!k.auto_disabled;
@@ -926,18 +991,31 @@ export async function renderChannels(container) {
                 const at = k.auto_disabled_at
                   ? new Date(k.auto_disabled_at * 1000).toLocaleString('zh-CN')
                   : '';
-                const schedulerState = k.scheduler_state || '-';
-                const healthScore = typeof k.health_score === 'number' ? k.health_score.toFixed(3) : '-';
-                const nextProbeAt = k.next_probe_at
-                  ? new Date(k.next_probe_at * 1000).toLocaleString('zh-CN')
-                  : '';
+                const runtimeMeta = mapRuntimeStatus(rt, k.enabled);
+                const schedulerMeta = mapSchedulerState(k.scheduler_state);
+                const healthMeta = mapHealthScore(k.health_score);
+                const nextProbeAt = toLocaleTime(k.next_probe_at);
+                const nextEligibleAt = toLocaleTime(k.next_eligible_at);
 
-                return h('div', { className: 'text-muted text-body-sm mb-xs' },
+                return h('div', {
+                  className: 'text-muted text-body-sm mb-xs',
+                  style: {
+                    display: 'flex',
+                    flexWrap: 'wrap',
+                    alignItems: 'center',
+                    gap: '6px',
+                  }
+                },
                   h('span', { className: 'text-mono' }, k.id || '-'),
-                  ' · 运行时状态: ',
-                  h('strong', {}, rt),
-                  ` · scheduler: ${schedulerState} · health: ${healthScore}`,
-                  nextProbeAt ? ` · next_probe: ${nextProbeAt}` : '',
+                  h('span', { className: `badge badge-sm ${runtimeMeta.badgeClass}` }, runtimeMeta.label),
+                  h('span', { className: `badge badge-sm ${schedulerMeta.badgeClass}` }, schedulerMeta.label),
+                  h('span', { className: `badge badge-sm ${healthMeta.badgeClass}` }, healthMeta.label),
+                  nextEligibleAt
+                    ? h('span', { className: 'text-muted' }, `预计恢复可试: ${nextEligibleAt}`)
+                    : null,
+                  nextProbeAt
+                    ? h('span', { className: 'text-muted' }, `下次探活: ${nextProbeAt}`)
+                    : null,
                   autoDisabled
                     ? h('span', { style: 'color: var(--error); margin-left: 8px;' },
                       `自动禁用（${reason || 'long_unavailable'}）${at ? ` @ ${at}` : ''}`
