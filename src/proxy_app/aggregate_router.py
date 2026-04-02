@@ -83,7 +83,9 @@ def _extract_error_info(result: Any) -> Tuple[str, str, Optional[int]]:
     return ("unknown", str(result), None)
 
 
-def _looks_provider_specific_invalid_request(message: str) -> bool:
+def _looks_provider_specific_invalid_request(
+    message: str, status_code: Optional[int] = None
+) -> bool:
     """
     Decide whether an invalid_request is likely provider-specific.
 
@@ -91,9 +93,16 @@ def _looks_provider_specific_invalid_request(message: str) -> bool:
     - model not found / not available on this provider
     - provider-specific unsupported request fields
     """
-    msg = (message or "").strip().lower()
+    msg_raw = (message or "").strip()
+    msg = msg_raw.lower()
     if not msg:
-        return False
+        # Some providers return empty body with a status code that still indicates
+        # "route/target mismatch" semantics.
+        return status_code in {404, 405, 409, 422}
+
+    # Status codes that are very often provider/model/parameter mismatch errors.
+    if status_code in {404, 405, 409, 422}:
+        return True
 
     patterns = [
         "model not found",
@@ -107,16 +116,46 @@ def _looks_provider_specific_invalid_request(message: str) -> bool:
         "unrecognized request argument",
         "unknown field",
         "invalid model",
+        "not supported by this model",
+        "is not supported for this model",
+        "unsupported field",
+        "extra inputs are not permitted",
+        "unknown argument",
+        "unknown parameter",
+        "does not support",
+        "not available on this provider",
     ]
-    return any(p in msg for p in patterns)
-
-
-def _should_fallback(error_type: str, message: str = "") -> bool:
-    """Decide whether to try the next target for this error type."""
-    if error_type == "invalid_request" and _looks_provider_specific_invalid_request(
-        message
-    ):
+    if any(p in msg for p in patterns):
         return True
+
+    # Chinese provider-side request incompatibility patterns.
+    zh_provider_specific_patterns = [
+        "模型不存在",
+        "模型未找到",
+        "模型不可用",
+        "无效模型",
+        "不支持的模型",
+        "参数不支持",
+        "不支持参数",
+        "未知参数",
+        "未识别参数",
+        "字段不存在",
+        "不支持该参数",
+    ]
+    if any(p in msg_raw for p in zh_provider_specific_patterns):
+        return True
+
+    return False
+
+
+def _should_fallback(
+    error_type: str,
+    message: str = "",
+    status_code: Optional[int] = None,
+) -> bool:
+    """Decide whether to try the next target for this error type."""
+    if error_type == "invalid_request":
+        return _looks_provider_specific_invalid_request(message, status_code)
     return error_type not in NON_FALLBACK_ERROR_TYPES
 
 
@@ -403,7 +442,7 @@ async def execute_virtual_completion(
                             status_code=status_code,
                         )
                     )
-                    if not _should_fallback(error_type, message):
+                    if not _should_fallback(error_type, message, status_code):
                         return (result, target_model, len(failures) - 1)
                     continue
 
@@ -424,7 +463,9 @@ async def execute_virtual_completion(
                         status_code=getattr(e, "status_code", None),
                     )
                 )
-                if not _should_fallback(error_type, message):
+                if not _should_fallback(
+                    error_type, message, getattr(e, "status_code", None)
+                ):
                     raise
                 continue
 
@@ -479,7 +520,7 @@ async def execute_virtual_completion(
                 )
                 failures.append(failure)
 
-                if not _should_fallback(error_type, message):
+                if not _should_fallback(error_type, message, status_code):
                     logger.error(
                         f"[VirtualModel] Non-fallbackable error '{error_type}' "
                         f"from {target_model}. Stopping."
@@ -515,7 +556,9 @@ async def execute_virtual_completion(
             )
             failures.append(failure)
 
-            if not _should_fallback(error_type, message):
+            if not _should_fallback(
+                error_type, message, getattr(e, "status_code", None)
+            ):
                 logger.error(
                     f"[VirtualModel] Non-fallbackable exception from "
                     f"{target_model}. Propagating."
@@ -740,7 +783,9 @@ async def execute_virtual_completion_streaming(
                             status_code=getattr(e, "status_code", None),
                         )
                     )
-                    if not _should_fallback(exc_error_type, str(e)):
+                    if not _should_fallback(
+                        exc_error_type, str(e), getattr(e, "status_code", None)
+                    ):
                         raise
                     continue
 
@@ -907,7 +952,9 @@ async def execute_virtual_completion_streaming(
                     )
                 )
 
-                if not _should_fallback(exc_error_type, message):
+                if not _should_fallback(
+                    exc_error_type, message, getattr(e, "status_code", None)
+                ):
                     raise
 
                 continue

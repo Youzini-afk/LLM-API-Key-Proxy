@@ -311,6 +311,32 @@ class TestAggregateErrorClassification:
             "unsupported parameter: reasoning_effort",
         )
 
+    def test_invalid_request_chinese_model_not_found_fallback(self):
+        assert _should_fallback(
+            "invalid_request",
+            "模型不存在: kimi-k2.5",
+        )
+
+    def test_invalid_request_chinese_unknown_parameter_fallback(self):
+        assert _should_fallback(
+            "invalid_request",
+            "未知参数: foo_bar",
+        )
+
+    def test_invalid_request_status_404_fallback_even_without_message(self):
+        assert _should_fallback(
+            "invalid_request",
+            "",
+            404,
+        )
+
+    def test_invalid_request_status_400_without_provider_hint_no_fallback(self):
+        assert not _should_fallback(
+            "invalid_request",
+            "messages must be a non-empty array",
+            400,
+        )
+
     def test_context_window_no_fallback(self):
         assert not _should_fallback("context_window_exceeded")
 
