@@ -295,6 +295,7 @@ from proxy_app.aggregate_router import (
     _classify_exception_type,
     _should_fallback,
     execute_virtual_completion,
+    execute_virtual_completion_streaming,
 )
 
 
@@ -436,6 +437,50 @@ class TestAggregateRouterTimeouts:
 
         assert result == {"id": "fast"}
         assert actual_target == "fast/model"
+        assert fallback_count == 1
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_empty_response_falls_back(self, monkeypatch):
+        class FakeClient:
+            global_timeout = 5
+
+            async def acompletion(self, request=None, **kwargs):
+                if kwargs["model"] == "empty/model":
+                    return {
+                        "id": "empty",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": ""},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                return {"id": "ok"}
+
+        config = VirtualModelConfig(
+            strategy="sequential",
+            timeout_seconds=1,
+            targets=[
+                RouteTarget(model="empty/model"),
+                RouteTarget(model="second/model"),
+            ],
+        )
+
+        monkeypatch.setattr(
+            "proxy_app.aggregate_router.get_virtual_model",
+            lambda _: config,
+        )
+
+        result, actual_target, fallback_count = await execute_virtual_completion(
+            FakeClient(),
+            request=None,
+            request_data={"model": "virtual/test"},
+            virtual_model_name="virtual/test",
+        )
+
+        assert result == {"id": "ok"}
+        assert actual_target == "second/model"
         assert fallback_count == 1
 
     @pytest.mark.asyncio
@@ -700,3 +745,50 @@ class TestAggregateRouterTimeouts:
         assert actual_target == ""
         assert fallback_count == 0
         assert releases == [("cred-a", "prov_a/model")]
+
+    @pytest.mark.asyncio
+    async def test_streaming_role_only_then_done_falls_back(self, monkeypatch):
+        class FakeClient:
+            global_timeout = 5
+
+            def acompletion(self, request=None, **kwargs):
+                if kwargs["model"] == "empty/model":
+                    async def _empty_stream():
+                        yield 'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'
+                        yield "data: [DONE]\n\n"
+
+                    return _empty_stream()
+
+                async def _ok_stream():
+                    yield 'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+                    yield "data: [DONE]\n\n"
+
+                return _ok_stream()
+
+        config = VirtualModelConfig(
+            strategy="sequential",
+            timeout_seconds=1,
+            targets=[
+                RouteTarget(model="empty/model"),
+                RouteTarget(model="ok/model"),
+            ],
+        )
+
+        monkeypatch.setattr(
+            "proxy_app.aggregate_router.get_virtual_model",
+            lambda _: config,
+        )
+
+        stream, actual_target, fallback_count = await execute_virtual_completion_streaming(
+            FakeClient(),
+            request=None,
+            request_data={"model": "virtual/test", "stream": True},
+            virtual_model_name="virtual/test",
+        )
+
+        chunks = []
+        async for chunk in stream:
+            chunks.append(chunk)
+
+        assert any("hello" in chunk for chunk in chunks)
+        assert not any("virtual_model_exhausted" in chunk for chunk in chunks)

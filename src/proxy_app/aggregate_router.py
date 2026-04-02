@@ -83,6 +83,116 @@ def _extract_error_info(result: Any) -> Tuple[str, str, Optional[int]]:
     return ("unknown", str(result), None)
 
 
+def _has_nonempty_content(content: Any) -> bool:
+    """Best-effort check for meaningful text/media content fields."""
+    if content is None:
+        return False
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, str) and item.strip():
+                return True
+            if isinstance(item, dict):
+                for key in ("text", "value", "content"):
+                    val = item.get(key)
+                    if isinstance(val, str) and val.strip():
+                        return True
+        return False
+    return bool(content)
+
+
+def _to_plain_dict(payload: Any) -> Optional[Dict[str, Any]]:
+    """Convert response-like objects to dict when possible."""
+    if isinstance(payload, dict):
+        return payload
+    for method_name in ("model_dump", "dict"):
+        method = getattr(payload, method_name, None)
+        if callable(method):
+            try:
+                data = method()
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                continue
+    return None
+
+
+def _response_has_meaningful_completion(result: Any) -> bool:
+    """Check non-streaming completion result for meaningful assistant output."""
+    data = _to_plain_dict(result)
+    if not data:
+        return True
+
+    # Non-chat payloads used in lightweight tests may not include choices.
+    # In that case, keep prior behavior and treat as meaningful.
+    if "choices" not in data:
+        return True
+
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if isinstance(message, dict):
+            if _has_nonempty_content(message.get("content")):
+                return True
+            if message.get("tool_calls") or message.get("function_call"):
+                return True
+
+        delta = choice.get("delta")
+        if isinstance(delta, dict):
+            if _has_nonempty_content(delta.get("content")):
+                return True
+            if delta.get("tool_calls") or delta.get("function_call"):
+                return True
+            if _has_nonempty_content(delta.get("reasoning")) or _has_nonempty_content(
+                delta.get("reasoning_content")
+            ):
+                return True
+
+        if choice.get("finish_reason") == "tool_calls":
+            return True
+
+    return False
+
+
+def _stream_chunk_has_meaningful_output(parsed: Dict[str, Any]) -> bool:
+    """Check a streaming JSON chunk for meaningful output."""
+    choices = parsed.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta")
+        if isinstance(delta, dict):
+            if _has_nonempty_content(delta.get("content")):
+                return True
+            if delta.get("tool_calls") or delta.get("function_call"):
+                return True
+            if _has_nonempty_content(delta.get("reasoning")) or _has_nonempty_content(
+                delta.get("reasoning_content")
+            ):
+                return True
+
+        message = choice.get("message")
+        if isinstance(message, dict):
+            if _has_nonempty_content(message.get("content")):
+                return True
+            if message.get("tool_calls") or message.get("function_call"):
+                return True
+
+        if choice.get("finish_reason") == "tool_calls":
+            return True
+
+    return False
+
+
 def _looks_provider_specific_invalid_request(
     message: str, status_code: Optional[int] = None
 ) -> bool:
@@ -446,6 +556,16 @@ async def execute_virtual_completion(
                         return (result, target_model, len(failures) - 1)
                     continue
 
+                if not _response_has_meaningful_completion(result):
+                    failures.append(
+                        TargetFailure(
+                            target=target_model,
+                            reason="Empty completion response",
+                            error_type="server_error",
+                        )
+                    )
+                    continue
+
                 logger.info(
                     f"[VirtualModel] Global pool candidate {target_model} succeeded "
                     f"(fallback_count={len(failures)})"
@@ -468,6 +588,20 @@ async def execute_virtual_completion(
                 ):
                     raise
                 continue
+
+        if not failures:
+            failures.append(
+                TargetFailure(
+                    target=virtual_model_name,
+                    reason=(
+                        f"Virtual model request exhausted its shared "
+                        f"{overall_timeout_seconds:.2f}s budget before any target started"
+                    ),
+                    error_type="timeout",
+                )
+            )
+        error_response = _build_aggregate_error(virtual_model_name, failures)
+        return (error_response, "", len(failures) - 1)
 
     for idx, target in enumerate(targets):
         target_model = target.model
@@ -529,6 +663,16 @@ async def execute_virtual_completion(
                     return (result, target_model, idx)
 
                 continue  # Try next target
+
+            if not _response_has_meaningful_completion(result):
+                failures.append(
+                    TargetFailure(
+                        target=target_model,
+                        reason="Empty completion response",
+                        error_type="server_error",
+                    )
+                )
+                continue
 
             # Success!
             logger.info(
@@ -705,10 +849,11 @@ async def execute_virtual_completion_streaming(
                         target_model,
                     )
 
-                    buffer: List[str] = []
+                    pending_chunks: List[str] = []
                     found_error = False
                     error_type = "unknown"
                     error_message = ""
+                    has_meaningful_output = False
 
                     async for chunk in stream:
                         if chunk.strip().startswith("data:"):
@@ -716,46 +861,66 @@ async def execute_virtual_completion_streaming(
                             if data_content == "[DONE]":
                                 if found_error:
                                     break
-                                for buffered in buffer:
+                                if not has_meaningful_output:
+                                    failures.append(
+                                        TargetFailure(
+                                            target=target_model,
+                                            reason="Empty streaming response",
+                                            error_type="server_error",
+                                        )
+                                    )
+                                    break
+                                for buffered in pending_chunks:
                                     yield buffered
+                                pending_chunks.clear()
                                 yield chunk
                                 actual_target = target_model
                                 fallback_count = len(failures)
                                 return
                             try:
                                 parsed = json.loads(data_content)
-                                if "error" in parsed and not buffer:
+                                if "error" in parsed and not has_meaningful_output:
                                     found_error = True
                                     err = parsed.get("error", {})
                                     error_type = err.get("type", "unknown")
                                     error_message = err.get("message", str(err))
-                                    if not _should_fallback(error_type, error_message):
+                                    status_code = (
+                                        err.get("code")
+                                        if isinstance(err.get("code"), int)
+                                        else None
+                                    )
+                                    if not _should_fallback(
+                                        error_type, error_message, status_code
+                                    ):
                                         yield chunk
                                         actual_target = target_model
                                         fallback_count = len(failures)
                                         return
                                     continue
-                                for buffered in buffer:
-                                    yield buffered
-                                buffer.clear()
-                                yield chunk
-                                async for remaining in stream:
-                                    yield remaining
-                                actual_target = target_model
-                                fallback_count = len(failures)
-                                return
+                                pending_chunks.append(chunk)
+                                if _stream_chunk_has_meaningful_output(parsed):
+                                    has_meaningful_output = True
+                                    for buffered in pending_chunks:
+                                        yield buffered
+                                    pending_chunks.clear()
+                                    async for remaining in stream:
+                                        yield remaining
+                                    actual_target = target_model
+                                    fallback_count = len(failures)
+                                    return
                             except json.JSONDecodeError:
-                                for buffered in buffer:
+                                has_meaningful_output = True
+                                pending_chunks.append(chunk)
+                                for buffered in pending_chunks:
                                     yield buffered
-                                buffer.clear()
-                                yield chunk
+                                pending_chunks.clear()
                                 async for remaining in stream:
                                     yield remaining
                                 actual_target = target_model
                                 fallback_count = len(failures)
                                 return
                         else:
-                            buffer.append(chunk)
+                            pending_chunks.append(chunk)
 
                     if found_error:
                         failures.append(
@@ -767,11 +932,14 @@ async def execute_virtual_completion_streaming(
                         )
                         continue
 
-                    for buffered in buffer:
-                        yield buffered
-                    actual_target = target_model
-                    fallback_count = len(failures)
-                    return
+                    failures.append(
+                        TargetFailure(
+                            target=target_model,
+                            reason="Empty streaming response",
+                            error_type="server_error",
+                        )
+                    )
+                    continue
 
                 except Exception as e:
                     exc_error_type = _classify_exception_type(e)
@@ -839,10 +1007,11 @@ async def execute_virtual_completion_streaming(
                 )
 
                 # Buffer initial chunks to detect immediate errors
-                buffer: List[str] = []
+                pending_chunks: List[str] = []
                 found_error = False
                 error_type = "unknown"
                 error_message = ""
+                has_meaningful_output = False
 
                 async for chunk in stream:
                     # Check if this chunk is an error response
@@ -853,11 +1022,18 @@ async def execute_virtual_completion_streaming(
                                 # Error stream complete – try next target
                                 break
                             else:
-                                # Normal end of stream
-                                # First yield any buffered chunks
-                                for buffered in buffer:
+                                if not has_meaningful_output:
+                                    failures.append(
+                                        TargetFailure(
+                                            target=target_model,
+                                            reason="Empty streaming response",
+                                            error_type="server_error",
+                                        )
+                                    )
+                                    break
+                                for buffered in pending_chunks:
                                     yield buffered
-                                buffer.clear()
+                                pending_chunks.clear()
                                 yield chunk
                                 actual_target = target_model
                                 fallback_count = idx
@@ -865,14 +1041,21 @@ async def execute_virtual_completion_streaming(
                         else:
                             try:
                                 parsed = json.loads(data_content)
-                                if "error" in parsed and not buffer:
+                                if "error" in parsed and not has_meaningful_output:
                                     # First meaningful chunk is an error
                                     found_error = True
                                     err = parsed.get("error", {})
                                     error_type = err.get("type", "unknown")
                                     error_message = err.get("message", str(err))
+                                    status_code = (
+                                        err.get("code")
+                                        if isinstance(err.get("code"), int)
+                                        else None
+                                    )
 
-                                    if not _should_fallback(error_type, error_message):
+                                    if not _should_fallback(
+                                        error_type, error_message, status_code
+                                    ):
                                         # Non-fallbackable – forward to client
                                         logger.error(
                                             f"[VirtualModel] Streaming: non-fallbackable "
@@ -886,23 +1069,24 @@ async def execute_virtual_completion_streaming(
                                     # Record failure, will try next target
                                     continue
                                 else:
-                                    # Real content – flush buffer and continue
-                                    for buffered in buffer:
-                                        yield buffered
-                                    buffer.clear()
-                                    yield chunk
-                                    # From here on, stream directly
-                                    async for remaining in stream:
-                                        yield remaining
-                                    actual_target = target_model
-                                    fallback_count = idx
-                                    return
+                                    pending_chunks.append(chunk)
+                                    if _stream_chunk_has_meaningful_output(parsed):
+                                        has_meaningful_output = True
+                                        for buffered in pending_chunks:
+                                            yield buffered
+                                        pending_chunks.clear()
+                                        async for remaining in stream:
+                                            yield remaining
+                                        actual_target = target_model
+                                        fallback_count = idx
+                                        return
                             except json.JSONDecodeError:
                                 # Not valid JSON, treat as content
-                                for buffered in buffer:
+                                has_meaningful_output = True
+                                pending_chunks.append(chunk)
+                                for buffered in pending_chunks:
                                     yield buffered
-                                buffer.clear()
-                                yield chunk
+                                pending_chunks.clear()
                                 async for remaining in stream:
                                     yield remaining
                                 actual_target = target_model
@@ -910,7 +1094,7 @@ async def execute_virtual_completion_streaming(
                                 return
                     else:
                         # Non-data line (empty, comments) – buffer it
-                        buffer.append(chunk)
+                        pending_chunks.append(chunk)
 
                 # Stream ended – if we found an error, record and continue
                 if found_error:
@@ -927,12 +1111,14 @@ async def execute_virtual_completion_streaming(
                     )
                     continue
 
-                # Stream ended without data (edge case) – treat as success
-                for buffered in buffer:
-                    yield buffered
-                actual_target = target_model
-                fallback_count = idx
-                return
+                failures.append(
+                    TargetFailure(
+                        target=target_model,
+                        reason="Empty streaming response",
+                        error_type="server_error",
+                    )
+                )
+                continue
 
             except Exception as e:
                 exc_error_type = _classify_exception_type(e)
