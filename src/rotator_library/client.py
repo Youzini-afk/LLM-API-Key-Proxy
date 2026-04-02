@@ -1973,7 +1973,12 @@ class RotatingClient:
                             for m in litellm_kwargs["messages"]
                         ]
 
-                    litellm_kwargs = sanitize_request_payload(litellm_kwargs, model)
+                    runtime_provider = self.provider_config.get_runtime_provider(provider)
+                    litellm_kwargs = sanitize_request_payload(
+                        litellm_kwargs,
+                        model,
+                        runtime_provider=runtime_provider,
+                    )
 
                     for attempt in range(self.max_retries):
                         try:
@@ -2743,7 +2748,12 @@ class RotatingClient:
                             for m in litellm_kwargs["messages"]
                         ]
 
-                    litellm_kwargs = sanitize_request_payload(litellm_kwargs, model)
+                    runtime_provider = self.provider_config.get_runtime_provider(provider)
+                    litellm_kwargs = sanitize_request_payload(
+                        litellm_kwargs,
+                        model,
+                        runtime_provider=runtime_provider,
+                    )
 
                     # If the provider is 'qwen_code', set the custom provider to 'qwen'
                     # and strip the prefix from the model name for LiteLLM.

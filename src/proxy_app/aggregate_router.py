@@ -8,7 +8,9 @@
 import asyncio
 import json
 import logging
+import re
 import time
+from collections import Counter
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 from proxy_app.virtual_models import get_virtual_model, is_virtual_model
@@ -306,17 +308,87 @@ def _build_aggregate_error(
     virtual_model: str, failures: List[TargetFailure]
 ) -> dict:
     """Build a unified error response when all targets have failed."""
+    unsupported_parameters = _extract_unsupported_parameters(failures)
+    hint = _build_failure_hint(failures, unsupported_parameters)
+    message = f"All route targets failed for virtual model '{virtual_model}'"
+    if hint:
+        message = f"{message}. Hint: {hint}"
+
+    details: Dict[str, Any] = {
+        "virtual_model": virtual_model,
+        "targets_tried": len(failures),
+        "failures": [f.to_dict() for f in failures],
+    }
+    if failures:
+        details["sample_errors"] = [f.to_dict() for f in failures[:3]]
+    if unsupported_parameters:
+        details["unsupported_parameters"] = unsupported_parameters
+    if hint:
+        details["hint"] = hint
+
     return {
         "error": {
-            "message": f"All route targets failed for virtual model '{virtual_model}'",
+            "message": message,
             "type": "virtual_model_exhausted",
-            "details": {
-                "virtual_model": virtual_model,
-                "targets_tried": len(failures),
-                "failures": [f.to_dict() for f in failures],
-            },
+            "details": details,
         }
     }
+
+
+def _extract_unsupported_parameter(message: str) -> Optional[str]:
+    """Best-effort extract unsupported parameter name from provider error text."""
+    if not message:
+        return None
+
+    patterns = [
+        r"(?:unsupported|unknown|unrecognized|invalid)\s+(?:request\s+)?(?:argument|parameter|field)\s*[:：`'\"\s]+\s*([a-zA-Z0-9_.-]+)",
+        r"`([a-zA-Z0-9_.-]+)`\s+(?:is\s+)?not supported",
+        r"未知参数[:：\s]*([A-Za-z0-9_.-]+)",
+        r"未识别参数[:：\s]*([A-Za-z0-9_.-]+)",
+        r"不支持(?:的)?参数[:：\s]*([A-Za-z0-9_.-]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, message, re.IGNORECASE)
+        if match:
+            value = (match.group(1) or "").strip("`'\" ").lower()
+            if value:
+                return value
+    return None
+
+
+def _extract_unsupported_parameters(failures: List[TargetFailure]) -> List[str]:
+    params = {
+        value
+        for value in (
+            _extract_unsupported_parameter(f.reason)
+            for f in failures
+            if f.error_type == "invalid_request"
+        )
+        if value
+    }
+    return sorted(params)
+
+
+def _build_failure_hint(
+    failures: List[TargetFailure], unsupported_parameters: List[str]
+) -> str:
+    if unsupported_parameters:
+        params = ", ".join(unsupported_parameters[:3])
+        return (
+            f"Likely unsupported request parameter(s): {params}. "
+            "External relay payload may include fields not accepted by upstream."
+        )
+
+    error_counts = Counter(f.error_type for f in failures)
+    dominant_type, dominant_count = error_counts.most_common(1)[0] if error_counts else ("unknown", 0)
+    if dominant_count and dominant_count == len(failures):
+        if dominant_type == "invalid_request":
+            return "Likely request payload incompatibility across all route targets."
+        if dominant_type in {"rate_limit", "quota_exceeded"}:
+            return "All targets are currently rate-limited or quota-limited."
+        if dominant_type in {"authentication", "forbidden"}:
+            return "Credential authorization failed across all targets."
+    return ""
 
 
 def _add_virtual_model_headers(

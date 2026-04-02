@@ -292,6 +292,8 @@ class TestRouteStrategy:
 # 4. Aggregate router – error classification / timeout behavior
 # ---------------------------------------------------------------------------
 from proxy_app.aggregate_router import (
+    TargetFailure,
+    _build_aggregate_error,
     _classify_exception_type,
     _should_fallback,
     execute_virtual_completion,
@@ -323,6 +325,30 @@ class TestAggregateErrorClassification:
             "invalid_request",
             "未知参数: foo_bar",
         )
+
+    def test_aggregate_error_includes_unsupported_param_hint(self):
+        failures = [
+            TargetFailure(
+                target="prov_a/glm-4.5",
+                reason="unsupported parameter: reasoning_effort",
+                error_type="invalid_request",
+                status_code=400,
+            ),
+            TargetFailure(
+                target="prov_b/glm-4.5",
+                reason="未知参数: reasoning_effort",
+                error_type="invalid_request",
+                status_code=400,
+            ),
+        ]
+
+        result = _build_aggregate_error("glm-5.1", failures)
+        details = result["error"]["details"]
+
+        assert result["error"]["type"] == "virtual_model_exhausted"
+        assert "reasoning_effort" in result["error"]["message"]
+        assert details["unsupported_parameters"] == ["reasoning_effort"]
+        assert "hint" in details
 
     def test_invalid_request_status_404_fallback_even_without_message(self):
         assert _should_fallback(
