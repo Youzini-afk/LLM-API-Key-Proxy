@@ -104,6 +104,7 @@ class VirtualModelAdminConfig(BaseModel):
 
 class AdminPolicies(BaseModel):
     global_timeout: Optional[int] = Field(default=None, ge=1)
+    same_key_max_retries: int = Field(default=2, ge=1, le=10)
     virtual_scheduler_mode: VirtualSchedulerMode = "global_pool"
     key_busy_wait_interval_seconds: float = Field(default=0.2, ge=0.0)
     key_busy_wait_max_attempts: int = Field(default=5, ge=0)

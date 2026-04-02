@@ -577,6 +577,28 @@ def discover_max_concurrent_requests_per_key_from_env() -> Dict[str, int]:
     return max_concurrent_requests_per_key
 
 
+def discover_max_retries_from_env() -> int:
+    raw = os.getenv("MAX_RETRIES", "2")
+    try:
+        value = int(raw)
+    except ValueError:
+        logging.warning(
+            f"Invalid MAX_RETRIES value: {raw}. Falling back to default (2)."
+        )
+        return 2
+    if value < 1:
+        logging.warning(
+            f"Invalid MAX_RETRIES value: {raw}. Must be >= 1. Falling back to 1."
+        )
+        return 1
+    if value > 10:
+        logging.warning(
+            f"MAX_RETRIES value too large: {raw}. Clamping to 10 to avoid excessive latency."
+        )
+        return 10
+    return value
+
+
 def build_rotating_client_from_env(
     oauth_credentials: Optional[Dict[str, List[str]]] = None,
 ) -> RotatingClient:
@@ -588,6 +610,7 @@ def build_rotating_client_from_env(
         api_keys=discover_api_keys_from_env(),
         oauth_credentials=oauth_credentials,
         configure_logging=True,
+        max_retries=discover_max_retries_from_env(),
         global_timeout=global_timeout,
         litellm_provider_params=litellm_provider_params,
         ignore_models=discover_ignore_models_from_env(),
@@ -2278,6 +2301,7 @@ async def admin_test_channel(
         api_keys={channel.id: [k.value for k in enabled_keys]},
         oauth_credentials={},
         configure_logging=True,
+        max_retries=max(1, int(cfg.policies.same_key_max_retries)),
         global_timeout=30,
         ignore_models={channel.id: list(channel.settings.ignore_models or [])},
         whitelist_models={channel.id: list(channel.settings.whitelist_models or [])},

@@ -593,6 +593,7 @@ class AdminService:
 
         if cfg.policies.global_timeout is not None:
             env["GLOBAL_TIMEOUT"] = str(cfg.policies.global_timeout)
+        env["MAX_RETRIES"] = str(cfg.policies.same_key_max_retries)
         env["VIRTUAL_SCHEDULER_MODE"] = cfg.policies.virtual_scheduler_mode
         env["KEY_BUSY_WAIT_INTERVAL_SECONDS"] = str(
             cfg.policies.key_busy_wait_interval_seconds

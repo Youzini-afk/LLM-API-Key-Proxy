@@ -160,6 +160,7 @@ def test_admin_service_scheduler_policy_overlay(monkeypatch, tmp_path):
     service.update_policies(
         admin_service_mod.AdminPoliciesUpdateRequest(
             global_timeout=20,
+            same_key_max_retries=3,
             virtual_scheduler_mode="global_pool",
             key_busy_wait_interval_seconds=0.2,
             key_busy_wait_max_attempts=5,
@@ -170,6 +171,7 @@ def test_admin_service_scheduler_policy_overlay(monkeypatch, tmp_path):
 
     overlay = service.build_runtime_env_overlay()
     assert overlay["GLOBAL_TIMEOUT"] == "20"
+    assert overlay["MAX_RETRIES"] == "3"
     assert overlay["VIRTUAL_SCHEDULER_MODE"] == "global_pool"
     assert overlay["KEY_BUSY_WAIT_INTERVAL_SECONDS"] == "0.2"
     assert overlay["KEY_BUSY_WAIT_MAX_ATTEMPTS"] == "5"

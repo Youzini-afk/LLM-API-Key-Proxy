@@ -389,15 +389,58 @@ class RequestErrorAccumulator:
         if not self.normal_errors:
             return ""
 
-        # Count by type
-        counts = {}
-        for err in self.normal_errors:
-            err_type = err["error_type"]
-            counts[err_type] = counts.get(err_type, 0) + 1
-
         # Build summary like "3 rate_limit, 1 server_error"
+        counts = self.get_error_type_counts()
         parts = [f"{count} {err_type}" for err_type, count in counts.items()]
         return ", ".join(parts)
+
+    def get_error_type_counts(self) -> Dict[str, int]:
+        """Count errors by classified error type."""
+        counts: Dict[str, int] = {}
+        for err in self.abnormal_errors + self.normal_errors:
+            err_type = err["error_type"]
+            counts[err_type] = counts.get(err_type, 0) + 1
+        return counts
+
+    def get_error_samples(self, max_samples: int = 5) -> list:
+        """Return a small sample of concrete failures for client diagnostics."""
+        sampled = []
+        for err in self.abnormal_errors + self.normal_errors:
+            sampled.append(
+                {
+                    "credential": err["credential"],
+                    "error_type": err["error_type"],
+                    "status_code": err["status_code"],
+                    "message": err["message"],
+                }
+            )
+            if len(sampled) >= max_samples:
+                break
+        return sampled
+
+    def build_operator_hint(self) -> Optional[str]:
+        """Return a short operator-facing hint derived from error distribution."""
+        counts = self.get_error_type_counts()
+        if not counts:
+            return None
+
+        if counts.get("authentication") or counts.get("forbidden"):
+            return (
+                "Credential auth/access failures detected. Check channel keys and provider permissions."
+            )
+        if counts.get("quota_exceeded") or counts.get("rate_limit"):
+            return (
+                "Quota/rate-limit pressure detected. Add healthy credentials or reduce request burst."
+            )
+        if counts.get("api_connection") or counts.get("server_error"):
+            return (
+                "Upstream connectivity/server instability detected. Retry later or fail over provider."
+            )
+        if counts.get("invalid_request") or counts.get("context_window_exceeded"):
+            return (
+                "Request payload issue detected. Verify model name, params, and input token size."
+            )
+        return None
 
     def build_client_error_response(self) -> dict:
         """
@@ -436,9 +479,21 @@ class RequestErrorAccumulator:
                 )
             else:
                 message_parts.append(f"\n\nAll failures were: {normal_summary}")
-                message_parts.append(
-                    "\nThis is normal during high load - retry later or add more credentials."
-                )
+                sample_errors = self.get_error_samples(max_samples=3)
+                if sample_errors:
+                    message_parts.append("\nRecent concrete failures:")
+                    for err in sample_errors:
+                        status = (
+                            f"HTTP {err['status_code']}"
+                            if err["status_code"] is not None
+                            else err["error_type"]
+                        )
+                        message_parts.append(
+                            f"\n  • {err['credential']}: {status} - {err['message']}"
+                        )
+                hint = self.build_operator_hint()
+                if hint:
+                    message_parts.append(f"\nHint: {hint}")
 
         response = {
             "error": {
@@ -449,6 +504,8 @@ class RequestErrorAccumulator:
                     "provider": self.provider,
                     "credentials_tried": self.total_credentials_tried,
                     "timeout": self.timeout_occurred,
+                    "error_type_counts": self.get_error_type_counts(),
+                    "sample_errors": self.get_error_samples(),
                 },
             }
         }
@@ -460,6 +517,10 @@ class RequestErrorAccumulator:
         # Include summary of normal errors
         if normal_summary:
             response["error"]["details"]["normal_error_summary"] = normal_summary
+
+        hint = self.build_operator_hint()
+        if hint:
+            response["error"]["details"]["hint"] = hint
 
         return response
 

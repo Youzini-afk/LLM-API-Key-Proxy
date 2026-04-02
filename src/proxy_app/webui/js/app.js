@@ -183,6 +183,7 @@ class App {
 
       const safePolicies = {
         global_timeout: policies?.global_timeout ?? '',
+        same_key_max_retries: policies?.same_key_max_retries ?? 2,
         virtual_scheduler_mode: policies?.virtual_scheduler_mode ?? 'global_pool',
         key_busy_wait_interval_seconds: policies?.key_busy_wait_interval_seconds ?? 0.2,
         key_busy_wait_max_attempts: policies?.key_busy_wait_max_attempts ?? 5,
@@ -216,6 +217,9 @@ class App {
                 </label>
                 <label class="input-label">总超时 Global Timeout
                   <input id="policy-global-timeout" class="input-field" type="number" min="1" step="1" value="${safePolicies.global_timeout}">
+                </label>
+                <label class="input-label">同 Key 重试次数
+                  <input id="policy-same-key-max-retries" class="input-field" type="number" min="1" step="1" value="${safePolicies.same_key_max_retries}">
                 </label>
                 <label class="input-label">Busy Wait 间隔(秒)
                   <input id="policy-busy-wait-interval" class="input-field" type="number" min="0" step="0.1" value="${safePolicies.key_busy_wait_interval_seconds}">
@@ -252,6 +256,7 @@ class App {
         const globalTimeoutRaw = (container.querySelector('#policy-global-timeout')?.value || '').trim();
         return {
           global_timeout: globalTimeoutRaw ? Number.parseInt(globalTimeoutRaw, 10) : null,
+          same_key_max_retries: Number.parseInt(container.querySelector('#policy-same-key-max-retries')?.value || '2', 10),
           virtual_scheduler_mode: container.querySelector('#policy-virtual-scheduler-mode')?.value || 'global_pool',
           key_busy_wait_interval_seconds: Number.parseFloat(container.querySelector('#policy-busy-wait-interval')?.value || '0.2'),
           key_busy_wait_max_attempts: Number.parseInt(container.querySelector('#policy-busy-wait-attempts')?.value || '5', 10),

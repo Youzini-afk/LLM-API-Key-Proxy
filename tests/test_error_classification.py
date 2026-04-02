@@ -63,3 +63,40 @@ def test_bad_request_forbidden_message_is_classified_as_forbidden(monkeypatch):
 
     assert classified.error_type == "forbidden"
     assert error_handler.should_rotate_on_error(classified) is True
+
+
+def test_error_response_includes_counts_samples_and_hint(monkeypatch):
+    _install_litellm_stubs(monkeypatch)
+    error_handler = _load_error_handler()
+
+    accumulator = error_handler.RequestErrorAccumulator()
+    accumulator.model = "demo/model"
+    accumulator.provider = "demo"
+    accumulator.record_error(
+        "sk-live-1",
+        error_handler.ClassifiedError(
+            error_type="rate_limit",
+            original_exception=Exception("too many requests"),
+            status_code=429,
+        ),
+        "HTTP 429: too many requests",
+    )
+    accumulator.record_error(
+        "sk-live-2",
+        error_handler.ClassifiedError(
+            error_type="api_connection",
+            original_exception=Exception("connection reset by peer"),
+            status_code=503,
+        ),
+        "connection reset by peer",
+    )
+
+    payload = accumulator.build_client_error_response()
+    details = payload["error"]["details"]
+
+    assert details["error_type_counts"]["rate_limit"] == 1
+    assert details["error_type_counts"]["api_connection"] == 1
+    assert isinstance(details["sample_errors"], list)
+    assert len(details["sample_errors"]) >= 2
+    assert "hint" in details
+    assert "Recent concrete failures" in payload["error"]["message"]
