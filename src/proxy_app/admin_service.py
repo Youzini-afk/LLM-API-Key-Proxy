@@ -10,6 +10,8 @@ from urllib.parse import urlparse
 
 from proxy_app.admin_schemas import (
     AdminConfig,
+    AdminPolicies,
+    AdminPoliciesUpdateRequest,
     ChannelConfig,
     ChannelKeyConfig,
     ChannelCreateRequest,
@@ -244,6 +246,10 @@ class AdminService:
         data = masked_config_dict(self._cfg)
         data["_store_health"] = self._current_store_health()
         return data
+
+    def get_policies(self) -> Dict:
+        cfg = self.get_config()
+        return cfg.policies.model_dump()
 
     def list_channels(self) -> List[dict]:
         return self.get_config_masked().get("channels", [])
@@ -504,6 +510,16 @@ class AdminService:
         self._cfg = save_admin_config(cfg)
         return self.get_config_masked()
 
+    def update_policies(self, req: AdminPoliciesUpdateRequest) -> Dict:
+        self._ensure_store_writable()
+        cfg = self.get_config()
+        cfg.policies = AdminPolicies(**req.model_dump())
+        result = self.validate_config(cfg)
+        if not result.ok:
+            raise ValueError("; ".join(result.errors))
+        self._cfg = save_admin_config(cfg)
+        return self.get_config_masked()
+
     # -----------------------
     # Runtime derivation/reload
     # -----------------------
@@ -577,6 +593,17 @@ class AdminService:
 
         if cfg.policies.global_timeout is not None:
             env["GLOBAL_TIMEOUT"] = str(cfg.policies.global_timeout)
+        env["VIRTUAL_SCHEDULER_MODE"] = cfg.policies.virtual_scheduler_mode
+        env["KEY_BUSY_WAIT_INTERVAL_SECONDS"] = str(
+            cfg.policies.key_busy_wait_interval_seconds
+        )
+        env["KEY_BUSY_WAIT_MAX_ATTEMPTS"] = str(
+            cfg.policies.key_busy_wait_max_attempts
+        )
+        env["SCARCITY_PROBE_BUDGET_RATIO"] = str(
+            cfg.policies.scarcity_probe_budget_ratio
+        )
+        env["SCARCITY_PROBE_BURST"] = str(cfg.policies.scarcity_probe_burst)
 
         return env
 

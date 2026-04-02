@@ -390,3 +390,213 @@ class TestAggregateRouterTimeouts:
         assert actual_target == ""
         assert fallback_count == 1
         assert attempted_models == ["slow-err/model", "slow-success/model"]
+
+    @pytest.mark.asyncio
+    async def test_global_pool_can_pick_hot_candidate_from_later_provider(
+        self, monkeypatch
+    ):
+        selected_specs = []
+
+        class FakeUsageManager:
+            def __init__(self):
+                self.real_requests = 0
+
+            def note_real_request(self):
+                self.real_requests += 1
+
+            async def acquire_virtual_candidate(self, specs, *, deadline, strategy, top_n):
+                selected = next(spec for spec in specs if spec["provider"] == "prov_b")
+                selected_specs.append((strategy, top_n, selected["provider"], selected["model"]))
+                return {
+                    **selected,
+                    "target_model": selected["model"],
+                }
+
+        class FakeClient:
+            global_timeout = 5
+            virtual_scheduler_mode = "global_pool"
+            all_credentials = {
+                "prov_a": ["cred-a"],
+                "prov_b": ["cred-b"],
+            }
+            max_concurrent_requests_per_key = {"prov_a": 1, "prov_b": 1}
+            usage_manager = FakeUsageManager()
+
+            def _build_provider_credential_context(self, provider, model, credentials_override=None):
+                creds = credentials_override or self.all_credentials[provider]
+                return {
+                    "provider_plugin": None,
+                    "credentials": list(creds),
+                    "credential_priorities": None,
+                    "credential_tier_names": None,
+                }
+
+            async def acompletion(self, request=None, **kwargs):
+                if kwargs["model"] == "prov_b/model":
+                    return {"id": "from-b"}
+                return {"error": {"type": "rate_limit", "message": "bad candidate"}}
+
+        config = VirtualModelConfig(
+            strategy="balanced",
+            timeout_seconds=1,
+            targets=[
+                RouteTarget(model="prov_a/model", weight=100),
+                RouteTarget(model="prov_b/model", weight=100),
+            ],
+        )
+
+        monkeypatch.setattr(
+            "proxy_app.aggregate_router.get_virtual_model",
+            lambda _: config,
+        )
+
+        result, actual_target, fallback_count = await execute_virtual_completion(
+            FakeClient(),
+            request=None,
+            request_data={"model": "virtual/test"},
+            virtual_model_name="virtual/test",
+        )
+
+        assert result == {"id": "from-b"}
+        assert actual_target == "prov_b/model"
+        assert fallback_count == 0
+        assert selected_specs == [("balanced", 5, "prov_b", "prov_b/model")]
+        assert FakeClient.usage_manager.real_requests == 1
+
+    @pytest.mark.asyncio
+    async def test_global_pool_resolves_route_model_before_selection_and_request(
+        self, monkeypatch
+    ):
+        selected_request_models = []
+        attempted_request_models = []
+
+        class FakeUsageManager:
+            async def acquire_virtual_candidate(self, specs, *, deadline, strategy, top_n):
+                selected_request_models.extend(spec["model"] for spec in specs)
+                selected = specs[0]
+                return {
+                    **selected,
+                    "request_model": selected["model"],
+                    "target_model": selected["route_model"],
+                }
+
+            def note_real_request(self):
+                pass
+
+        class FakeClient:
+            global_timeout = 5
+            virtual_scheduler_mode = "global_pool"
+            all_credentials = {"prov_a": ["cred-a"]}
+            max_concurrent_requests_per_key = {"prov_a": 1}
+            usage_manager = FakeUsageManager()
+
+            def _resolve_model_id(self, model, provider):
+                assert model == "prov_a/alias"
+                assert provider == "prov_a"
+                return "prov_a/resolved"
+
+            def _build_provider_credential_context(self, provider, model, credentials_override=None):
+                assert model == "prov_a/resolved"
+                creds = credentials_override or self.all_credentials[provider]
+                return {
+                    "provider_plugin": None,
+                    "credentials": list(creds),
+                    "credential_priorities": None,
+                    "credential_tier_names": None,
+                }
+
+            async def acompletion(self, request=None, **kwargs):
+                attempted_request_models.append(kwargs["model"])
+                assert kwargs["_acquired_model"] == "prov_a/resolved"
+                assert kwargs["_count_as_real_request"] is False
+                return {"id": "resolved"}
+
+        config = VirtualModelConfig(
+            strategy="balanced",
+            timeout_seconds=1,
+            targets=[RouteTarget(model="prov_a/alias", weight=100)],
+        )
+
+        monkeypatch.setattr(
+            "proxy_app.aggregate_router.get_virtual_model",
+            lambda _: config,
+        )
+
+        result, actual_target, fallback_count = await execute_virtual_completion(
+            FakeClient(),
+            request=None,
+            request_data={"model": "virtual/test"},
+            virtual_model_name="virtual/test",
+        )
+
+        assert result == {"id": "resolved"}
+        assert actual_target == "prov_a/alias"
+        assert fallback_count == 0
+        assert selected_request_models == ["prov_a/resolved"]
+        assert attempted_request_models == ["prov_a/resolved"]
+
+    @pytest.mark.asyncio
+    async def test_global_pool_releases_candidate_if_budget_is_gone_before_request(
+        self, monkeypatch
+    ):
+        releases = []
+
+        class FakeUsageManager:
+            async def acquire_virtual_candidate(self, specs, *, deadline, strategy, top_n):
+                selected = specs[0]
+                return {
+                    **selected,
+                    "request_model": selected["model"],
+                    "target_model": selected["route_model"],
+                }
+
+            async def release_key(self, key, model):
+                releases.append((key, model))
+
+            def note_real_request(self):
+                pass
+
+        class FakeClient:
+            global_timeout = 5
+            virtual_scheduler_mode = "global_pool"
+            all_credentials = {"prov_a": ["cred-a"]}
+            max_concurrent_requests_per_key = {"prov_a": 1}
+            usage_manager = FakeUsageManager()
+
+            def _build_provider_credential_context(self, provider, model, credentials_override=None):
+                return {
+                    "provider_plugin": None,
+                    "credentials": ["cred-a"],
+                    "credential_priorities": None,
+                    "credential_tier_names": None,
+                }
+
+            async def acompletion(self, request=None, **kwargs):
+                raise AssertionError("request should not start when no budget remains")
+
+        config = VirtualModelConfig(
+            strategy="balanced",
+            timeout_seconds=1,
+            targets=[RouteTarget(model="prov_a/model", weight=100)],
+        )
+
+        monkeypatch.setattr(
+            "proxy_app.aggregate_router.get_virtual_model",
+            lambda _: config,
+        )
+        monkeypatch.setattr(
+            "proxy_app.aggregate_router._compute_target_timeout",
+            lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("no budget")),
+        )
+
+        result, actual_target, fallback_count = await execute_virtual_completion(
+            FakeClient(),
+            request=None,
+            request_data={"model": "virtual/test"},
+            virtual_model_name="virtual/test",
+        )
+
+        assert result["error"]["type"] == "virtual_model_exhausted"
+        assert actual_target == ""
+        assert fallback_count == 0
+        assert releases == [("cred-a", "prov_a/model")]

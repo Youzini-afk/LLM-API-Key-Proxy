@@ -153,6 +153,30 @@ def test_admin_service_runtime_overlay(monkeypatch, tmp_path):
     assert overlay["AUTO_DISABLE_UNAVAILABLE_HOURS_DASHSCOPE_A"] == "12"
 
 
+def test_admin_service_scheduler_policy_overlay(monkeypatch, tmp_path):
+    _, admin_service_mod = _reload_modules(monkeypatch, tmp_path)
+    service = admin_service_mod.AdminService()
+
+    service.update_policies(
+        admin_service_mod.AdminPoliciesUpdateRequest(
+            global_timeout=20,
+            virtual_scheduler_mode="global_pool",
+            key_busy_wait_interval_seconds=0.2,
+            key_busy_wait_max_attempts=5,
+            scarcity_probe_budget_ratio=0.01,
+            scarcity_probe_burst=3,
+        )
+    )
+
+    overlay = service.build_runtime_env_overlay()
+    assert overlay["GLOBAL_TIMEOUT"] == "20"
+    assert overlay["VIRTUAL_SCHEDULER_MODE"] == "global_pool"
+    assert overlay["KEY_BUSY_WAIT_INTERVAL_SECONDS"] == "0.2"
+    assert overlay["KEY_BUSY_WAIT_MAX_ATTEMPTS"] == "5"
+    assert overlay["SCARCITY_PROBE_BUDGET_RATIO"] == "0.01"
+    assert overlay["SCARCITY_PROBE_BURST"] == "3"
+
+
 def test_admin_service_update_channel_id_and_custom_provider(monkeypatch, tmp_path):
     _, admin_service_mod = _reload_modules(monkeypatch, tmp_path)
     service = admin_service_mod.AdminService()

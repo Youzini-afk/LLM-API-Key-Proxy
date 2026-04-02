@@ -153,6 +153,7 @@ with _console.status("[dim]Loading core dependencies...", spinner="dots"):
     from typing import AsyncGenerator, Any, Dict, List, Optional, Union
     from pydantic import BaseModel, ConfigDict, Field
     from proxy_app.admin_schemas import (
+        AdminPoliciesUpdateRequest,
         ChannelCreateRequest,
         ChannelUpdateRequest,
         KeyCreateRequest,
@@ -2054,6 +2055,22 @@ async def admin_get_config(_=Depends(verify_admin_api_key)):
     return admin_service.get_config_masked()
 
 
+@app.get("/admin/policies")
+async def admin_get_policies(_=Depends(verify_admin_api_key)):
+    return admin_service.get_policies()
+
+
+@app.put("/admin/policies")
+async def admin_update_policies(
+    body: AdminPoliciesUpdateRequest,
+    _=Depends(verify_admin_api_key),
+):
+    try:
+        return admin_service.update_policies(body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @app.post("/admin/config/validate")
 async def admin_validate_config(_=Depends(verify_admin_api_key)):
     cfg = admin_service.get_config()
@@ -2112,6 +2129,10 @@ async def admin_list_channels(_=Depends(verify_admin_api_key)):
                     "auto_disabled_reason": cred.get("auto_disabled_reason"),
                     "auto_disabled_at": cred.get("auto_disabled_at"),
                     "key_cooldown_until": cred.get("key_cooldown_until"),
+                    "scheduler_state": cred.get("scheduler_state"),
+                    "health_score": cred.get("health_score"),
+                    "next_eligible_at": cred.get("next_eligible_at"),
+                    "next_probe_at": cred.get("next_probe_at"),
                 }
 
             if provider_states:
@@ -2136,6 +2157,10 @@ async def admin_list_channels(_=Depends(verify_admin_api_key)):
                 merged_key["auto_disabled_reason"] = state.get("auto_disabled_reason")
                 merged_key["auto_disabled_at"] = state.get("auto_disabled_at")
                 merged_key["key_cooldown_until"] = state.get("key_cooldown_until")
+                merged_key["scheduler_state"] = state.get("scheduler_state")
+                merged_key["health_score"] = state.get("health_score")
+                merged_key["next_eligible_at"] = state.get("next_eligible_at")
+                merged_key["next_probe_at"] = state.get("next_probe_at")
             else:
                 merged_key["runtime_status"] = (
                     "disabled"

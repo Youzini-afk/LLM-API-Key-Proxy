@@ -9,6 +9,7 @@ import asyncio
 import random
 import hashlib
 import copy
+import math
 from datetime import date, datetime, timezone, time as dt_time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -35,6 +36,63 @@ lib_logger = logging.getLogger("rotator_library")
 lib_logger.propagate = False
 if not lib_logger.handlers:
     lib_logger.addHandler(logging.NullHandler())
+
+
+SCHEDULER_STATE_HOT = "hot"
+SCHEDULER_STATE_WARM = "warm"
+SCHEDULER_STATE_COOLING = "cooling"
+SCHEDULER_STATE_SUSPECT_EXPIRED = "suspect_expired"
+SCHEDULER_STATE_DISABLED = "disabled"
+SCHEDULER_STATE_VALUES = {
+    SCHEDULER_STATE_HOT,
+    SCHEDULER_STATE_WARM,
+    SCHEDULER_STATE_COOLING,
+    SCHEDULER_STATE_SUSPECT_EXPIRED,
+    SCHEDULER_STATE_DISABLED,
+}
+
+SCHEDULER_RECOVERY_LADDER_SECONDS = [
+    15,
+    120,
+    600,
+    1800,
+    3600,
+    10800,
+    18000,
+    43200,
+    86400,
+    259200,
+    604800,
+    1209600,
+    2592000,
+]
+
+SCHEDULER_WINDOW_PEAKS = {
+    "short": 5 * 3600,
+    "weekly": 7 * 24 * 3600,
+    "monthly": 30 * 24 * 3600,
+}
+SCHEDULER_AUTH_DISABLE_WINDOW_SECONDS = 7 * 24 * 3600
+SCHEDULER_AUTH_SUSPECT_RETRY_SECONDS = 24 * 3600
+SCHEDULER_BUSY_NEAR_CAP_RATIO = 0.75
+SCHEDULER_SUCCESS_EMA_ALPHA = 0.2
+SCHEDULER_LATENCY_EMA_ALPHA = 0.25
+SCHEDULER_TRACKING_FIELDS = (
+    "scheduler_state",
+    "health_score",
+    "success_ema",
+    "latency_ema_ms",
+    "last_success_at",
+    "last_failure_at",
+    "last_error_type",
+    "next_eligible_at",
+    "next_probe_at",
+    "probe_step",
+    "belief_short",
+    "belief_weekly",
+    "belief_monthly",
+    "expired_confidence",
+)
 
 
 class UsageManager:
@@ -186,14 +244,21 @@ class UsageManager:
         self._save_task: Optional[asyncio.Task] = None
         self._save_shutdown = False
         self.busy_wait_interval_seconds = self._get_env_float(
-            "KEY_BUSY_WAIT_INTERVAL_SECONDS", 1.0, minimum=0.1
+            "KEY_BUSY_WAIT_INTERVAL_SECONDS", 0.2, minimum=0.0
         )
         self.busy_wait_max_attempts = self._get_env_int(
-            "KEY_BUSY_WAIT_MAX_ATTEMPTS", 0, minimum=0
+            "KEY_BUSY_WAIT_MAX_ATTEMPTS", 5, minimum=0
+        )
+        self.scarcity_probe_budget_ratio = self._get_env_float(
+            "SCARCITY_PROBE_BUDGET_RATIO", 0.01, minimum=0.0
+        )
+        self.scarcity_probe_burst = self._get_env_int(
+            "SCARCITY_PROBE_BURST", 3, minimum=1
         )
         self.save_debounce_seconds = self._get_env_float(
             "USAGE_SAVE_DEBOUNCE_SECONDS", 0.5, minimum=0.0
         )
+        self._probe_tokens = float(self.scarcity_probe_burst)
 
         # Resilient writer for usage data persistence
         self._state_writer = ResilientStateWriter(file_path, lib_logger)
@@ -283,6 +348,381 @@ class UsageManager:
             lib_logger.info("Availability signal received. Re-evaluating...")
         except asyncio.TimeoutError:
             lib_logger.info("Availability wait timed out. Re-evaluating...")
+
+    def note_real_request(self, cost: float = 1.0) -> None:
+        """
+        Refill sparse probe budget as real traffic passes through the proxy.
+
+        Budget is intentionally light and process-local so restarts do not make
+        the scheduler more aggressive than configured.
+        """
+        if self.scarcity_probe_budget_ratio <= 0 or cost <= 0:
+            return
+        self._probe_tokens = min(
+            float(self.scarcity_probe_burst),
+            self._probe_tokens + (cost * float(self.scarcity_probe_budget_ratio)),
+        )
+
+    def _consume_probe_token(self) -> bool:
+        if self._probe_tokens < 1.0:
+            return False
+        self._probe_tokens -= 1.0
+        return True
+
+    def _default_scheduler_state(
+        self, scheduler_state: str = SCHEDULER_STATE_HOT
+    ) -> Dict[str, Any]:
+        now_ts = time.time()
+        return {
+            "scheduler_state": self._normalize_scheduler_state(scheduler_state),
+            "health_score": 1.0,
+            "success_ema": 0.75,
+            "latency_ema_ms": None,
+            "last_success_at": None,
+            "last_failure_at": None,
+            "last_error_type": None,
+            "next_eligible_at": 0.0,
+            "next_probe_at": 0.0,
+            "probe_step": 0,
+            "belief_short": 1.0,
+            "belief_weekly": 1.0,
+            "belief_monthly": 1.0,
+            "expired_confidence": 0.0,
+            "last_quota_failure_at": None,
+            "last_quota_failure_has_exact_reset": False,
+            "auth_failure_timestamps": [],
+            "last_updated_at": now_ts,
+        }
+
+    def _normalize_scheduler_state(self, value: Optional[str]) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized not in SCHEDULER_STATE_VALUES:
+            return SCHEDULER_STATE_HOT
+        return normalized
+
+    @staticmethod
+    def _is_internal_usage_key(key: Any) -> bool:
+        return isinstance(key, str) and key.startswith("__")
+
+    def _iter_usage_data_entries(
+        self, source: Optional[Dict[str, Any]] = None
+    ) -> Any:
+        data = self._usage_data if source is None else source
+        if not isinstance(data, dict):
+            return
+        for key, key_data in data.items():
+            if self._is_internal_usage_key(key) or not isinstance(key_data, dict):
+                continue
+            yield key, key_data
+
+    def _ensure_scheduler_bundle_for_key_data(
+        self, key_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        bundle = key_data.setdefault("scheduler", {})
+        global_state = bundle.get("credential_global")
+        if not isinstance(global_state, dict):
+            global_state = self._default_scheduler_state()
+            bundle["credential_global"] = global_state
+        else:
+            self._ensure_scheduler_fields(global_state)
+
+        tracking_states = bundle.get("tracking")
+        if not isinstance(tracking_states, dict):
+            tracking_states = {}
+            bundle["tracking"] = tracking_states
+
+        return bundle
+
+    def _ensure_scheduler_fields(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        defaults = self._default_scheduler_state(
+            state.get("scheduler_state", SCHEDULER_STATE_HOT)
+        )
+        for field, value in defaults.items():
+            if field not in state:
+                state[field] = copy.deepcopy(value)
+
+        state["scheduler_state"] = self._normalize_scheduler_state(
+            state.get("scheduler_state")
+        )
+        if state.get("probe_step") is None:
+            state["probe_step"] = 0
+        state["probe_step"] = max(
+            0,
+            min(
+                int(state.get("probe_step") or 0),
+                len(SCHEDULER_RECOVERY_LADDER_SECONDS),
+            ),
+        )
+        if not isinstance(state.get("auth_failure_timestamps"), list):
+            state["auth_failure_timestamps"] = []
+        self._normalize_recovery_hypothesis(state)
+        self._refresh_scheduler_health(state)
+        return state
+
+    def _ensure_tracking_scheduler_state(
+        self, key_data: Dict[str, Any], tracking_key: str
+    ) -> Dict[str, Any]:
+        bundle = self._ensure_scheduler_bundle_for_key_data(key_data)
+        tracking_states = bundle["tracking"]
+        state = tracking_states.get(tracking_key)
+        if not isinstance(state, dict):
+            state = self._default_scheduler_state()
+            tracking_states[tracking_key] = state
+        else:
+            self._ensure_scheduler_fields(state)
+        return state
+
+    def _get_scheduler_tracking_key(self, credential: str, model: str) -> str:
+        normalized_model = self._normalize_model(credential, model)
+        group = self._get_model_quota_group(credential, normalized_model)
+        return group if group else normalized_model
+
+    def _normalize_recovery_hypothesis(self, state: Dict[str, Any]) -> Dict[str, float]:
+        short = max(0.0001, float(state.get("belief_short") or 0.0))
+        weekly = max(0.0001, float(state.get("belief_weekly") or 0.0))
+        monthly = max(0.0001, float(state.get("belief_monthly") or 0.0))
+        expired = max(0.0001, float(state.get("expired_confidence") or 0.0))
+        total = short + weekly + monthly + expired
+        normalized = {
+            "short": short / total,
+            "weekly": weekly / total,
+            "monthly": monthly / total,
+            "expired": expired / total,
+        }
+        state["belief_short"] = short
+        state["belief_weekly"] = weekly
+        state["belief_monthly"] = monthly
+        state["expired_confidence"] = min(1.0, max(0.0, expired))
+        return normalized
+
+    def _latency_component(self, latency_ema_ms: Optional[float]) -> float:
+        if latency_ema_ms is None:
+            return 1.0
+        latency_ms = max(0.0, float(latency_ema_ms))
+        return 1.0 / (1.0 + (latency_ms / 4000.0))
+
+    def _refresh_scheduler_health(self, state: Dict[str, Any]) -> float:
+        success_ema = min(1.0, max(0.0, float(state.get("success_ema") or 0.0)))
+        expired_confidence = min(
+            1.0, max(0.0, float(state.get("expired_confidence") or 0.0))
+        )
+        latency_score = self._latency_component(state.get("latency_ema_ms"))
+        probe_penalty = min(
+            0.30, float(state.get("probe_step") or 0) * 0.03
+        )
+        state_penalty = {
+            SCHEDULER_STATE_HOT: 0.0,
+            SCHEDULER_STATE_WARM: 0.08,
+            SCHEDULER_STATE_COOLING: 0.15,
+            SCHEDULER_STATE_SUSPECT_EXPIRED: 0.35,
+            SCHEDULER_STATE_DISABLED: 0.70,
+        }.get(self._normalize_scheduler_state(state.get("scheduler_state")), 0.0)
+        score = (0.45 * success_ema) + (0.35 * latency_score) + 0.20
+        score -= (expired_confidence * 0.45) + probe_penalty + state_penalty
+        score = max(0.0, min(1.0, score))
+        state["success_ema"] = success_ema
+        state["health_score"] = score
+        state["last_updated_at"] = time.time()
+        return score
+
+    def _update_success_ema(self, state: Dict[str, Any], success: bool) -> None:
+        current = float(state.get("success_ema") or 0.0)
+        target = 1.0 if success else 0.0
+        alpha = SCHEDULER_SUCCESS_EMA_ALPHA
+        state["success_ema"] = current + ((target - current) * alpha)
+
+    def _update_latency_ema(
+        self, state: Dict[str, Any], latency_ms: Optional[float]
+    ) -> None:
+        if latency_ms is None:
+            return
+        latency_ms = max(1.0, float(latency_ms))
+        current = state.get("latency_ema_ms")
+        if current is None:
+            state["latency_ema_ms"] = latency_ms
+            return
+        alpha = SCHEDULER_LATENCY_EMA_ALPHA
+        state["latency_ema_ms"] = float(current) + (
+            (latency_ms - float(current)) * alpha
+        )
+
+    def _reinforce_recovery_hypothesis(
+        self, state: Dict[str, Any], observed_seconds: float, weight: float = 0.3
+    ) -> None:
+        observed = max(1.0, float(observed_seconds))
+
+        def _similarity(peak_seconds: float) -> float:
+            return 1.0 / (1.0 + abs(math.log(observed / peak_seconds)))
+
+        state["belief_short"] = float(state.get("belief_short") or 0.0) + (
+            _similarity(SCHEDULER_WINDOW_PEAKS["short"]) * weight
+        )
+        state["belief_weekly"] = float(state.get("belief_weekly") or 0.0) + (
+            _similarity(SCHEDULER_WINDOW_PEAKS["weekly"]) * weight
+        )
+        state["belief_monthly"] = float(state.get("belief_monthly") or 0.0) + (
+            _similarity(SCHEDULER_WINDOW_PEAKS["monthly"]) * weight
+        )
+        self._normalize_recovery_hypothesis(state)
+
+    def _record_scheduler_auth_failure(
+        self, state: Dict[str, Any], now_ts: float
+    ) -> None:
+        timestamps = [
+            float(ts)
+            for ts in (state.get("auth_failure_timestamps") or [])
+            if isinstance(ts, (int, float))
+            and float(ts) >= now_ts - SCHEDULER_AUTH_DISABLE_WINDOW_SECONDS
+        ]
+        timestamps.append(now_ts)
+        state["auth_failure_timestamps"] = timestamps[-8:]
+        if len(timestamps) >= 3:
+            state["scheduler_state"] = SCHEDULER_STATE_DISABLED
+            state["next_eligible_at"] = now_ts + SCHEDULER_RECOVERY_LADDER_SECONDS[-1]
+            state["next_probe_at"] = state["next_eligible_at"]
+
+    def _get_next_probe_seconds(
+        self, previous_step: int, *, advance: bool
+    ) -> Tuple[int, int]:
+        if previous_step <= 0:
+            next_step = 1
+        elif advance:
+            next_step = min(
+                previous_step + 1, len(SCHEDULER_RECOVERY_LADDER_SECONDS)
+            )
+        else:
+            next_step = min(previous_step, len(SCHEDULER_RECOVERY_LADDER_SECONDS))
+        return (
+            SCHEDULER_RECOVERY_LADDER_SECONDS[next_step - 1],
+            next_step,
+        )
+
+    def _set_scheduler_backoff(
+        self,
+        state: Dict[str, Any],
+        *,
+        now_ts: float,
+        seconds: float,
+        scheduler_state: str,
+        probe_step: Optional[int] = None,
+    ) -> None:
+        cooldown_seconds = max(0.0, float(seconds))
+        state["scheduler_state"] = self._normalize_scheduler_state(scheduler_state)
+        state["next_eligible_at"] = now_ts + cooldown_seconds
+        state["next_probe_at"] = now_ts + cooldown_seconds
+        if probe_step is not None:
+            state["probe_step"] = probe_step
+        self._refresh_scheduler_health(state)
+
+    def _scheduler_state_from_error_type(
+        self, error_type: Optional[str]
+    ) -> str:
+        if error_type in {"authentication", "credential_reauth_needed", "forbidden"}:
+            return SCHEDULER_STATE_SUSPECT_EXPIRED
+        if error_type in {"quota_exceeded", "rate_limit"}:
+            return SCHEDULER_STATE_WARM
+        if error_type in {"server_error", "api_connection", "unknown"}:
+            return SCHEDULER_STATE_COOLING
+        return SCHEDULER_STATE_HOT
+
+    def _scheduler_state_due(self, state: Dict[str, Any], now_ts: float) -> bool:
+        return (float(state.get("next_probe_at") or 0.0) or 0.0) <= now_ts
+
+    def _scheduler_effective_state(
+        self,
+        *,
+        global_state: Dict[str, Any],
+        tracking_state: Dict[str, Any],
+        key_cooldown_until: float,
+        model_cooldown_until: float,
+        now_ts: float,
+    ) -> str:
+        global_status = self._normalize_scheduler_state(
+            global_state.get("scheduler_state")
+        )
+        tracking_status = self._normalize_scheduler_state(
+            tracking_state.get("scheduler_state")
+        )
+
+        if global_status == SCHEDULER_STATE_DISABLED or tracking_status == SCHEDULER_STATE_DISABLED:
+            return SCHEDULER_STATE_DISABLED
+        if (
+            max(key_cooldown_until, model_cooldown_until) > now_ts
+            or float(global_state.get("next_eligible_at") or 0.0) > now_ts
+            or float(tracking_state.get("next_eligible_at") or 0.0) > now_ts
+        ):
+            return SCHEDULER_STATE_COOLING
+        if (
+            global_status == SCHEDULER_STATE_SUSPECT_EXPIRED
+            or tracking_status == SCHEDULER_STATE_SUSPECT_EXPIRED
+        ):
+            return SCHEDULER_STATE_SUSPECT_EXPIRED
+        if global_status == SCHEDULER_STATE_WARM or tracking_status == SCHEDULER_STATE_WARM:
+            return SCHEDULER_STATE_WARM
+        return SCHEDULER_STATE_HOT
+
+    def _scheduler_recovery_snapshot(self, state: Dict[str, Any]) -> Dict[str, float]:
+        normalized = self._normalize_recovery_hypothesis(state)
+        return {key: round(value, 4) for key, value in normalized.items()}
+
+    def _prune_scheduler_state(self, state: Dict[str, Any], now_ts: float) -> None:
+        self._ensure_scheduler_fields(state)
+        state["auth_failure_timestamps"] = [
+            float(ts)
+            for ts in (state.get("auth_failure_timestamps") or [])
+            if isinstance(ts, (int, float))
+            and float(ts) >= now_ts - SCHEDULER_AUTH_DISABLE_WINDOW_SECONDS
+        ]
+
+        if (
+            state.get("scheduler_state") == SCHEDULER_STATE_COOLING
+            and float(state.get("next_eligible_at") or 0.0) <= now_ts
+        ):
+            last_error_type = state.get("last_error_type")
+            state["scheduler_state"] = (
+                SCHEDULER_STATE_WARM
+                if last_error_type in {"quota_exceeded", "rate_limit"}
+                else SCHEDULER_STATE_HOT
+            )
+
+        if (
+            state.get("scheduler_state") == SCHEDULER_STATE_SUSPECT_EXPIRED
+            and float(state.get("next_probe_at") or 0.0) <= now_ts
+            and state.get("expired_confidence", 0.0) < 0.85
+        ):
+            state["scheduler_state"] = SCHEDULER_STATE_WARM
+
+        self._refresh_scheduler_health(state)
+
+    def _pick_public_scheduler_state(
+        self, key_data: Dict[str, Any], now_ts: float
+    ) -> Dict[str, Any]:
+        bundle = self._ensure_scheduler_bundle_for_key_data(key_data)
+        global_state = bundle["credential_global"]
+        self._prune_scheduler_state(global_state, now_ts)
+
+        tracking_states = list(bundle["tracking"].values())
+        if not tracking_states:
+            return global_state
+
+        def _public_sort_key(state: Dict[str, Any]) -> Tuple[int, float]:
+            self._prune_scheduler_state(state, now_ts)
+            priority = {
+                SCHEDULER_STATE_HOT: 0,
+                SCHEDULER_STATE_WARM: 1,
+                SCHEDULER_STATE_COOLING: 2,
+                SCHEDULER_STATE_SUSPECT_EXPIRED: 3,
+                SCHEDULER_STATE_DISABLED: 4,
+            }.get(self._normalize_scheduler_state(state.get("scheduler_state")), 4)
+            return (priority, -(float(state.get("health_score") or 0.0)))
+
+        best_tracking = sorted(tracking_states, key=_public_sort_key)[0]
+        if self._normalize_scheduler_state(global_state.get("scheduler_state")) in {
+            SCHEDULER_STATE_DISABLED,
+            SCHEDULER_STATE_SUSPECT_EXPIRED,
+        }:
+            return global_state
+        return best_tracking
 
     def _get_rotation_mode(self, provider: str) -> str:
         """
@@ -1746,6 +2186,10 @@ class UsageManager:
                 )
                 self._usage_data = {}
 
+            if self._usage_data:
+                for _, key_data in self._iter_usage_data_entries(self._usage_data):
+                    self._ensure_scheduler_bundle_for_key_data(key_data)
+
             # Restore fair cycle state from persisted data
             fair_cycle_data = self._usage_data.get("__fair_cycle__", {})
             if fair_cycle_data:
@@ -1787,6 +2231,11 @@ class UsageManager:
                 snapshot["__fair_cycle__"] = self._serialize_cycle_state()
             elif "__fair_cycle__" in snapshot:
                 del snapshot["__fair_cycle__"]
+
+            for key, key_data in snapshot.items():
+                if key.startswith("__") or not isinstance(key_data, dict):
+                    continue
+                self._ensure_scheduler_bundle_for_key_data(key_data)
 
         self._add_readable_timestamps(snapshot)
         return snapshot
@@ -1834,6 +2283,46 @@ class UsageManager:
                 await self._save_task
             finally:
                 self._save_task = None
+
+    async def run_maintenance(self) -> None:
+        """
+        Local-only scheduler maintenance.
+
+        This intentionally performs no paid upstream probes. It only ages
+        scheduler state, clears expired cooldowns, and refreshes derived scores.
+        """
+        await self._lazy_init()
+        now_ts = time.time()
+        modified = False
+
+        async with self._data_lock:
+            if not self._usage_data:
+                return
+
+            for _, key_data in self._iter_usage_data_entries(self._usage_data):
+                bundle = self._ensure_scheduler_bundle_for_key_data(key_data)
+                self._prune_scheduler_state(bundle["credential_global"], now_ts)
+                for tracking_state in bundle.get("tracking", {}).values():
+                    self._prune_scheduler_state(tracking_state, now_ts)
+
+                key_cooldown_until = float(key_data.get("key_cooldown_until") or 0.0)
+                if key_cooldown_until and key_cooldown_until <= now_ts:
+                    key_data["key_cooldown_until"] = None
+                    modified = True
+
+                model_cooldowns = key_data.get("model_cooldowns", {}) or {}
+                active_model_cooldowns = {
+                    model_name: float(cooldown_until)
+                    for model_name, cooldown_until in model_cooldowns.items()
+                    if isinstance(cooldown_until, (int, float))
+                    and float(cooldown_until) > now_ts
+                }
+                if active_model_cooldowns != model_cooldowns:
+                    key_data["model_cooldowns"] = active_model_cooldowns
+                    modified = True
+
+        if modified:
+            await self._save_usage()
 
     async def _get_usage_data_snapshot(self) -> Dict[str, Any]:
         """
@@ -1993,6 +2482,12 @@ class UsageManager:
             for key in credentials:
                 key_data = self._usage_data.get(key, {})
                 normalized_model = self._normalize_model(key, model)
+                bundle = self._ensure_scheduler_bundle_for_key_data(key_data)
+                tracking_key = self._get_scheduler_tracking_key(key, model)
+                tracking_state = self._ensure_tracking_scheduler_state(
+                    key_data, tracking_key
+                )
+                global_state = bundle["credential_global"]
 
                 # Check key-level cooldown
                 key_cooldown = key_data.get("key_cooldown_until") or 0
@@ -2007,6 +2502,16 @@ class UsageManager:
                 if model_cooldown > now:
                     if soonest_end is None or model_cooldown < soonest_end:
                         soonest_end = model_cooldown
+
+                scheduler_eligible = max(
+                    float(global_state.get("next_eligible_at") or 0.0),
+                    float(tracking_state.get("next_eligible_at") or 0.0),
+                    float(global_state.get("next_probe_at") or 0.0),
+                    float(tracking_state.get("next_probe_at") or 0.0),
+                )
+                if scheduler_eligible > now:
+                    if soonest_end is None or scheduler_eligible < soonest_end:
+                        soonest_end = scheduler_eligible
 
         return soonest_end
 
@@ -2027,7 +2532,7 @@ class UsageManager:
         today_str = now_utc.date().isoformat()
         needs_saving = False
 
-        for key, data in self._usage_data.items():
+        for key, data in self._iter_usage_data_entries():
             reset_config = self._get_usage_reset_config(key)
 
             if reset_config:
@@ -2441,6 +2946,461 @@ class UsageManager:
                     "models_in_use": {},  # Dict[model_name, concurrent_count]
                 }
 
+    def _get_total_inflight(self, key: str) -> int:
+        state = self.key_states.get(key)
+        if not state:
+            return 0
+        return sum(int(v) for v in state.get("models_in_use", {}).values())
+
+    def _build_scheduler_candidate_records(
+        self,
+        available_keys: List[str],
+        model: str,
+        *,
+        hard_cap: int,
+        route_weight_factor: float = 1.0,
+    ) -> List[Dict[str, Any]]:
+        now_ts = time.time()
+        records: List[Dict[str, Any]] = []
+
+        for key in available_keys:
+            key_data = self._usage_data.get(key, {})
+            bundle = self._ensure_scheduler_bundle_for_key_data(key_data)
+            tracking_key = self._get_scheduler_tracking_key(key, model)
+            global_state = bundle["credential_global"]
+            tracking_state = self._ensure_tracking_scheduler_state(key_data, tracking_key)
+            self._prune_scheduler_state(global_state, now_ts)
+            self._prune_scheduler_state(tracking_state, now_ts)
+
+            normalized_model = self._normalize_model(key, model)
+            key_cooldown_until = float(key_data.get("key_cooldown_until") or 0.0)
+            model_cooldown_until = float(
+                (key_data.get("model_cooldowns", {}) or {}).get(normalized_model) or 0.0
+            )
+            scheduler_state = self._scheduler_effective_state(
+                global_state=global_state,
+                tracking_state=tracking_state,
+                key_cooldown_until=key_cooldown_until,
+                model_cooldown_until=model_cooldown_until,
+                now_ts=now_ts,
+            )
+            in_flight = self._get_total_inflight(key)
+            cap = max(1, int(hard_cap))
+            occupancy = in_flight / cap
+            busy = in_flight >= cap
+            due_for_probe = self._scheduler_state_due(tracking_state, now_ts)
+
+            if scheduler_state == SCHEDULER_STATE_HOT and not busy:
+                bucket = 1 if occupancy >= SCHEDULER_BUSY_NEAR_CAP_RATIO else 0
+            elif scheduler_state == SCHEDULER_STATE_WARM and due_for_probe and not busy:
+                bucket = 2
+            elif scheduler_state == SCHEDULER_STATE_WARM:
+                bucket = 3
+            elif scheduler_state == SCHEDULER_STATE_COOLING:
+                bucket = 4
+            elif scheduler_state == SCHEDULER_STATE_SUSPECT_EXPIRED:
+                bucket = 5
+            else:
+                bucket = 6
+
+            health_score = min(
+                float(global_state.get("health_score") or 0.0),
+                float(tracking_state.get("health_score") or 0.0),
+            )
+            record = {
+                "key": key,
+                "model": model,
+                "normalized_model": normalized_model,
+                "tracking_key": tracking_key,
+                "scheduler_state": scheduler_state,
+                "bucket": bucket,
+                "busy": busy,
+                "due_for_probe": due_for_probe,
+                "in_flight": in_flight,
+                "hard_cap": cap,
+                "occupancy": occupancy,
+                "success_ema": float(tracking_state.get("success_ema") or 0.0),
+                "latency_ema_ms": tracking_state.get("latency_ema_ms"),
+                "last_used_ts": float(key_data.get("last_used_ts") or 0.0),
+                "credential_id": key,
+                "health_score": health_score,
+                "route_weight_factor": max(0.0, float(route_weight_factor)),
+                "effective_score": max(0.0, float(route_weight_factor)) * health_score,
+                "next_eligible_at": max(
+                    key_cooldown_until,
+                    model_cooldown_until,
+                    float(global_state.get("next_eligible_at") or 0.0),
+                    float(tracking_state.get("next_eligible_at") or 0.0),
+                ),
+                "next_probe_at": max(
+                    float(global_state.get("next_probe_at") or 0.0),
+                    float(tracking_state.get("next_probe_at") or 0.0),
+                ),
+                "last_error_type": tracking_state.get("last_error_type")
+                or global_state.get("last_error_type"),
+                "expired_confidence": max(
+                    float(global_state.get("expired_confidence") or 0.0),
+                    float(tracking_state.get("expired_confidence") or 0.0),
+                ),
+                "recovery_hypothesis": self._scheduler_recovery_snapshot(tracking_state),
+                "global_state": global_state,
+                "tracking_state": tracking_state,
+            }
+            records.append(record)
+
+        return records
+
+    def _provider_candidate_sort_key(self, record: Dict[str, Any]) -> Tuple[Any, ...]:
+        latency = (
+            float(record["latency_ema_ms"])
+            if record.get("latency_ema_ms") is not None
+            else float("inf")
+        )
+        return (
+            int(record.get("bucket", 6)),
+            float(record.get("occupancy", 1.0)),
+            -float(record.get("success_ema", 0.0)),
+            latency,
+            float(record.get("last_used_ts", 0.0)),
+            str(record.get("credential_id") or ""),
+        )
+
+    def _virtual_candidate_sort_key(self, record: Dict[str, Any]) -> Tuple[Any, ...]:
+        latency = (
+            float(record["latency_ema_ms"])
+            if record.get("latency_ema_ms") is not None
+            else float("inf")
+        )
+        return (
+            int(record.get("bucket", 6)),
+            -float(record.get("effective_score", 0.0)),
+            float(record.get("occupancy", 1.0)),
+            -float(record.get("success_ema", 0.0)),
+            latency,
+            float(record.get("last_used_ts", 0.0)),
+            str(record.get("credential_id") or ""),
+        )
+
+    def _apply_scheduler_hard_cap(
+        self, record: Dict[str, Any], hard_cap: int
+    ) -> Dict[str, Any]:
+        cap = max(1, int(hard_cap))
+        in_flight = int(record.get("in_flight") or 0)
+        occupancy = in_flight / cap
+        busy = in_flight >= cap
+        scheduler_state = record.get("scheduler_state")
+        due_for_probe = bool(record.get("due_for_probe"))
+
+        if scheduler_state == SCHEDULER_STATE_HOT and not busy:
+            bucket = 1 if occupancy >= SCHEDULER_BUSY_NEAR_CAP_RATIO else 0
+        elif scheduler_state == SCHEDULER_STATE_WARM and due_for_probe and not busy:
+            bucket = 2
+        elif scheduler_state == SCHEDULER_STATE_WARM:
+            bucket = 3
+        elif scheduler_state == SCHEDULER_STATE_COOLING:
+            bucket = 4
+        elif scheduler_state == SCHEDULER_STATE_SUSPECT_EXPIRED:
+            bucket = 5
+        else:
+            bucket = 6
+
+        record["hard_cap"] = cap
+        record["occupancy"] = occupancy
+        record["busy"] = busy
+        record["bucket"] = bucket
+        return record
+
+    def _rank_provider_candidates(
+        self,
+        records: List[Dict[str, Any]],
+        *,
+        rotation_mode: str,
+        credential_priorities: Optional[Dict[str, int]],
+    ) -> List[Dict[str, Any]]:
+        if not records:
+            return []
+
+        if rotation_mode == "sequential":
+            ordered_pairs = self._sort_sequential(
+                [
+                    (record["key"], int(record.get("usage_count") or 0))
+                    for record in records
+                ],
+                credential_priorities,
+            )
+            order = {key: idx for idx, (key, _) in enumerate(ordered_pairs)}
+            return sorted(
+                records,
+                key=lambda record: (
+                    order.get(record["key"], len(order)),
+                    self._provider_candidate_sort_key(record),
+                ),
+            )
+
+        return sorted(records, key=self._provider_candidate_sort_key)
+
+    def _prepare_provider_candidate_records(
+        self,
+        records: List[Dict[str, Any]],
+        *,
+        model: str,
+        base_hard_cap: int,
+        credential_priorities: Optional[Dict[str, int]],
+        available_keys: List[str],
+        all_provider_credentials: Optional[List[str]],
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        provider = model.split("/")[0] if "/" in model else ""
+        rotation_mode = self._get_rotation_mode(provider)
+        capped_records: List[Dict[str, Any]] = []
+
+        for record in records:
+            priority = (
+                credential_priorities.get(record["key"], 999)
+                if credential_priorities
+                else 999
+            )
+            multiplier = max(
+                1, int(self._get_priority_multiplier(provider, priority, rotation_mode))
+            )
+            record["priority"] = priority
+            record["usage_count"] = self._get_grouped_usage_count(record["key"], model)
+            self._apply_scheduler_hard_cap(
+                record, max(1, int(base_hard_cap)) * multiplier
+            )
+            capped_records.append(record)
+
+        if not capped_records:
+            return ([], rotation_mode)
+
+        grouped_records: List[Dict[str, Any]] = []
+        sorted_priorities = sorted({int(record["priority"]) for record in capped_records})
+        available_scope = all_provider_credentials or available_keys
+        now_ts = time.time()
+
+        for priority in sorted_priorities:
+            priority_records = [
+                record for record in capped_records if int(record["priority"]) == priority
+            ]
+            if not priority_records:
+                continue
+
+            if provider and self._is_fair_cycle_enabled(provider, rotation_mode):
+                tier_key = self._get_tier_key(provider, priority)
+                tracking_key = self._get_tracking_key(
+                    priority_records[0]["key"], model, provider
+                )
+                all_tier_creds = self._get_all_credentials_for_tier_key(
+                    provider, tier_key, available_scope, credential_priorities
+                )
+                available_not_on_cooldown = [
+                    record["key"]
+                    for record in priority_records
+                    if float(record.get("next_eligible_at") or 0.0) <= now_ts
+                ]
+                if self._should_reset_cycle(
+                    provider,
+                    tier_key,
+                    tracking_key,
+                    all_tier_creds,
+                    available_not_on_cooldown=available_not_on_cooldown,
+                ):
+                    self._reset_cycle(provider, tier_key, tracking_key)
+
+                priority_records = [
+                    record
+                    for record in priority_records
+                    if not self._is_credential_exhausted_in_cycle(
+                        record["key"], provider, tier_key, tracking_key
+                    )
+                ]
+
+            grouped_records.extend(priority_records)
+
+        return (grouped_records, rotation_mode)
+
+    def _hot_pool_is_scarce(self, records: List[Dict[str, Any]]) -> bool:
+        hot_records = [r for r in records if r.get("scheduler_state") == SCHEDULER_STATE_HOT]
+        hot_free = [r for r in hot_records if not r.get("busy")]
+        if len(hot_free) < 2:
+            return True
+        return bool(hot_records) and not hot_free
+
+    def _claim_record_if_available(self, record: Dict[str, Any]) -> bool:
+        key = record["key"]
+        model = record["model"]
+        cap = max(1, int(record["hard_cap"]))
+        state = self.key_states[key]
+        current_total = sum(int(v) for v in state["models_in_use"].values())
+        if current_total >= cap:
+            return False
+        state["models_in_use"][model] = state["models_in_use"].get(model, 0) + 1
+        return True
+
+    async def has_other_hot_candidates(
+        self,
+        available_keys: List[str],
+        model: str,
+        *,
+        hard_cap: int,
+        exclude_key: Optional[str] = None,
+    ) -> bool:
+        await self._lazy_init()
+        self._initialize_key_states(available_keys)
+        provider = model.split("/")[0] if "/" in model else ""
+        credential_priorities = (
+            {key: self._get_credential_priority(key, provider) for key in available_keys}
+            if provider
+            else None
+        )
+        async with self._data_lock:
+            records = self._build_scheduler_candidate_records(
+                available_keys,
+                model,
+                hard_cap=hard_cap,
+            )
+            records, _ = self._prepare_provider_candidate_records(
+                records,
+                model=model,
+                base_hard_cap=hard_cap,
+                credential_priorities=credential_priorities,
+                available_keys=available_keys,
+                all_provider_credentials=available_keys,
+            )
+        for record in records:
+            if exclude_key and record["key"] == exclude_key:
+                continue
+            if record["bucket"] in (0, 1):
+                return True
+        return False
+
+    async def get_virtual_candidate_records(
+        self,
+        candidate_specs: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        await self._lazy_init()
+        self._initialize_key_states([spec["key"] for spec in candidate_specs])
+        async with self._data_lock:
+            records: List[Dict[str, Any]] = []
+            for spec in candidate_specs:
+                provider_records = self._build_scheduler_candidate_records(
+                    [spec["key"]],
+                    spec["model"],
+                    hard_cap=int(spec.get("hard_cap") or 1),
+                    route_weight_factor=float(spec.get("route_weight_factor") or 1.0),
+                )
+                if not provider_records:
+                    continue
+                record = provider_records[0]
+                record["provider"] = spec.get("provider")
+                record["request_model"] = spec.get("model")
+                record["target_model"] = spec.get("route_model", spec.get("model"))
+                record["target_weight"] = spec.get("route_weight_factor", 1.0)
+                records.append(record)
+            return records
+
+    async def acquire_virtual_candidate(
+        self,
+        candidate_specs: List[Dict[str, Any]],
+        *,
+        deadline: float,
+        strategy: str,
+        top_n: int = 5,
+    ) -> Dict[str, Any]:
+        await self._lazy_init()
+        self._initialize_key_states([spec["key"] for spec in candidate_specs])
+
+        wait_attempts = 0
+        last_wait_reason: Optional[str] = None
+
+        while time.time() < deadline:
+            async with self._data_lock:
+                records = []
+                for spec in candidate_specs:
+                    provider_records = self._build_scheduler_candidate_records(
+                        [spec["key"]],
+                        spec["model"],
+                        hard_cap=int(spec.get("hard_cap") or 1),
+                        route_weight_factor=float(
+                            spec.get("route_weight_factor") or 1.0
+                        ),
+                    )
+                    if not provider_records:
+                        continue
+                    record = provider_records[0]
+                    record["provider"] = spec.get("provider")
+                    record["request_model"] = spec.get("model")
+                    record["target_model"] = spec.get("route_model", spec.get("model"))
+                    record["target_weight"] = spec.get("route_weight_factor", 1.0)
+                    records.append(record)
+
+            if not records:
+                break
+
+            hot_candidates = [r for r in records if r["bucket"] in (0, 1)]
+            scarce = self._hot_pool_is_scarce(records)
+            selected: Optional[Dict[str, Any]] = None
+
+            if strategy == "weighted_random":
+                ranked = sorted(hot_candidates, key=self._virtual_candidate_sort_key)
+                sampling_pool = ranked[: max(1, min(int(top_n), len(ranked)))]
+                if sampling_pool:
+                    total_weight = sum(
+                        max(0.0001, float(r["effective_score"] or 0.0))
+                        for r in sampling_pool
+                    )
+                    roll = random.uniform(0.0, total_weight)
+                    cumulative = 0.0
+                    for record in sampling_pool:
+                        cumulative += max(
+                            0.0001, float(record.get("effective_score") or 0.0)
+                        )
+                        if cumulative >= roll:
+                            selected = record
+                            break
+            else:
+                ranked = sorted(hot_candidates, key=self._virtual_candidate_sort_key)
+                if ranked:
+                    selected = ranked[0]
+
+            if selected is None and scarce:
+                warm_due = sorted(
+                    [r for r in records if r["bucket"] == 2],
+                    key=self._virtual_candidate_sort_key,
+                )
+                if warm_due and self._consume_probe_token():
+                    selected = warm_due[0]
+
+            if selected is not None:
+                state = self.key_states[selected["key"]]
+                async with state["lock"]:
+                    if self._claim_record_if_available(selected):
+                        return selected
+
+            busy_hot = [r for r in records if r["scheduler_state"] == SCHEDULER_STATE_HOT]
+            wait_reason = (
+                "All virtual hot candidates stayed busy"
+                if busy_hot
+                else "All virtual candidates stayed unavailable"
+            )
+            remaining_budget = deadline - time.time()
+            wait_timeout, wait_attempts, exhaustion_reason = self._reserve_busy_wait_attempt(
+                wait_attempts,
+                remaining_budget,
+                reason=wait_reason,
+            )
+            if exhaustion_reason:
+                last_wait_reason = exhaustion_reason
+                break
+            if wait_timeout is None:
+                break
+            await self._wait_for_any_availability(wait_timeout)
+
+        if last_wait_reason:
+            raise NoAvailableKeysError(last_wait_reason)
+        raise NoAvailableKeysError(
+            "Could not acquire a virtual candidate within the global time budget."
+        )
+
     def _select_weighted_random(self, candidates: List[tuple], tolerance: float) -> str:
         """
         Selects a credential using weighted random selection based on usage counts.
@@ -2530,523 +3490,124 @@ class UsageManager:
         await self._lazy_init()
         await self._reset_daily_stats_if_needed()
         self._initialize_key_states(available_keys)
-
-        # Normalize model name for consistent cooldown lookup
-        # (cooldowns are stored under normalized names by record_failure)
-        # Use first credential for provider detection; all credentials passed here
-        # are for the same provider (filtered by client.py before calling acquire_key).
-        # For providers without normalize_model_for_tracking (non-Antigravity),
-        # this returns the model unchanged, so cooldown lookups work as before.
-        normalized_model = (
-            self._normalize_model(available_keys[0], model) if available_keys else model
-        )
-
-        # This loop continues as long as the global deadline has not been met.
         wait_attempts = 0
         wait_exhaustion_reason: Optional[str] = None
+        base_hard_cap = max(1, int(max_concurrent))
+
         while time.time() < deadline:
-            now = time.time()
+            async with self._data_lock:
+                records = self._build_scheduler_candidate_records(
+                    available_keys,
+                    model,
+                    hard_cap=base_hard_cap,
+                )
+                records, rotation_mode = self._prepare_provider_candidate_records(
+                    records,
+                    model=model,
+                    base_hard_cap=base_hard_cap,
+                    credential_priorities=credential_priorities,
+                    available_keys=available_keys,
+                    all_provider_credentials=all_provider_credentials,
+                )
 
-            # Group credentials by priority level (if priorities provided)
-            if credential_priorities:
-                # Group keys by priority level
-                priority_groups = {}
-                async with self._data_lock:
-                    for key in available_keys:
-                        key_data = self._usage_data.get(key, {})
+            if not records:
+                break
 
-                        # Skip keys on cooldown (use normalized model for lookup)
-                        if (key_data.get("key_cooldown_until") or 0) > now or (
-                            key_data.get("model_cooldowns", {}).get(normalized_model)
-                            or 0
-                        ) > now:
-                            continue
+            selected: Optional[Dict[str, Any]] = None
+            sorted_priorities = sorted({int(record["priority"]) for record in records})
 
-                        # Get priority for this key (default to 999 if not specified)
-                        priority = credential_priorities.get(key, 999)
-
-                        # Get usage count for load balancing within priority groups
-                        # Uses grouped usage if model is in a quota group
-                        usage_count = self._get_grouped_usage_count(key, model)
-
-                        # Group by priority
-                        if priority not in priority_groups:
-                            priority_groups[priority] = []
-                        priority_groups[priority].append((key, usage_count))
-
-                # Try priority groups in order (1, 2, 3, ...)
-                sorted_priorities = sorted(priority_groups.keys())
-
-                for priority_level in sorted_priorities:
-                    keys_in_priority = priority_groups[priority_level]
-
-                    # Determine selection method based on provider's rotation mode
-                    provider = model.split("/")[0] if "/" in model else ""
-                    rotation_mode = self._get_rotation_mode(provider)
-
-                    # Fair cycle filtering
-                    if provider and self._is_fair_cycle_enabled(
-                        provider, rotation_mode
-                    ):
-                        tier_key = self._get_tier_key(provider, priority_level)
-                        tracking_key = self._get_tracking_key(
-                            keys_in_priority[0][0] if keys_in_priority else "",
-                            model,
-                            provider,
-                        )
-
-                        # Get all credentials for this tier (for cycle completion check)
-                        all_tier_creds = self._get_all_credentials_for_tier_key(
-                            provider,
-                            tier_key,
-                            all_provider_credentials or available_keys,
-                            credential_priorities,
-                        )
-
-                        # Check if cycle should reset (all exhausted, expired, or none available)
-                        if self._should_reset_cycle(
-                            provider,
-                            tier_key,
-                            tracking_key,
-                            all_tier_creds,
-                            available_not_on_cooldown=[
-                                key for key, _ in keys_in_priority
-                            ],
-                        ):
-                            self._reset_cycle(provider, tier_key, tracking_key)
-
-                        # Filter out exhausted credentials
-                        filtered_keys = []
-                        for key, usage_count in keys_in_priority:
-                            if not self._is_credential_exhausted_in_cycle(
-                                key, provider, tier_key, tracking_key
-                            ):
-                                filtered_keys.append((key, usage_count))
-
-                        keys_in_priority = filtered_keys
-
-                    # Calculate effective concurrency based on priority tier
-                    multiplier = self._get_priority_multiplier(
-                        provider, priority_level, rotation_mode
-                    )
-                    effective_max_concurrent = max_concurrent * multiplier
-
-                    # Within each priority group, use existing tier1/tier2 logic
-                    tier1_keys, tier2_keys = [], []
-                    for key, usage_count in keys_in_priority:
-                        key_state = self.key_states[key]
-
-                        # Tier 1: Completely idle keys (preferred)
-                        if not key_state["models_in_use"]:
-                            tier1_keys.append((key, usage_count))
-                        # Tier 2: Keys that can accept more concurrent requests
-                        elif (
-                            key_state["models_in_use"].get(model, 0)
-                            < effective_max_concurrent
-                        ):
-                            tier2_keys.append((key, usage_count))
-
-                    if rotation_mode == "sequential":
-                        # Sequential mode: sort credentials by priority, usage, recency
-                        # Keep all candidates in sorted order (no filtering to single key)
-                        selection_method = "sequential"
-                        if tier1_keys:
-                            tier1_keys = self._sort_sequential(
-                                tier1_keys, credential_priorities
-                            )
-                        if tier2_keys:
-                            tier2_keys = self._sort_sequential(
-                                tier2_keys, credential_priorities
-                            )
-                    elif self.rotation_tolerance > 0:
-                        # Balanced mode with weighted randomness
-                        selection_method = "weighted-random"
-                        if tier1_keys:
-                            selected_key = self._select_weighted_random(
-                                tier1_keys, self.rotation_tolerance
-                            )
-                            tier1_keys = [
-                                (k, u) for k, u in tier1_keys if k == selected_key
-                            ]
-                        if tier2_keys:
-                            selected_key = self._select_weighted_random(
-                                tier2_keys, self.rotation_tolerance
-                            )
-                            tier2_keys = [
-                                (k, u) for k, u in tier2_keys if k == selected_key
-                            ]
-                    else:
-                        # Deterministic: sort by usage within each tier
-                        selection_method = "least-used"
-                        tier1_keys.sort(key=lambda x: x[1])
-                        tier2_keys.sort(key=lambda x: x[1])
-
-                    # Try to acquire from Tier 1 first
-                    for key, usage in tier1_keys:
-                        state = self.key_states[key]
-                        async with state["lock"]:
-                            if not state["models_in_use"]:
-                                state["models_in_use"][model] = 1
-                                tier_name = (
-                                    credential_tier_names.get(key, "unknown")
-                                    if credential_tier_names
-                                    else "unknown"
-                                )
-                                quota_display = self._get_quota_display(key, model)
-                                lib_logger.debug(
-                                    f"Acquired key {mask_credential(key)} for model {model} "
-                                    f"(tier: {tier_name}, priority: {priority_level}, selection: {selection_method}, {quota_display})"
-                                )
-                                return key
-
-                    # Then try Tier 2
-                    for key, usage in tier2_keys:
-                        state = self.key_states[key]
-                        async with state["lock"]:
-                            current_count = state["models_in_use"].get(model, 0)
-                            if current_count < effective_max_concurrent:
-                                state["models_in_use"][model] = current_count + 1
-                                tier_name = (
-                                    credential_tier_names.get(key, "unknown")
-                                    if credential_tier_names
-                                    else "unknown"
-                                )
-                                quota_display = self._get_quota_display(key, model)
-                                lib_logger.debug(
-                                    f"Acquired key {mask_credential(key)} for model {model} "
-                                    f"(tier: {tier_name}, priority: {priority_level}, selection: {selection_method}, concurrent: {state['models_in_use'][model]}/{effective_max_concurrent}, {quota_display})"
-                                )
-                                return key
-
-                # If we get here, all priority groups were exhausted but keys might become available
-                # Collect all keys across all priorities for waiting
-                all_potential_keys = []
-                for keys_list in priority_groups.values():
-                    all_potential_keys.extend(keys_list)
-
-                if not all_potential_keys:
-                    # All credentials are on cooldown - check if waiting makes sense
-                    soonest_end = await self.get_soonest_cooldown_end(
-                        available_keys, model
-                    )
-
-                    if soonest_end is None:
-                        # No cooldowns active but no keys available (shouldn't happen)
-                        lib_logger.warning(
-                            "No keys eligible and no cooldowns active. Re-evaluating..."
-                        )
-                        await asyncio.sleep(self.busy_wait_interval_seconds)
-                        continue
-
-                    remaining_budget = deadline - time.time()
-                    wait_needed = soonest_end - time.time()
-
-                    wait_timeout, wait_attempts, exhaustion_reason = (
-                        self._reserve_busy_wait_attempt(
-                            wait_attempts,
-                            remaining_budget,
-                            reason="All credentials stayed on cooldown",
-                        )
-                    )
-                    if exhaustion_reason:
-                        wait_exhaustion_reason = exhaustion_reason
-                        lib_logger.warning(
-                            f"{wait_exhaustion_reason} for model {model}. "
-                            f"Soonest credential reports availability in {max(0.0, wait_needed):.1f}s."
-                        )
-                        break
-
-                    if wait_timeout is None:
-                        break
-
-                    lib_logger.info(
-                        f"All credentials on cooldown. Soonest credential reports availability "
-                        f"in {max(0.0, wait_needed):.1f}s. Waiting {wait_timeout:.1f}s "
-                        f"before retrying (attempt {wait_attempts}"
-                        + (
-                            f"/{self.busy_wait_max_attempts}"
-                            if self.busy_wait_max_attempts > 0
-                            else ""
-                        )
-                        + ")."
-                    )
-                    await asyncio.sleep(wait_timeout)
+            for priority in sorted_priorities:
+                priority_records = [
+                    record for record in records if int(record["priority"]) == priority
+                ]
+                if not priority_records:
                     continue
 
-                # Wait for the highest priority key with lowest usage
-                remaining_budget = deadline - time.time()
-                wait_timeout, wait_attempts, exhaustion_reason = (
-                    self._reserve_busy_wait_attempt(
-                        wait_attempts,
-                        remaining_budget,
-                        reason="All eligible credentials stayed busy",
-                    )
+                hot_candidates = self._rank_provider_candidates(
+                    [record for record in priority_records if record["bucket"] in (0, 1)],
+                    rotation_mode=rotation_mode,
+                    credential_priorities=credential_priorities,
                 )
-                if exhaustion_reason:
-                    wait_exhaustion_reason = exhaustion_reason
-                    lib_logger.warning(
-                        f"{wait_exhaustion_reason} for model {model}."
-                    )
+                if hot_candidates:
+                    selected = hot_candidates[0]
                     break
-                if wait_timeout is None:
-                    break
-                best_priority = min(priority_groups.keys())
-                lib_logger.info(
-                    f"All Priority-{best_priority} keys are busy. Waiting up to {wait_timeout:.1f}s "
-                    f"before retrying (attempt {wait_attempts}"
-                    + (
-                        f"/{self.busy_wait_max_attempts}"
-                        if self.busy_wait_max_attempts > 0
-                        else ""
+
+                if self._hot_pool_is_scarce(priority_records):
+                    warm_due_candidates = self._rank_provider_candidates(
+                        [record for record in priority_records if record["bucket"] == 2],
+                        rotation_mode=rotation_mode,
+                        credential_priorities=credential_priorities,
                     )
-                    + ")."
-                )
-                await self._wait_for_any_availability(wait_timeout)
-                continue
-
-            else:
-                # Original logic when no priorities specified
-
-                # Determine selection method based on provider's rotation mode
-                provider = model.split("/")[0] if "/" in model else ""
-                rotation_mode = self._get_rotation_mode(provider)
-
-                # Calculate effective concurrency for default priority (999)
-                # When no priorities are specified, all credentials get default priority
-                default_priority = 999
-                multiplier = self._get_priority_multiplier(
-                    provider, default_priority, rotation_mode
-                )
-                effective_max_concurrent = max_concurrent * multiplier
-
-                eligible_keys = []
-
-                # First, filter the list of available keys to exclude any on cooldown.
-                async with self._data_lock:
-                    for key in available_keys:
-                        key_data = self._usage_data.get(key, {})
-
-                        # Skip keys on cooldown (use normalized model for lookup)
-                        if (key_data.get("key_cooldown_until") or 0) > now or (
-                            key_data.get("model_cooldowns", {}).get(normalized_model)
-                            or 0
-                        ) > now:
-                            continue
-
-                        # Prioritize keys based on their current usage to ensure load balancing.
-                        # Uses grouped usage if model is in a quota group
-                        usage_count = self._get_grouped_usage_count(key, model)
-                        eligible_keys.append((key, usage_count))
-
-                # Fair cycle filtering (non-priority case)
-                if provider and self._is_fair_cycle_enabled(provider, rotation_mode):
-                    tier_key = self._get_tier_key(provider, default_priority)
-                    tracking_key = self._get_tracking_key(
-                        available_keys[0] if available_keys else "",
-                        model,
-                        provider,
-                    )
-
-                    # Get all credentials for this tier (for cycle completion check)
-                    all_tier_creds = self._get_all_credentials_for_tier_key(
-                        provider,
-                        tier_key,
-                        all_provider_credentials or available_keys,
-                        None,
-                    )
-
-                    # Check if cycle should reset (all exhausted, expired, or none available)
-                    if self._should_reset_cycle(
-                        provider,
-                        tier_key,
-                        tracking_key,
-                        all_tier_creds,
-                        available_not_on_cooldown=[key for key, _ in eligible_keys],
-                    ):
-                        self._reset_cycle(provider, tier_key, tracking_key)
-
-                    # Filter out exhausted credentials before concurrency checks so
-                    # "all keys busy" is not mistaken for "no eligible keys".
-                    eligible_keys = [
-                        (key, usage)
-                        for key, usage in eligible_keys
-                        if not self._is_credential_exhausted_in_cycle(
-                            key, provider, tier_key, tracking_key
-                        )
-                    ]
-
-                tier1_keys, tier2_keys = [], []
-                for key, usage_count in eligible_keys:
-                    key_state = self.key_states[key]
-
-                    # Tier 1: Completely idle keys (preferred).
-                    if not key_state["models_in_use"]:
-                        tier1_keys.append((key, usage_count))
-                    # Tier 2: Keys that can accept more concurrent requests for this model.
-                    elif (
-                        key_state["models_in_use"].get(model, 0)
-                        < effective_max_concurrent
-                    ):
-                        tier2_keys.append((key, usage_count))
-
-                if rotation_mode == "sequential":
-                    # Sequential mode: sort credentials by priority, usage, recency
-                    # Keep all candidates in sorted order (no filtering to single key)
-                    selection_method = "sequential"
-                    if tier1_keys:
-                        tier1_keys = self._sort_sequential(
-                            tier1_keys, credential_priorities
-                        )
-                    if tier2_keys:
-                        tier2_keys = self._sort_sequential(
-                            tier2_keys, credential_priorities
-                        )
-                elif self.rotation_tolerance > 0:
-                    # Balanced mode with weighted randomness
-                    selection_method = "weighted-random"
-                    if tier1_keys:
-                        selected_key = self._select_weighted_random(
-                            tier1_keys, self.rotation_tolerance
-                        )
-                        tier1_keys = [
-                            (k, u) for k, u in tier1_keys if k == selected_key
-                        ]
-                    if tier2_keys:
-                        selected_key = self._select_weighted_random(
-                            tier2_keys, self.rotation_tolerance
-                        )
-                        tier2_keys = [
-                            (k, u) for k, u in tier2_keys if k == selected_key
-                        ]
-                else:
-                    # Deterministic: sort by usage within each tier
-                    selection_method = "least-used"
-                    tier1_keys.sort(key=lambda x: x[1])
-                    tier2_keys.sort(key=lambda x: x[1])
-
-                # Attempt to acquire a key from Tier 1 first.
-                for key, usage in tier1_keys:
-                    state = self.key_states[key]
-                    async with state["lock"]:
-                        if not state["models_in_use"]:
-                            state["models_in_use"][model] = 1
-                            tier_name = (
-                                credential_tier_names.get(key)
-                                if credential_tier_names
-                                else None
-                            )
-                            tier_info = f"tier: {tier_name}, " if tier_name else ""
-                            quota_display = self._get_quota_display(key, model)
-                            lib_logger.debug(
-                                f"Acquired key {mask_credential(key)} for model {model} "
-                                f"({tier_info}selection: {selection_method}, {quota_display})"
-                            )
-                            return key
-
-                # If no Tier 1 keys are available, try Tier 2.
-                for key, usage in tier2_keys:
-                    state = self.key_states[key]
-                    async with state["lock"]:
-                        current_count = state["models_in_use"].get(model, 0)
-                        if current_count < effective_max_concurrent:
-                            state["models_in_use"][model] = current_count + 1
-                            tier_name = (
-                                credential_tier_names.get(key)
-                                if credential_tier_names
-                                else None
-                            )
-                            tier_info = f"tier: {tier_name}, " if tier_name else ""
-                            quota_display = self._get_quota_display(key, model)
-                            lib_logger.debug(
-                                f"Acquired key {mask_credential(key)} for model {model} "
-                                f"({tier_info}selection: {selection_method}, concurrent: {state['models_in_use'][model]}/{effective_max_concurrent}, {quota_display})"
-                            )
-                            return key
-
-                all_potential_keys = eligible_keys
-                if not all_potential_keys:
-                    # All credentials are on cooldown - check if waiting makes sense
-                    soonest_end = await self.get_soonest_cooldown_end(
-                        available_keys, model
-                    )
-
-                    if soonest_end is None:
-                        # No cooldowns active but no keys available (shouldn't happen)
-                        lib_logger.warning(
-                            "No keys eligible and no cooldowns active. Re-evaluating..."
-                        )
-                        await asyncio.sleep(self.busy_wait_interval_seconds)
-                        continue
-
-                    remaining_budget = deadline - time.time()
-                    wait_needed = soonest_end - time.time()
-
-                    wait_timeout, wait_attempts, exhaustion_reason = (
-                        self._reserve_busy_wait_attempt(
-                            wait_attempts,
-                            remaining_budget,
-                            reason="All credentials stayed on cooldown",
-                        )
-                    )
-                    if exhaustion_reason:
-                        wait_exhaustion_reason = exhaustion_reason
-                        lib_logger.warning(
-                            f"{wait_exhaustion_reason} for model {model}. "
-                            f"Soonest credential reports availability in {max(0.0, wait_needed):.1f}s."
-                        )
+                    if warm_due_candidates and self._consume_probe_token():
+                        selected = warm_due_candidates[0]
                         break
 
-                    if wait_timeout is None:
-                        break
-
-                    lib_logger.info(
-                        f"All credentials on cooldown. Soonest credential reports availability "
-                        f"in {max(0.0, wait_needed):.1f}s. Waiting {wait_timeout:.1f}s "
-                        f"before retrying (attempt {wait_attempts}"
-                        + (
-                            f"/{self.busy_wait_max_attempts}"
-                            if self.busy_wait_max_attempts > 0
-                            else ""
+            if selected is not None:
+                state = self.key_states[selected["key"]]
+                async with state["lock"]:
+                    if self._claim_record_if_available(selected):
+                        tier_name = (
+                            credential_tier_names.get(selected["key"])
+                            if credential_tier_names
+                            else None
                         )
-                        + ")."
-                    )
-                    await asyncio.sleep(wait_timeout)
-                    continue
+                        tier_info = f"tier: {tier_name}, " if tier_name else ""
+                        lib_logger.debug(
+                            f"Acquired key {mask_credential(selected['key'])} for model {model} "
+                            f"({tier_info}state={selected['scheduler_state']}, health={selected['health_score']:.3f}, "
+                            f"in_flight={selected['in_flight'] + 1}/{selected['hard_cap']})"
+                        )
+                        return selected["key"]
 
-                remaining_budget = deadline - time.time()
-                wait_timeout, wait_attempts, exhaustion_reason = (
-                    self._reserve_busy_wait_attempt(
-                        wait_attempts,
-                        remaining_budget,
-                        reason="All eligible credentials stayed busy",
-                    )
-                )
-                if exhaustion_reason:
-                    wait_exhaustion_reason = exhaustion_reason
-                    lib_logger.warning(
-                        f"{wait_exhaustion_reason} for model {model}."
-                    )
-                    break
-                if wait_timeout is None:
-                    break
-                lib_logger.info(
-                    "All eligible keys are currently locked for this model. "
-                    f"Waiting up to {wait_timeout:.1f}s before retrying (attempt {wait_attempts}"
-                    + (
-                        f"/{self.busy_wait_max_attempts}"
-                        if self.busy_wait_max_attempts > 0
-                        else ""
-                    )
-                    + ")."
-                )
-                await self._wait_for_any_availability(wait_timeout)
-                continue
-
-        # If the loop exits, it means the deadline was exceeded.
-        if wait_exhaustion_reason:
-            raise NoAvailableKeysError(
-                f"{wait_exhaustion_reason} for model {model}."
+            now_ts = time.time()
+            busy_hot = any(
+                record["scheduler_state"] == SCHEDULER_STATE_HOT and record["busy"]
+                for record in records
             )
+            wait_targets = [
+                ts
+                for record in records
+                for ts in (
+                    float(record.get("next_eligible_at") or 0.0),
+                    float(record.get("next_probe_at") or 0.0),
+                )
+                if ts > now_ts
+            ]
+            soonest_wait_target = min(wait_targets) if wait_targets else None
+
+            remaining_budget = deadline - time.time()
+            wait_reason = (
+                "All eligible credentials stayed busy"
+                if busy_hot
+                else "All credentials stayed unavailable"
+            )
+            wait_timeout, wait_attempts, exhaustion_reason = self._reserve_busy_wait_attempt(
+                wait_attempts,
+                remaining_budget,
+                reason=wait_reason,
+            )
+            if exhaustion_reason:
+                wait_exhaustion_reason = exhaustion_reason
+                break
+            if wait_timeout is None:
+                break
+
+            if soonest_wait_target is not None:
+                wait_timeout = min(
+                    wait_timeout,
+                    max(0.0, soonest_wait_target - time.time()),
+                )
+            if wait_timeout <= 0:
+                await asyncio.sleep(0)
+                continue
+
+            if busy_hot:
+                await self._wait_for_any_availability(wait_timeout)
+            else:
+                await asyncio.sleep(wait_timeout)
+
+        if wait_exhaustion_reason:
+            raise NoAvailableKeysError(f"{wait_exhaustion_reason} for model {model}.")
         raise NoAvailableKeysError(
             f"Could not acquire a key for model {model} within the global time budget."
         )
@@ -3083,6 +3644,7 @@ class UsageManager:
         key: str,
         model: str,
         completion_response: Optional[litellm.ModelResponse] = None,
+        latency_ms: Optional[float] = None,
     ):
         """
         Records a successful API call, resetting failure counters.
@@ -3246,6 +3808,42 @@ class UsageManager:
             if model in key_data.get("model_cooldowns", {}):
                 del key_data["model_cooldowns"][model]
 
+            tracking_key = self._get_scheduler_tracking_key(key, model)
+            scheduler_bundle = self._ensure_scheduler_bundle_for_key_data(key_data)
+            global_state = scheduler_bundle["credential_global"]
+            tracking_state = self._ensure_tracking_scheduler_state(
+                key_data, tracking_key
+            )
+            previous_quota_failure_at = tracking_state.get("last_quota_failure_at")
+            had_opaque_quota_failure = (
+                previous_quota_failure_at is not None
+                and not bool(tracking_state.get("last_quota_failure_has_exact_reset"))
+            )
+
+            for scheduler_state in (global_state, tracking_state):
+                scheduler_state["scheduler_state"] = SCHEDULER_STATE_HOT
+                scheduler_state["last_success_at"] = now_ts
+                scheduler_state["last_error_type"] = None
+                scheduler_state["next_eligible_at"] = 0.0
+                scheduler_state["next_probe_at"] = 0.0
+                scheduler_state["expired_confidence"] = max(
+                    0.0,
+                    float(scheduler_state.get("expired_confidence") or 0.0) - 0.2,
+                )
+                self._update_success_ema(scheduler_state, True)
+                self._update_latency_ema(scheduler_state, latency_ms)
+                self._refresh_scheduler_health(scheduler_state)
+
+            tracking_state["probe_step"] = 0
+            tracking_state["last_quota_failure_has_exact_reset"] = False
+            if had_opaque_quota_failure:
+                outage_seconds = max(
+                    1.0, now_ts - float(previous_quota_failure_at or now_ts)
+                )
+                self._reinforce_recovery_hypothesis(tracking_state, outage_seconds, 0.8)
+            tracking_state["last_quota_failure_at"] = None
+            global_state["auth_failure_timestamps"] = []
+
             # Record token and cost usage
             if (
                 completion_response
@@ -3382,6 +3980,13 @@ class UsageManager:
                     },
                 )
 
+            tracking_key = self._get_scheduler_tracking_key(key, model)
+            scheduler_bundle = self._ensure_scheduler_bundle_for_key_data(key_data)
+            global_state = scheduler_bundle["credential_global"]
+            tracking_state = self._ensure_tracking_scheduler_state(
+                key_data, tracking_key
+            )
+
             # Provider-level errors (transient issues) should not count against the key
             provider_level_errors = {"server_error", "api_connection"}
 
@@ -3406,11 +4011,13 @@ class UsageManager:
             if classified_error.error_type == "quota_exceeded":
                 # Quota exhausted - use authoritative reset timestamp if available
                 quota_reset_ts = classified_error.quota_reset_timestamp
-                cooldown_seconds = (
-                    classified_error.retry_after or COOLDOWN_RATE_LIMIT_DEFAULT
+                has_exact_reset = bool(quota_reset_ts or classified_error.retry_after)
+                cooldown_seconds = None
+                exact_cooldown_until = quota_reset_ts or (
+                    now_ts + float(classified_error.retry_after or 0)
                 )
 
-                if quota_reset_ts and reset_mode == "per_model":
+                if has_exact_reset and reset_mode == "per_model":
                     # Set quota_reset_ts on model - this becomes authoritative stats reset time
                     models_data = key_data.setdefault("models", {})
                     model_data = models_data.setdefault(
@@ -3472,34 +4079,63 @@ class UsageManager:
                                     f"{new_request_count}/{max_req}"
                                 )
                             # Also set transient cooldown for selection logic
-                            model_cooldowns[grouped_model] = quota_reset_ts
+                            model_cooldowns[grouped_model] = exact_cooldown_until
 
-                        reset_dt = datetime.fromtimestamp(
-                            quota_reset_ts, tz=timezone.utc
-                        )
-                        lib_logger.info(
-                            f"Quota exhausted for group '{group}' ({len(grouped_models)} models) "
-                            f"on {mask_credential(key)}. Resets at {reset_dt.isoformat()}"
-                        )
+                        if quota_reset_ts:
+                            reset_dt = datetime.fromtimestamp(
+                                quota_reset_ts, tz=timezone.utc
+                            )
+                            lib_logger.info(
+                                f"Quota exhausted for group '{group}' ({len(grouped_models)} models) "
+                                f"on {mask_credential(key)}. Resets at {reset_dt.isoformat()}"
+                            )
                     else:
-                        reset_dt = datetime.fromtimestamp(
-                            quota_reset_ts, tz=timezone.utc
-                        )
-                        hours = (quota_reset_ts - now_ts) / 3600
-                        lib_logger.info(
-                            f"Quota exhausted for model {model} on {mask_credential(key)}. "
-                            f"Resets at {reset_dt.isoformat()} ({hours:.1f}h)"
-                        )
+                        if quota_reset_ts:
+                            reset_dt = datetime.fromtimestamp(
+                                quota_reset_ts, tz=timezone.utc
+                            )
+                            hours = (quota_reset_ts - now_ts) / 3600
+                            lib_logger.info(
+                                f"Quota exhausted for model {model} on {mask_credential(key)}. "
+                                f"Resets at {reset_dt.isoformat()} ({hours:.1f}h)"
+                            )
 
-                    # Set transient cooldown for selection logic
-                    model_cooldowns[model] = quota_reset_ts
+                    cooldown_until = exact_cooldown_until
+                    cooldown_seconds = max(0.0, cooldown_until - now_ts)
+                    model_cooldowns[model] = cooldown_until
                 else:
-                    # No authoritative timestamp or legacy mode - just use retry_after
-                    model_cooldowns[model] = now_ts + cooldown_seconds
-                    hours = cooldown_seconds / 3600
+                    previous_step = int(tracking_state.get("probe_step") or 0)
+                    previous_probe_at = float(tracking_state.get("next_probe_at") or 0.0)
+                    if (
+                        previous_step >= len(SCHEDULER_RECOVERY_LADDER_SECONDS)
+                        and previous_probe_at > 0
+                        and now_ts >= previous_probe_at
+                    ):
+                        tracking_state["scheduler_state"] = SCHEDULER_STATE_DISABLED
+                        tracking_state["next_eligible_at"] = (
+                            now_ts + SCHEDULER_RECOVERY_LADDER_SECONDS[-1]
+                        )
+                        tracking_state["next_probe_at"] = tracking_state["next_eligible_at"]
+                        cooldown_seconds = SCHEDULER_RECOVERY_LADDER_SECONDS[-1]
+                    else:
+                        cooldown_seconds, next_step = self._get_next_probe_seconds(
+                            previous_step,
+                            advance=(
+                                previous_step > 0
+                                and previous_probe_at > 0
+                                and now_ts >= previous_probe_at
+                            ),
+                        )
+                        tracking_state["probe_step"] = next_step
+                    model_cooldowns[model] = now_ts + float(cooldown_seconds or 0.0)
+                    self._reinforce_recovery_hypothesis(
+                        tracking_state,
+                        float(cooldown_seconds or COOLDOWN_RATE_LIMIT_DEFAULT),
+                        0.15,
+                    )
                     lib_logger.info(
-                        f"Quota exhausted on {mask_credential(key)} for model {model}. "
-                        f"Cooldown: {cooldown_seconds}s ({hours:.1f}h)"
+                        f"Opaque quota exhaustion on {mask_credential(key)} for {model}. "
+                        f"Recovery ladder step={tracking_state.get('probe_step', 0)} cooldown={cooldown_seconds}s"
                     )
 
                 # Mark credential as exhausted for fair cycle if cooldown exceeds threshold
@@ -3527,23 +4163,67 @@ class UsageManager:
                                 )
 
             elif classified_error.error_type == "rate_limit":
-                # Transient rate limit - just set short cooldown (does NOT set quota_reset_ts)
-                cooldown_seconds = (
-                    classified_error.retry_after or COOLDOWN_RATE_LIMIT_DEFAULT
-                )
-                model_cooldowns[model] = now_ts + cooldown_seconds
-                lib_logger.info(
-                    f"Rate limit on {mask_credential(key)} for model {model}. "
-                    f"Transient cooldown: {cooldown_seconds}s"
-                )
+                # Exact retry-after keeps precise cooldown; opaque 429 enters sparse ladder.
+                if classified_error.retry_after:
+                    cooldown_seconds = float(classified_error.retry_after)
+                    model_cooldowns[model] = now_ts + cooldown_seconds
+                    lib_logger.info(
+                        f"Rate limit on {mask_credential(key)} for model {model}. "
+                        f"Exact cooldown: {cooldown_seconds}s"
+                    )
+                else:
+                    previous_step = int(tracking_state.get("probe_step") or 0)
+                    previous_probe_at = float(tracking_state.get("next_probe_at") or 0.0)
+                    if (
+                        previous_step >= len(SCHEDULER_RECOVERY_LADDER_SECONDS)
+                        and previous_probe_at > 0
+                        and now_ts >= previous_probe_at
+                    ):
+                        tracking_state["scheduler_state"] = SCHEDULER_STATE_DISABLED
+                        tracking_state["next_eligible_at"] = (
+                            now_ts + SCHEDULER_RECOVERY_LADDER_SECONDS[-1]
+                        )
+                        tracking_state["next_probe_at"] = tracking_state["next_eligible_at"]
+                        cooldown_seconds = SCHEDULER_RECOVERY_LADDER_SECONDS[-1]
+                    else:
+                        cooldown_seconds, next_step = self._get_next_probe_seconds(
+                            previous_step,
+                            advance=(
+                                previous_step > 0
+                                and previous_probe_at > 0
+                                and now_ts >= previous_probe_at
+                            ),
+                        )
+                        tracking_state["probe_step"] = next_step
+                    model_cooldowns[model] = now_ts + float(cooldown_seconds or 0.0)
+                    self._reinforce_recovery_hypothesis(
+                        tracking_state,
+                        float(cooldown_seconds or COOLDOWN_RATE_LIMIT_DEFAULT),
+                        0.15,
+                    )
+                    lib_logger.info(
+                        f"Opaque rate limit on {mask_credential(key)} for {model}. "
+                        f"Recovery ladder step={tracking_state.get('probe_step', 0)} cooldown={cooldown_seconds}s"
+                    )
 
-            elif classified_error.error_type == "authentication":
-                # Apply a 5-minute key-level lockout for auth errors
-                key_data["key_cooldown_until"] = now_ts + COOLDOWN_AUTH_ERROR
-                cooldown_seconds = COOLDOWN_AUTH_ERROR
+            elif classified_error.error_type == "forbidden":
+                cooldown_seconds = float(SCHEDULER_AUTH_SUSPECT_RETRY_SECONDS)
+                model_cooldowns[model] = now_ts + cooldown_seconds
+
+            elif classified_error.error_type in {
+                "authentication",
+                "credential_reauth_needed",
+            }:
+                # Authentication failures block the whole credential, not just one model.
+                cooldown_seconds = float(SCHEDULER_AUTH_SUSPECT_RETRY_SECONDS)
+                key_data["key_cooldown_until"] = max(
+                    float(key_data.get("key_cooldown_until") or 0.0),
+                    now_ts + cooldown_seconds,
+                )
                 model_cooldowns[model] = now_ts + cooldown_seconds
                 lib_logger.warning(
-                    f"Authentication error on key {mask_credential(key)}. Applying 5-minute key-level lockout."
+                    f"Authentication error on key {mask_credential(key)}. "
+                    f"Blocking credential for {int(cooldown_seconds)}s pending recovery."
                 )
 
             # If we should increment failures, calculate escalating backoff
@@ -3573,6 +4253,79 @@ class UsageManager:
                 lib_logger.info(
                     f"Provider-level error ({classified_error.error_type}) for key {mask_credential(key)} "
                     f"with model {model}. NOT incrementing failures. Cooldown: {cooldown_seconds}s"
+                )
+
+            tracking_state["last_failure_at"] = now_ts
+            tracking_state["last_error_type"] = classified_error.error_type
+            self._update_success_ema(tracking_state, False)
+
+            if classified_error.error_type in {"quota_exceeded", "rate_limit"}:
+                tracking_state["last_quota_failure_at"] = now_ts
+                tracking_state["last_quota_failure_has_exact_reset"] = bool(
+                    classified_error.quota_reset_timestamp or classified_error.retry_after
+                )
+                if tracking_state.get("scheduler_state") != SCHEDULER_STATE_DISABLED:
+                    if classified_error.quota_reset_timestamp or classified_error.retry_after:
+                        self._set_scheduler_backoff(
+                            tracking_state,
+                            now_ts=now_ts,
+                            seconds=float(cooldown_seconds or 0.0),
+                            scheduler_state=SCHEDULER_STATE_COOLING,
+                            probe_step=0,
+                        )
+                    else:
+                        self._set_scheduler_backoff(
+                            tracking_state,
+                            now_ts=now_ts,
+                            seconds=float(cooldown_seconds or 0.0),
+                            scheduler_state=SCHEDULER_STATE_WARM,
+                            probe_step=int(tracking_state.get("probe_step") or 0),
+                        )
+            elif classified_error.error_type == "forbidden":
+                tracking_state["scheduler_state"] = SCHEDULER_STATE_SUSPECT_EXPIRED
+                tracking_state["next_eligible_at"] = now_ts + float(cooldown_seconds or 0.0)
+                tracking_state["next_probe_at"] = tracking_state["next_eligible_at"]
+                tracking_state["expired_confidence"] = min(
+                    1.0,
+                    float(tracking_state.get("expired_confidence") or 0.0) + 0.35,
+                )
+                self._refresh_scheduler_health(tracking_state)
+            else:
+                self._set_scheduler_backoff(
+                    tracking_state,
+                    now_ts=now_ts,
+                    seconds=float(cooldown_seconds or COOLDOWN_TRANSIENT_ERROR),
+                    scheduler_state=self._scheduler_state_from_error_type(
+                        classified_error.error_type
+                    ),
+                )
+
+            if classified_error.error_type in {
+                "authentication",
+                "credential_reauth_needed",
+            }:
+                global_state["last_failure_at"] = now_ts
+                global_state["last_error_type"] = classified_error.error_type
+                global_state["scheduler_state"] = SCHEDULER_STATE_SUSPECT_EXPIRED
+                global_state["next_eligible_at"] = now_ts + float(
+                    cooldown_seconds or SCHEDULER_AUTH_SUSPECT_RETRY_SECONDS
+                )
+                global_state["next_probe_at"] = global_state["next_eligible_at"]
+                global_state["expired_confidence"] = min(
+                    1.0, float(global_state.get("expired_confidence") or 0.0) + 0.5
+                )
+                self._update_success_ema(global_state, False)
+                self._record_scheduler_auth_failure(global_state, now_ts)
+                self._refresh_scheduler_health(global_state)
+            elif classified_error.error_type in {"server_error", "api_connection"}:
+                global_state["last_failure_at"] = now_ts
+                global_state["last_error_type"] = classified_error.error_type
+                self._update_success_ema(global_state, False)
+                self._set_scheduler_backoff(
+                    global_state,
+                    now_ts=now_ts,
+                    seconds=float(cooldown_seconds or COOLDOWN_TRANSIENT_ERROR),
+                    scheduler_state=SCHEDULER_STATE_COOLING,
                 )
 
             # Check for key-level lockout condition
@@ -3687,6 +4440,11 @@ class UsageManager:
                     "model_cooldowns": {},
                     "failures": {},
                 },
+            )
+            tracking_key = self._get_scheduler_tracking_key(credential, model)
+            scheduler_bundle = self._ensure_scheduler_bundle_for_key_data(key_data)
+            tracking_state = self._ensure_tracking_scheduler_state(
+                key_data, tracking_key
             )
 
             # Ensure models dict exists
@@ -3820,6 +4578,20 @@ class UsageManager:
                                     credential, provider, tier_key, tracking_key
                                 )
 
+                tracking_state["last_failure_at"] = now_ts
+                tracking_state["last_error_type"] = "quota_exceeded"
+                tracking_state["last_quota_failure_at"] = now_ts
+                tracking_state["last_quota_failure_has_exact_reset"] = True
+                tracking_state["probe_step"] = 0
+                self._update_success_ema(tracking_state, False)
+                self._set_scheduler_backoff(
+                    tracking_state,
+                    now_ts=now_ts,
+                    seconds=max(0.0, reset_timestamp - now_ts),
+                    scheduler_state=SCHEDULER_STATE_COOLING,
+                    probe_step=0,
+                )
+
                 # Defensive clamp: ensure request_count doesn't exceed max when exhausted
                 if (
                     max_requests is not None
@@ -3892,6 +4664,17 @@ class UsageManager:
                 f"Updated quota baseline for {mask_credential(credential)} model={model}: "
                 f"remaining={remaining_fraction:.2%}, synced_request_count={synced_count}"
             )
+
+            if not is_exhausted and remaining_fraction > 0:
+                tracking_state["scheduler_state"] = SCHEDULER_STATE_HOT
+                tracking_state["next_eligible_at"] = 0.0
+                tracking_state["next_probe_at"] = 0.0
+                tracking_state["probe_step"] = 0
+                tracking_state["expired_confidence"] = max(
+                    0.0,
+                    float(tracking_state.get("expired_confidence") or 0.0) - 0.1,
+                )
+                self._refresh_scheduler_health(tracking_state)
 
         await self._save_usage()
         return cooldown_set_info
@@ -3991,7 +4774,7 @@ class UsageManager:
                     "timestamp": now_ts,
                 }
 
-            for credential, cred_data in self._usage_data.items():
+            for credential, cred_data in self._iter_usage_data_entries():
                 # Extract provider from credential path
                 provider = self._get_provider_from_credential(credential)
                 if not provider:
@@ -4166,6 +4949,7 @@ class UsageManager:
                 # Build credential entry (stable and redacted public identity)
                 identifier = self._build_public_credential_identifier(provider, credential)
                 public_full_path = self._build_public_full_path(credential)
+                public_scheduler = self._pick_public_scheduler_state(cred_data, now_ts)
 
                 cred_entry = {
                     "identifier": identifier,
@@ -4176,6 +4960,19 @@ class UsageManager:
                     "requests": cred_requests,
                     "tokens": cred_tokens,
                     "approx_cost": cred_cost if cred_cost > 0 else None,
+                    "scheduler_state": public_scheduler.get("scheduler_state"),
+                    "health_score": round(
+                        float(public_scheduler.get("health_score") or 0.0), 4
+                    ),
+                    "next_eligible_at": public_scheduler.get("next_eligible_at"),
+                    "next_probe_at": public_scheduler.get("next_probe_at"),
+                    "last_error_type": public_scheduler.get("last_error_type"),
+                    "expired_confidence": round(
+                        float(public_scheduler.get("expired_confidence") or 0.0), 4
+                    ),
+                    "recovery_hypothesis": self._scheduler_recovery_snapshot(
+                        public_scheduler
+                    ),
                 }
 
                 # Add cooldown info

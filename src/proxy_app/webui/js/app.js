@@ -170,18 +170,31 @@ class App {
         : '未设置';
 
       let runtime = null;
-      let validate = null;
+      let policies = null;
       try {
-        runtime = await api.getRuntimeStatus();
+        [runtime, policies] = await Promise.all([
+          api.getRuntimeStatus(),
+          api.getPolicies(),
+        ]);
       } catch (e) {
         runtime = { message: `获取运行时状态失败: ${e.message}` };
+        policies = null;
       }
+
+      const safePolicies = {
+        global_timeout: policies?.global_timeout ?? '',
+        virtual_scheduler_mode: policies?.virtual_scheduler_mode ?? 'global_pool',
+        key_busy_wait_interval_seconds: policies?.key_busy_wait_interval_seconds ?? 0.2,
+        key_busy_wait_max_attempts: policies?.key_busy_wait_max_attempts ?? 5,
+        scarcity_probe_budget_ratio: policies?.scarcity_probe_budget_ratio ?? 0.01,
+        scarcity_probe_burst: policies?.scarcity_probe_burst ?? 3,
+      };
 
       container.innerHTML = `
         <div class="page-header">
           <h2 class="page-title">设置 / 运行时管理</h2>
         </div>
-        <div class="card" style="max-width:760px">
+        <div class="card" style="max-width:960px">
           <div class="card-body">
             <div style="margin-bottom:12px">
               <span class="text-muted">当前密钥：</span>
@@ -192,7 +205,39 @@ class App {
             <div style="margin-bottom:8px"><span class="text-muted">最后重载：</span> <code>${runtime?.last_reload_at ?? '-'}</code></div>
             <div style="margin-bottom:16px"><span class="text-muted">状态：</span> ${runtime?.message ?? '-'}</div>
 
+            <div style="border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:16px;background:var(--surface-2)">
+              <div style="font-weight:700;margin-bottom:12px">Scheduler Policies</div>
+              <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px">
+                <label class="input-label">虚拟调度模式
+                  <select id="policy-virtual-scheduler-mode" class="select-field">
+                    <option value="global_pool" ${safePolicies.virtual_scheduler_mode === 'global_pool' ? 'selected' : ''}>global_pool</option>
+                    <option value="legacy" ${safePolicies.virtual_scheduler_mode === 'legacy' ? 'selected' : ''}>legacy</option>
+                  </select>
+                </label>
+                <label class="input-label">总超时 Global Timeout
+                  <input id="policy-global-timeout" class="input-field" type="number" min="1" step="1" value="${safePolicies.global_timeout}">
+                </label>
+                <label class="input-label">Busy Wait 间隔(秒)
+                  <input id="policy-busy-wait-interval" class="input-field" type="number" min="0" step="0.1" value="${safePolicies.key_busy_wait_interval_seconds}">
+                </label>
+                <label class="input-label">Busy Wait 次数
+                  <input id="policy-busy-wait-attempts" class="input-field" type="number" min="0" step="1" value="${safePolicies.key_busy_wait_max_attempts}">
+                </label>
+                <label class="input-label">Probe Budget 比例
+                  <input id="policy-probe-ratio" class="input-field" type="number" min="0" step="0.001" value="${safePolicies.scarcity_probe_budget_ratio}">
+                </label>
+                <label class="input-label">Probe Burst
+                  <input id="policy-probe-burst" class="input-field" type="number" min="1" step="1" value="${safePolicies.scarcity_probe_burst}">
+                </label>
+              </div>
+              <div class="text-muted" style="margin-top:10px">
+                `global_pool` 会启用跨 provider 全局 key 候选池；probe 预算越低，恢复试探越保守。
+              </div>
+            </div>
+
             <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn btn-primary" id="admin-save-policies-btn">保存调度策略</button>
+              <button class="btn btn-ghost" id="admin-save-apply-btn">保存并应用</button>
               <button class="btn btn-ghost" id="admin-validate-btn">校验配置</button>
               <button class="btn btn-primary" id="admin-reload-btn">重载运行时</button>
               <button class="btn btn-danger" id="logout-btn">退出登录</button>
@@ -203,6 +248,48 @@ class App {
       `;
 
       container.querySelector('#logout-btn')?.addEventListener('click', () => api.logout());
+      const readPoliciesForm = () => {
+        const globalTimeoutRaw = (container.querySelector('#policy-global-timeout')?.value || '').trim();
+        return {
+          global_timeout: globalTimeoutRaw ? Number.parseInt(globalTimeoutRaw, 10) : null,
+          virtual_scheduler_mode: container.querySelector('#policy-virtual-scheduler-mode')?.value || 'global_pool',
+          key_busy_wait_interval_seconds: Number.parseFloat(container.querySelector('#policy-busy-wait-interval')?.value || '0.2'),
+          key_busy_wait_max_attempts: Number.parseInt(container.querySelector('#policy-busy-wait-attempts')?.value || '5', 10),
+          scarcity_probe_budget_ratio: Number.parseFloat(container.querySelector('#policy-probe-ratio')?.value || '0.01'),
+          scarcity_probe_burst: Number.parseInt(container.querySelector('#policy-probe-burst')?.value || '3', 10),
+        };
+      };
+
+      const savePolicies = async (applyAfter = false) => {
+        const payload = readPoliciesForm();
+        const updated = await api.updatePolicies(payload);
+        if (applyAfter) {
+          const applied = await api.applyAdminConfig();
+          container.querySelector('#settings-output').textContent = JSON.stringify(applied, null, 2);
+          showToast('调度策略已保存并应用', 'success');
+        } else {
+          container.querySelector('#settings-output').textContent = JSON.stringify(updated, null, 2);
+          showToast('调度策略已保存', 'success');
+        }
+        await render();
+      };
+
+      container.querySelector('#admin-save-policies-btn')?.addEventListener('click', async () => {
+        try {
+          await savePolicies(false);
+        } catch (e) {
+          showToast(`保存策略失败: ${e.message}`, 'error');
+        }
+      });
+
+      container.querySelector('#admin-save-apply-btn')?.addEventListener('click', async () => {
+        try {
+          await savePolicies(true);
+        } catch (e) {
+          showToast(`保存并应用失败: ${e.message}`, 'error');
+        }
+      });
+
       container.querySelector('#admin-validate-btn')?.addEventListener('click', async () => {
         try {
           const v = await api.validateAdminConfig();

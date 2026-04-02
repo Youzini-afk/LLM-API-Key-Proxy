@@ -923,11 +923,18 @@ export async function renderChannels(container) {
                 const at = k.auto_disabled_at
                   ? new Date(k.auto_disabled_at * 1000).toLocaleString('zh-CN')
                   : '';
+                const schedulerState = k.scheduler_state || '-';
+                const healthScore = typeof k.health_score === 'number' ? k.health_score.toFixed(3) : '-';
+                const nextProbeAt = k.next_probe_at
+                  ? new Date(k.next_probe_at * 1000).toLocaleString('zh-CN')
+                  : '';
 
                 return h('div', { className: 'text-muted text-body-sm mb-xs' },
                   h('span', { className: 'text-mono' }, k.id || '-'),
                   ' · 运行时状态: ',
                   h('strong', {}, rt),
+                  ` · scheduler: ${schedulerState} · health: ${healthScore}`,
+                  nextProbeAt ? ` · next_probe: ${nextProbeAt}` : '',
                   autoDisabled
                     ? h('span', { style: 'color: var(--error); margin-left: 8px;' },
                       `自动禁用（${reason || 'long_unavailable'}）${at ? ` @ ${at}` : ''}`

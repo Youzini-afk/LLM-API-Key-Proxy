@@ -268,6 +268,12 @@ class BackgroundRefresher:
         # Main OAuth refresh loop
         while True:
             try:
+                if getattr(self._client, "usage_manager", None):
+                    try:
+                        await self._client.usage_manager.run_maintenance()
+                    except Exception as e:
+                        lib_logger.error(f"Error in scheduler maintenance: {e}")
+
                 oauth_configs = self._client.get_oauth_credentials()
                 for provider, paths in oauth_configs.items():
                     provider_plugin = self._client._get_provider_instance(provider)

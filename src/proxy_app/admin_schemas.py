@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, field_validator
 
 RouteStrategy = Literal["sequential", "primary_backup", "weighted_random", "balanced"]
 RotationMode = Literal["balanced", "sequential"]
+VirtualSchedulerMode = Literal["legacy", "global_pool"]
 
 
 def _normalize_string_list(values: Optional[List[str]]) -> List[str]:
@@ -103,6 +104,11 @@ class VirtualModelAdminConfig(BaseModel):
 
 class AdminPolicies(BaseModel):
     global_timeout: Optional[int] = Field(default=None, ge=1)
+    virtual_scheduler_mode: VirtualSchedulerMode = "global_pool"
+    key_busy_wait_interval_seconds: float = Field(default=0.2, ge=0.0)
+    key_busy_wait_max_attempts: int = Field(default=5, ge=0)
+    scarcity_probe_budget_ratio: float = Field(default=0.01, ge=0.0)
+    scarcity_probe_burst: int = Field(default=3, ge=1)
 
 
 class AdminConfig(BaseModel):
@@ -203,4 +209,8 @@ class VirtualModelCreateRequest(BaseModel):
 
 
 class VirtualModelUpdateRequest(VirtualModelAdminConfig):
+    pass
+
+
+class AdminPoliciesUpdateRequest(AdminPolicies):
     pass

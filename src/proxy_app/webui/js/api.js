@@ -96,6 +96,17 @@ class ProxyAPI {
     return this.request('/admin/config/apply', { method: 'POST' });
   }
 
+  async getPolicies() {
+    return this.request('/admin/policies');
+  }
+
+  async updatePolicies(payload) {
+    return this.request('/admin/policies', {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    });
+  }
+
   async getChannels() {
     return this.request('/admin/channels');
   }

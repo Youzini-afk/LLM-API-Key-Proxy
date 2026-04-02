@@ -194,6 +194,10 @@ class RotatingClient:
         self.max_retries = max_retries
         self.global_timeout = global_timeout
         self.abort_on_callback_error = abort_on_callback_error
+        self.virtual_scheduler_mode = (
+            os.getenv("VIRTUAL_SCHEDULER_MODE", "global_pool").strip().lower()
+            or "global_pool"
+        )
 
         # Initialize provider plugins early so they can be used for rotation mode detection
         self._provider_plugins = PROVIDER_PLUGINS
@@ -1059,6 +1063,94 @@ class RotatingClient:
         # No conversion needed, return original
         return model
 
+    def _build_provider_credential_context(
+        self,
+        provider: str,
+        model: str,
+        *,
+        credentials_override: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        credentials_for_provider = (
+            list(credentials_override)
+            if credentials_override is not None
+            else list(self.all_credentials.get(provider, []))
+        )
+        provider_plugin = self._get_provider_instance(provider)
+
+        if provider_plugin and hasattr(provider_plugin, "is_credential_available"):
+            available_creds = [
+                cred
+                for cred in credentials_for_provider
+                if provider_plugin.is_credential_available(cred)
+            ]
+            if available_creds:
+                credentials_for_provider = available_creds
+
+        credential_priorities = None
+        credential_tier_names = None
+        if provider_plugin and hasattr(provider_plugin, "get_model_tier_requirement"):
+            required_tier = provider_plugin.get_model_tier_requirement(model)
+            if required_tier is not None:
+                compatible_creds = []
+                unknown_creds = []
+                incompatible_creds = []
+
+                for cred in credentials_for_provider:
+                    if hasattr(provider_plugin, "get_credential_priority"):
+                        priority = provider_plugin.get_credential_priority(cred)
+                        if priority is None:
+                            unknown_creds.append(cred)
+                        elif priority <= required_tier:
+                            compatible_creds.append(cred)
+                        else:
+                            incompatible_creds.append(cred)
+                    else:
+                        unknown_creds.append(cred)
+
+                tier_compatible_creds = compatible_creds + unknown_creds
+                if tier_compatible_creds:
+                    credentials_for_provider = tier_compatible_creds
+                elif incompatible_creds:
+                    lib_logger.warning(
+                        f"Model {model} requires priority <= {required_tier} credentials, "
+                        f"but all {len(incompatible_creds)} known credentials have priority > {required_tier}."
+                    )
+
+        if provider_plugin and hasattr(provider_plugin, "get_credential_priority"):
+            credential_priorities = {}
+            credential_tier_names = {}
+            for cred in credentials_for_provider:
+                priority = provider_plugin.get_credential_priority(cred)
+                if priority is not None:
+                    credential_priorities[cred] = priority
+                if hasattr(provider_plugin, "get_credential_tier_name"):
+                    tier_name = provider_plugin.get_credential_tier_name(cred)
+                    if tier_name:
+                        credential_tier_names[cred] = tier_name
+
+        return {
+            "provider_plugin": provider_plugin,
+            "credentials": credentials_for_provider,
+            "credential_priorities": credential_priorities,
+            "credential_tier_names": credential_tier_names,
+        }
+
+    async def _can_retry_same_key_provider_local(
+        self,
+        provider: str,
+        model: str,
+        credentials_for_provider: List[str],
+        current_cred: str,
+    ) -> bool:
+        max_concurrent = self.max_concurrent_requests_per_key.get(provider, 1)
+        has_other_hot = await self.usage_manager.has_other_hot_candidates(
+            credentials_for_provider,
+            model,
+            hard_cap=max(1, int(max_concurrent)),
+            exclude_key=current_cred,
+        )
+        return not has_other_hot
+
     @staticmethod
     def _remaining_deadline_budget(deadline: float) -> float:
         """Return remaining request budget in seconds."""
@@ -1122,6 +1214,7 @@ class RotatingClient:
         provider_plugin: Optional[Any] = None,
         initial_timeout: Optional[float] = None,
         deadline: Optional[float] = None,
+        initial_latency_ms: Optional[float] = None,
     ) -> AsyncGenerator[Any, None]:
         """
         A hybrid wrapper for streaming that buffers fragmented JSON, handles client disconnections gracefully,
@@ -1270,11 +1363,16 @@ class RotatingClient:
                         # Create a dummy ModelResponse for recording (only usage matters)
                         dummy_response = litellm.ModelResponse(usage=last_usage)
                         await self.usage_manager.record_success(
-                            key, model, dummy_response
+                            key,
+                            model,
+                            dummy_response,
+                            latency_ms=initial_latency_ms,
                         )
                     else:
                         # If no usage seen (rare), record success without tokens/cost
-                        await self.usage_manager.record_success(key, model)
+                        await self.usage_manager.record_success(
+                            key, model, latency_ms=initial_latency_ms
+                        )
 
                     break
 
@@ -1460,9 +1558,23 @@ class RotatingClient:
 
         # Extract internal logging parameters (not passed to API)
         parent_log_dir = kwargs.pop("_parent_log_dir", None)
+        forced_credential = kwargs.pop("_forced_credential", None)
+        request_deadline = kwargs.pop("_request_deadline", None)
+        allow_rotation = kwargs.pop("_allow_rotation", forced_credential is None)
+        allow_same_key_retry = kwargs.pop("_allow_same_key_retry", None)
+        key_already_acquired = kwargs.pop("_key_already_acquired", False)
+        acquired_model = kwargs.pop("_acquired_model", None)
+        count_as_real_request = kwargs.pop("_count_as_real_request", True)
+        if forced_credential is not None and allow_same_key_retry is None:
+            allow_same_key_retry = False
 
         # Establish a global deadline for the entire request lifecycle.
-        deadline = time.time() + self.global_timeout
+        if request_deadline is not None:
+            deadline = float(request_deadline)
+        else:
+            deadline = time.time() + self.global_timeout
+        if count_as_real_request:
+            self.usage_manager.note_real_request()
 
         # Create transaction logger if request logging is enabled
         transaction_logger = None
@@ -1475,25 +1587,6 @@ class RotatingClient:
                 parent_dir=parent_log_dir,
             )
             transaction_logger.log_request(kwargs)
-
-        # Create a mutable copy of the keys and shuffle it to ensure
-        # that the key selection is randomized, which is crucial when
-        # multiple keys have the same usage stats.
-        credentials_for_provider = list(self.all_credentials[provider])
-        random.shuffle(credentials_for_provider)
-
-        # Filter out credentials that are unavailable (queued for re-auth)
-        provider_plugin = self._get_provider_instance(provider)
-        if provider_plugin and hasattr(provider_plugin, "is_credential_available"):
-            available_creds = [
-                cred
-                for cred in credentials_for_provider
-                if provider_plugin.is_credential_available(cred)
-            ]
-            if available_creds:
-                credentials_for_provider = available_creds
-            # If all credentials are unavailable, keep the original list
-            # (better to try unavailable creds than fail immediately)
 
         tried_creds = set()
         last_exception = None
@@ -1508,79 +1601,15 @@ class RotatingClient:
             model = resolved_model
             kwargs["model"] = model  # Ensure kwargs has the resolved model for litellm
 
-        # [NEW] Filter by model tier requirement and build priority map
-        credential_priorities = None
-        if provider_plugin and hasattr(provider_plugin, "get_model_tier_requirement"):
-            required_tier = provider_plugin.get_model_tier_requirement(model)
-            if required_tier is not None:
-                # Filter OUT only credentials we KNOW are too low priority
-                # Keep credentials with unknown priority (None) - they might be high priority
-                incompatible_creds = []
-                compatible_creds = []
-                unknown_creds = []
-
-                for cred in credentials_for_provider:
-                    if hasattr(provider_plugin, "get_credential_priority"):
-                        priority = provider_plugin.get_credential_priority(cred)
-                        if priority is None:
-                            # Unknown priority - keep it, will be discovered on first use
-                            unknown_creds.append(cred)
-                        elif priority <= required_tier:
-                            # Known compatible priority
-                            compatible_creds.append(cred)
-                        else:
-                            # Known incompatible priority (too low)
-                            incompatible_creds.append(cred)
-                    else:
-                        # Provider doesn't support priorities - keep all
-                        unknown_creds.append(cred)
-
-                # If we have any known-compatible or unknown credentials, use them
-                tier_compatible_creds = compatible_creds + unknown_creds
-                if tier_compatible_creds:
-                    credentials_for_provider = tier_compatible_creds
-                    if compatible_creds and unknown_creds:
-                        lib_logger.info(
-                            f"Model {model} requires priority <= {required_tier}. "
-                            f"Using {len(compatible_creds)} known-compatible + {len(unknown_creds)} unknown-tier credentials."
-                        )
-                    elif compatible_creds:
-                        lib_logger.info(
-                            f"Model {model} requires priority <= {required_tier}. "
-                            f"Using {len(compatible_creds)} known-compatible credentials."
-                        )
-                    else:
-                        lib_logger.info(
-                            f"Model {model} requires priority <= {required_tier}. "
-                            f"Using {len(unknown_creds)} unknown-tier credentials (will discover on use)."
-                        )
-                elif incompatible_creds:
-                    # Only known-incompatible credentials remain
-                    lib_logger.warning(
-                        f"Model {model} requires priority <= {required_tier} credentials, "
-                        f"but all {len(incompatible_creds)} known credentials have priority > {required_tier}. "
-                        f"Request will likely fail."
-                    )
-
-        # Build priority map and tier names map for usage_manager
-        credential_tier_names = None
-        if provider_plugin and hasattr(provider_plugin, "get_credential_priority"):
-            credential_priorities = {}
-            credential_tier_names = {}
-            for cred in credentials_for_provider:
-                priority = provider_plugin.get_credential_priority(cred)
-                if priority is not None:
-                    credential_priorities[cred] = priority
-                # Also get tier name for logging
-                if hasattr(provider_plugin, "get_credential_tier_name"):
-                    tier_name = provider_plugin.get_credential_tier_name(cred)
-                    if tier_name:
-                        credential_tier_names[cred] = tier_name
-
-            if credential_priorities:
-                lib_logger.debug(
-                    f"Credential priorities for {provider}: {', '.join(f'P{p}={len([c for c in credentials_for_provider if credential_priorities.get(c) == p])}' for p in sorted(set(credential_priorities.values())))}"
-                )
+        provider_context = self._build_provider_credential_context(
+            provider,
+            model,
+            credentials_override=[forced_credential] if forced_credential else None,
+        )
+        credentials_for_provider = provider_context["credentials"]
+        provider_plugin = provider_context["provider_plugin"]
+        credential_priorities = provider_context["credential_priorities"]
+        credential_tier_names = provider_context["credential_tier_names"]
 
         # Initialize error accumulator for tracking errors across credential rotation
         error_accumulator = RequestErrorAccumulator()
@@ -1597,48 +1626,58 @@ class RotatingClient:
                 if not await self._wait_for_provider_cooldown(provider, deadline):
                     break
 
-                creds_to_try = [
-                    c for c in credentials_for_provider if c not in tried_creds
-                ]
-                if not creds_to_try:
-                    break
+                if (
+                    key_already_acquired
+                    and forced_credential
+                    and forced_credential not in tried_creds
+                ):
+                    current_cred = forced_credential
+                    key_acquired = True
+                    tried_creds.add(current_cred)
+                    key_already_acquired = False
+                else:
+                    creds_to_try = [
+                        c for c in credentials_for_provider if c not in tried_creds
+                    ]
+                    if not creds_to_try:
+                        break
 
-                # Get count of credentials not on cooldown for this model
-                availability_stats = (
-                    await self.usage_manager.get_credential_availability_stats(
-                        creds_to_try, model, credential_priorities
+                    # Get count of credentials not on cooldown for this model
+                    availability_stats = (
+                        await self.usage_manager.get_credential_availability_stats(
+                            creds_to_try, model, credential_priorities
+                        )
                     )
-                )
-                available_count = availability_stats["available"]
-                total_count = len(credentials_for_provider)
-                on_cooldown = availability_stats["on_cooldown"]
-                fc_excluded = availability_stats["fair_cycle_excluded"]
+                    available_count = availability_stats["available"]
+                    total_count = len(credentials_for_provider)
+                    on_cooldown = availability_stats["on_cooldown"]
+                    fc_excluded = availability_stats["fair_cycle_excluded"]
 
-                # Build compact exclusion breakdown
-                exclusion_parts = []
-                if on_cooldown > 0:
-                    exclusion_parts.append(f"cd:{on_cooldown}")
-                if fc_excluded > 0:
-                    exclusion_parts.append(f"fc:{fc_excluded}")
-                exclusion_str = (
-                    f",{','.join(exclusion_parts)}" if exclusion_parts else ""
-                )
+                    # Build compact exclusion breakdown
+                    exclusion_parts = []
+                    if on_cooldown > 0:
+                        exclusion_parts.append(f"cd:{on_cooldown}")
+                    if fc_excluded > 0:
+                        exclusion_parts.append(f"fc:{fc_excluded}")
+                    exclusion_str = (
+                        f",{','.join(exclusion_parts)}" if exclusion_parts else ""
+                    )
 
-                lib_logger.info(
-                    f"Acquiring key for model {model}. Tried keys: {len(tried_creds)}/{available_count}({total_count}{exclusion_str})"
-                )
-                max_concurrent = self.max_concurrent_requests_per_key.get(provider, 1)
-                current_cred = await self.usage_manager.acquire_key(
-                    available_keys=creds_to_try,
-                    model=model,
-                    deadline=deadline,
-                    max_concurrent=max_concurrent,
-                    credential_priorities=credential_priorities,
-                    credential_tier_names=credential_tier_names,
-                    all_provider_credentials=credentials_for_provider,
-                )
-                key_acquired = True
-                tried_creds.add(current_cred)
+                    lib_logger.info(
+                        f"Acquiring key for model {model}. Tried keys: {len(tried_creds)}/{available_count}({total_count}{exclusion_str})"
+                    )
+                    max_concurrent = self.max_concurrent_requests_per_key.get(provider, 1)
+                    current_cred = await self.usage_manager.acquire_key(
+                        available_keys=creds_to_try,
+                        model=model,
+                        deadline=deadline,
+                        max_concurrent=max_concurrent,
+                        credential_priorities=credential_priorities,
+                        credential_tier_names=credential_tier_names,
+                        all_provider_credentials=credentials_for_provider,
+                    )
+                    key_acquired = True
+                    tried_creds.add(current_cred)
 
                 litellm_kwargs = kwargs.copy()
 
@@ -1694,6 +1733,7 @@ class RotatingClient:
                                             f"Pre-request callback failed but abort_on_callback_error is False. Proceeding with request. Error: {e}"
                                         )
 
+                            attempt_started_at = time.perf_counter()
                             response = await self._await_with_deadline(
                                 provider_plugin.acompletion(
                                     self.http_client, **litellm_kwargs
@@ -1705,7 +1745,11 @@ class RotatingClient:
 
                             # For non-streaming, success is immediate
                             await self.usage_manager.record_success(
-                                current_cred, model, response
+                                current_cred,
+                                model,
+                                response,
+                                latency_ms=(time.perf_counter() - attempt_started_at)
+                                * 1000,
                             )
 
                             await self.usage_manager.release_key(current_cred, model)
@@ -1796,6 +1840,25 @@ class RotatingClient:
                                 )
                                 lib_logger.warning(
                                     f"Cred {mask_credential(current_cred)} failed after max retries. Rotating."
+                                )
+                                break
+
+                            can_retry_same_key = (
+                                bool(allow_same_key_retry)
+                                if allow_same_key_retry is not None
+                                else await self._can_retry_same_key_provider_local(
+                                    provider,
+                                    model,
+                                    credentials_for_provider,
+                                    current_cred,
+                                )
+                            )
+                            if not can_retry_same_key:
+                                error_accumulator.record_error(
+                                    current_cred, classified_error, error_message
+                                )
+                                lib_logger.warning(
+                                    f"Cred {mask_credential(current_cred)} hit a transient server error but other hot credentials are available. Rotating immediately."
                                 )
                                 break
 
@@ -1940,6 +2003,7 @@ class RotatingClient:
                                 final_kwargs, deadline, streaming=False
                             )
 
+                            attempt_started_at = time.perf_counter()
                             response = await self._await_with_deadline(
                                 api_call(
                                     **final_kwargs,
@@ -1951,7 +2015,11 @@ class RotatingClient:
                             )
 
                             await self.usage_manager.record_success(
-                                current_cred, model, response
+                                current_cred,
+                                model,
+                                response,
+                                latency_ms=(time.perf_counter() - attempt_started_at)
+                                * 1000,
                             )
 
                             await self.usage_manager.release_key(current_cred, model)
@@ -2038,6 +2106,25 @@ class RotatingClient:
                                 )
                                 break  # Move to the next key
 
+                            can_retry_same_key = (
+                                bool(allow_same_key_retry)
+                                if allow_same_key_retry is not None
+                                else await self._can_retry_same_key_provider_local(
+                                    provider,
+                                    model,
+                                    credentials_for_provider,
+                                    current_cred,
+                                )
+                            )
+                            if not can_retry_same_key:
+                                error_accumulator.record_error(
+                                    current_cred, classified_error, error_message
+                                )
+                                lib_logger.warning(
+                                    f"Key {mask_credential(current_cred)} hit a transient server error but another hot credential is available. Rotating immediately."
+                                )
+                                break
+
                             # For temporary errors, wait before retrying with the same key.
                             wait_time = classified_error.retry_after or (
                                 2**attempt
@@ -2101,6 +2188,24 @@ class RotatingClient:
                                 should_retry_same_key(classified_error)
                                 and attempt < self.max_retries - 1
                             ):
+                                can_retry_same_key = (
+                                    bool(allow_same_key_retry)
+                                    if allow_same_key_retry is not None
+                                    else await self._can_retry_same_key_provider_local(
+                                        provider,
+                                        model,
+                                        credentials_for_provider,
+                                        current_cred,
+                                    )
+                                )
+                                if not can_retry_same_key:
+                                    await self.usage_manager.record_failure(
+                                        current_cred, model, classified_error
+                                    )
+                                    lib_logger.info(
+                                        f"Rotating to next key after {classified_error.error_type} error because another hot credential is available."
+                                    )
+                                    break
                                 wait_time = classified_error.retry_after or (
                                     2**attempt
                                 ) + random.uniform(0, 1)
@@ -2168,7 +2273,9 @@ class RotatingClient:
                             break  # Try next key for other errors
             finally:
                 if key_acquired and current_cred:
-                    await self.usage_manager.release_key(current_cred, model)
+                    await self.usage_manager.release_key(
+                        current_cred, acquired_model or model
+                    )
 
         # Check if we exhausted all credentials or timed out
         if time.time() >= deadline:
@@ -2200,25 +2307,23 @@ class RotatingClient:
 
         # Extract internal logging parameters (not passed to API)
         parent_log_dir = kwargs.pop("_parent_log_dir", None)
+        forced_credential = kwargs.pop("_forced_credential", None)
+        request_deadline = kwargs.pop("_request_deadline", None)
+        allow_rotation = kwargs.pop("_allow_rotation", forced_credential is None)
+        allow_same_key_retry = kwargs.pop("_allow_same_key_retry", None)
+        key_already_acquired = kwargs.pop("_key_already_acquired", False)
+        acquired_model = kwargs.pop("_acquired_model", None)
+        count_as_real_request = kwargs.pop("_count_as_real_request", True)
+        if forced_credential is not None and allow_same_key_retry is None:
+            allow_same_key_retry = False
 
-        # Create a mutable copy of the keys and shuffle it.
-        credentials_for_provider = list(self.all_credentials[provider])
-        random.shuffle(credentials_for_provider)
-
-        # Filter out credentials that are unavailable (queued for re-auth)
-        provider_plugin = self._get_provider_instance(provider)
-        if provider_plugin and hasattr(provider_plugin, "is_credential_available"):
-            available_creds = [
-                cred
-                for cred in credentials_for_provider
-                if provider_plugin.is_credential_available(cred)
-            ]
-            if available_creds:
-                credentials_for_provider = available_creds
-            # If all credentials are unavailable, keep the original list
-            # (better to try unavailable creds than fail immediately)
-
-        deadline = time.time() + self.global_timeout
+        deadline = (
+            float(request_deadline)
+            if request_deadline is not None
+            else time.time() + self.global_timeout
+        )
+        if count_as_real_request:
+            self.usage_manager.note_real_request()
 
         # Create transaction logger if request logging is enabled
         transaction_logger = None
@@ -2245,79 +2350,15 @@ class RotatingClient:
             model = resolved_model
             kwargs["model"] = model  # Ensure kwargs has the resolved model for litellm
 
-        # [NEW] Filter by model tier requirement and build priority map
-        credential_priorities = None
-        if provider_plugin and hasattr(provider_plugin, "get_model_tier_requirement"):
-            required_tier = provider_plugin.get_model_tier_requirement(model)
-            if required_tier is not None:
-                # Filter OUT only credentials we KNOW are too low priority
-                # Keep credentials with unknown priority (None) - they might be high priority
-                incompatible_creds = []
-                compatible_creds = []
-                unknown_creds = []
-
-                for cred in credentials_for_provider:
-                    if hasattr(provider_plugin, "get_credential_priority"):
-                        priority = provider_plugin.get_credential_priority(cred)
-                        if priority is None:
-                            # Unknown priority - keep it, will be discovered on first use
-                            unknown_creds.append(cred)
-                        elif priority <= required_tier:
-                            # Known compatible priority
-                            compatible_creds.append(cred)
-                        else:
-                            # Known incompatible priority (too low)
-                            incompatible_creds.append(cred)
-                    else:
-                        # Provider doesn't support priorities - keep all
-                        unknown_creds.append(cred)
-
-                # If we have any known-compatible or unknown credentials, use them
-                tier_compatible_creds = compatible_creds + unknown_creds
-                if tier_compatible_creds:
-                    credentials_for_provider = tier_compatible_creds
-                    if compatible_creds and unknown_creds:
-                        lib_logger.info(
-                            f"Model {model} requires priority <= {required_tier}. "
-                            f"Using {len(compatible_creds)} known-compatible + {len(unknown_creds)} unknown-tier credentials."
-                        )
-                    elif compatible_creds:
-                        lib_logger.info(
-                            f"Model {model} requires priority <= {required_tier}. "
-                            f"Using {len(compatible_creds)} known-compatible credentials."
-                        )
-                    else:
-                        lib_logger.info(
-                            f"Model {model} requires priority <= {required_tier}. "
-                            f"Using {len(unknown_creds)} unknown-tier credentials (will discover on use)."
-                        )
-                elif incompatible_creds:
-                    # Only known-incompatible credentials remain
-                    lib_logger.warning(
-                        f"Model {model} requires priority <= {required_tier} credentials, "
-                        f"but all {len(incompatible_creds)} known credentials have priority > {required_tier}. "
-                        f"Request will likely fail."
-                    )
-
-        # Build priority map and tier names map for usage_manager
-        credential_tier_names = None
-        if provider_plugin and hasattr(provider_plugin, "get_credential_priority"):
-            credential_priorities = {}
-            credential_tier_names = {}
-            for cred in credentials_for_provider:
-                priority = provider_plugin.get_credential_priority(cred)
-                if priority is not None:
-                    credential_priorities[cred] = priority
-                # Also get tier name for logging
-                if hasattr(provider_plugin, "get_credential_tier_name"):
-                    tier_name = provider_plugin.get_credential_tier_name(cred)
-                    if tier_name:
-                        credential_tier_names[cred] = tier_name
-
-            if credential_priorities:
-                lib_logger.debug(
-                    f"Credential priorities for {provider}: {', '.join(f'P{p}={len([c for c in credentials_for_provider if credential_priorities.get(c) == p])}' for p in sorted(set(credential_priorities.values())))}"
-                )
+        provider_context = self._build_provider_credential_context(
+            provider,
+            model,
+            credentials_override=[forced_credential] if forced_credential else None,
+        )
+        credentials_for_provider = provider_context["credentials"]
+        provider_plugin = provider_context["provider_plugin"]
+        credential_priorities = provider_context["credential_priorities"]
+        credential_tier_names = provider_context["credential_tier_names"]
 
         # Initialize error accumulator for tracking errors across credential rotation
         error_accumulator = RequestErrorAccumulator()
@@ -2335,53 +2376,63 @@ class RotatingClient:
                     if not await self._wait_for_provider_cooldown(provider, deadline):
                         break
 
-                    creds_to_try = [
-                        c for c in credentials_for_provider if c not in tried_creds
-                    ]
-                    if not creds_to_try:
-                        lib_logger.warning(
-                            f"All credentials for provider {provider} have been tried. No more credentials to rotate to."
+                    if (
+                        key_already_acquired
+                        and forced_credential
+                        and forced_credential not in tried_creds
+                    ):
+                        current_cred = forced_credential
+                        key_acquired = True
+                        tried_creds.add(current_cred)
+                        key_already_acquired = False
+                    else:
+                        creds_to_try = [
+                            c for c in credentials_for_provider if c not in tried_creds
+                        ]
+                        if not creds_to_try:
+                            lib_logger.warning(
+                                f"All credentials for provider {provider} have been tried. No more credentials to rotate to."
+                            )
+                            break
+
+                        # Get count of credentials not on cooldown for this model
+                        availability_stats = (
+                            await self.usage_manager.get_credential_availability_stats(
+                                creds_to_try, model, credential_priorities
+                            )
                         )
-                        break
+                        available_count = availability_stats["available"]
+                        total_count = len(credentials_for_provider)
+                        on_cooldown = availability_stats["on_cooldown"]
+                        fc_excluded = availability_stats["fair_cycle_excluded"]
 
-                    # Get count of credentials not on cooldown for this model
-                    availability_stats = (
-                        await self.usage_manager.get_credential_availability_stats(
-                            creds_to_try, model, credential_priorities
+                        # Build compact exclusion breakdown
+                        exclusion_parts = []
+                        if on_cooldown > 0:
+                            exclusion_parts.append(f"cd:{on_cooldown}")
+                        if fc_excluded > 0:
+                            exclusion_parts.append(f"fc:{fc_excluded}")
+                        exclusion_str = (
+                            f",{','.join(exclusion_parts)}" if exclusion_parts else ""
                         )
-                    )
-                    available_count = availability_stats["available"]
-                    total_count = len(credentials_for_provider)
-                    on_cooldown = availability_stats["on_cooldown"]
-                    fc_excluded = availability_stats["fair_cycle_excluded"]
 
-                    # Build compact exclusion breakdown
-                    exclusion_parts = []
-                    if on_cooldown > 0:
-                        exclusion_parts.append(f"cd:{on_cooldown}")
-                    if fc_excluded > 0:
-                        exclusion_parts.append(f"fc:{fc_excluded}")
-                    exclusion_str = (
-                        f",{','.join(exclusion_parts)}" if exclusion_parts else ""
-                    )
-
-                    lib_logger.info(
-                        f"Acquiring credential for model {model}. Tried credentials: {len(tried_creds)}/{available_count}({total_count}{exclusion_str})"
-                    )
-                    max_concurrent = self.max_concurrent_requests_per_key.get(
-                        provider, 1
-                    )
-                    current_cred = await self.usage_manager.acquire_key(
-                        available_keys=creds_to_try,
-                        model=model,
-                        deadline=deadline,
-                        max_concurrent=max_concurrent,
-                        credential_priorities=credential_priorities,
-                        credential_tier_names=credential_tier_names,
-                        all_provider_credentials=credentials_for_provider,
-                    )
-                    key_acquired = True
-                    tried_creds.add(current_cred)
+                        lib_logger.info(
+                            f"Acquiring credential for model {model}. Tried credentials: {len(tried_creds)}/{available_count}({total_count}{exclusion_str})"
+                        )
+                        max_concurrent = self.max_concurrent_requests_per_key.get(
+                            provider, 1
+                        )
+                        current_cred = await self.usage_manager.acquire_key(
+                            available_keys=creds_to_try,
+                            model=model,
+                            deadline=deadline,
+                            max_concurrent=max_concurrent,
+                            credential_priorities=credential_priorities,
+                            credential_tier_names=credential_tier_names,
+                            all_provider_credentials=credentials_for_provider,
+                        )
+                        key_acquired = True
+                        tried_creds.add(current_cred)
 
                     litellm_kwargs = kwargs.copy()
                     if "reasoning_effort" in kwargs:
@@ -2443,6 +2494,7 @@ class RotatingClient:
                                                 f"Pre-request callback failed but abort_on_callback_error is False. Proceeding with request. Error: {e}"
                                             )
 
+                                attempt_started_at = time.perf_counter()
                                 response = await self._await_with_deadline(
                                     provider_plugin.acompletion(
                                         self.http_client, **litellm_kwargs
@@ -2467,6 +2519,10 @@ class RotatingClient:
                                         deadline, streaming=True
                                     ),
                                     deadline=deadline,
+                                    initial_latency_ms=(
+                                        time.perf_counter() - attempt_started_at
+                                    )
+                                    * 1000,
                                 )
 
                                 # Wrap with transaction logging
@@ -2559,6 +2615,25 @@ class RotatingClient:
                                     )
                                     lib_logger.warning(
                                         f"Cred {mask_credential(current_cred)} failed after max retries. Rotating."
+                                    )
+                                    break
+
+                                can_retry_same_key = (
+                                    bool(allow_same_key_retry)
+                                    if allow_same_key_retry is not None
+                                    else await self._can_retry_same_key_provider_local(
+                                        provider,
+                                        model,
+                                        credentials_for_provider,
+                                        current_cred,
+                                    )
+                                )
+                                if not can_retry_same_key:
+                                    error_accumulator.record_error(
+                                        current_cred, classified_error, error_message
+                                    )
+                                    lib_logger.warning(
+                                        f"Cred {mask_credential(current_cred)} hit a transient server error but other hot credentials are available. Rotating immediately."
                                     )
                                     break
 
@@ -2705,6 +2780,7 @@ class RotatingClient:
                                 final_kwargs, deadline, streaming=True
                             )
 
+                            attempt_started_at = time.perf_counter()
                             response = await self._await_with_deadline(
                                 litellm.acompletion(
                                     **final_kwargs,
@@ -2730,6 +2806,10 @@ class RotatingClient:
                                     deadline, streaming=True
                                 ),
                                 deadline=deadline,
+                                initial_latency_ms=(
+                                    time.perf_counter() - attempt_started_at
+                                )
+                                * 1000,
                             )
 
                             # Wrap with transaction logging
@@ -2901,6 +2981,22 @@ class RotatingClient:
                                 # [MODIFIED] Do not yield to the client here.
                                 break
 
+                            can_retry_same_key = (
+                                bool(allow_same_key_retry)
+                                if allow_same_key_retry is not None
+                                else await self._can_retry_same_key_provider_local(
+                                    provider,
+                                    model,
+                                    credentials_for_provider,
+                                    current_cred,
+                                )
+                            )
+                            if not can_retry_same_key:
+                                lib_logger.warning(
+                                    f"Credential {mask_credential(current_cred)} hit a transient server error but another hot credential is available. Rotating immediately."
+                                )
+                                break
+
                             wait_time = classified_error.retry_after or (
                                 2**attempt
                             ) + random.uniform(0, 1)
@@ -2964,7 +3060,9 @@ class RotatingClient:
 
                 finally:
                     if key_acquired and current_cred:
-                        await self.usage_manager.release_key(current_cred, model)
+                        await self.usage_manager.release_key(
+                            current_cred, acquired_model or model
+                        )
 
             # Build detailed error response using error accumulator
             error_accumulator.timeout_occurred = time.time() >= deadline
