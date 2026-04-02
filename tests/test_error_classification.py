@@ -54,6 +54,19 @@ def test_bad_request_auth_message_is_classified_as_authentication(monkeypatch):
     assert error_handler.should_rotate_on_error(classified) is True
 
 
+def test_bad_request_invalid_iam_token_is_classified_as_authentication(monkeypatch):
+    _, litellm_ex = _install_litellm_stubs(monkeypatch)
+    error_handler = _load_error_handler()
+
+    err = litellm_ex.BadRequestError(
+        "litellm.BadRequestError: OpenAIException - invalid_iam_token"
+    )
+    classified = error_handler.classify_error(err)
+
+    assert classified.error_type == "authentication"
+    assert error_handler.should_rotate_on_error(classified) is True
+
+
 def test_bad_request_forbidden_message_is_classified_as_forbidden(monkeypatch):
     _, litellm_ex = _install_litellm_stubs(monkeypatch)
     error_handler = _load_error_handler()
