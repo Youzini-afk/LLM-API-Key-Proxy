@@ -89,20 +89,20 @@ def _should_fallback(error_type: str) -> bool:
 
 
 async def _await_target_timeout(
-    awaitable: Any, timeout_seconds: int, target_model: str
+    awaitable: Any, timeout_seconds: float, target_model: str
 ) -> Any:
     """Enforce per-target timeout budget for non-streaming virtual model attempts."""
     try:
         return await asyncio.wait_for(awaitable, timeout=timeout_seconds)
     except TimeoutError as exc:
         raise TimeoutError(
-            f"Virtual model target '{target_model}' timed out after {timeout_seconds}s"
+            f"Virtual model target '{target_model}' timed out after {timeout_seconds:.2f}s"
         ) from exc
 
 
 async def _iter_stream_with_initial_timeout(
     stream: AsyncGenerator[str, None],
-    timeout_seconds: int,
+    timeout_seconds: float,
     target_model: str,
 ) -> AsyncGenerator[str, None]:
     """Fail over if a target does not produce its first streaming chunk in time."""
@@ -113,7 +113,7 @@ async def _iter_stream_with_initial_timeout(
         return
     except TimeoutError as exc:
         raise TimeoutError(
-            f"Virtual model target '{target_model}' produced no stream data within {timeout_seconds}s"
+            f"Virtual model target '{target_model}' produced no stream data within {timeout_seconds:.2f}s"
         ) from exc
 
     yield first_chunk
@@ -148,6 +148,36 @@ def _add_virtual_model_headers(
     return headers
 
 
+def _resolve_overall_timeout_seconds(client: Any, config: VirtualModelConfig) -> float:
+    """
+    Use the proxy-wide request budget when available so aggregate fallback cannot
+    multiply latency across targets.
+    """
+    raw_timeout = getattr(client, "global_timeout", None)
+    try:
+        parsed_timeout = float(raw_timeout) if raw_timeout is not None else None
+    except (TypeError, ValueError):
+        parsed_timeout = None
+
+    if parsed_timeout and parsed_timeout > 0:
+        return parsed_timeout
+    return float(config.timeout_seconds)
+
+
+def _compute_target_timeout(
+    deadline: float,
+    per_target_timeout_seconds: int,
+    target_model: str,
+) -> float:
+    """Clamp each target attempt to the remaining aggregate request budget."""
+    remaining_budget = deadline - time.monotonic()
+    if remaining_budget <= 0:
+        raise TimeoutError(
+            f"Virtual model request budget exhausted before trying target '{target_model}'"
+        )
+    return min(float(per_target_timeout_seconds), remaining_budget)
+
+
 # ---------------------------------------------------------------------------
 # Non-streaming execution
 # ---------------------------------------------------------------------------
@@ -178,6 +208,8 @@ async def execute_virtual_completion(
         )
 
     failures: List[TargetFailure] = []
+    overall_timeout_seconds = _resolve_overall_timeout_seconds(client, config)
+    deadline = time.monotonic() + overall_timeout_seconds
 
     for idx, target in enumerate(targets):
         target_model = target.model
@@ -190,9 +222,22 @@ async def execute_virtual_completion(
         modified_data = {**request_data, "model": target_model}
 
         try:
+            attempt_timeout = _compute_target_timeout(
+                deadline,
+                config.timeout_seconds,
+                target_model,
+            )
+        except TimeoutError as e:
+            logger.warning(
+                f"[VirtualModel] Aggregate request budget exhausted before "
+                f"target {target_model} could start: {e}"
+            )
+            break
+
+        try:
             result = await _await_target_timeout(
                 client.acompletion(request=request, **modified_data),
-                config.timeout_seconds,
+                attempt_timeout,
                 target_model,
             )
 
@@ -259,6 +304,17 @@ async def execute_virtual_completion(
             continue  # Try next target
 
     # All targets exhausted
+    if not failures:
+        failures.append(
+            TargetFailure(
+                target=virtual_model_name,
+                reason=(
+                    f"Virtual model request exhausted its shared "
+                    f"{overall_timeout_seconds:.2f}s budget before any target started"
+                ),
+                error_type="timeout",
+            )
+        )
     logger.error(
         f"[VirtualModel] All {len(failures)} target(s) failed for "
         f"virtual model '{virtual_model_name}'"
@@ -299,6 +355,8 @@ async def execute_virtual_completion_streaming(
     # so that FastAPI can stream the response.
     actual_target = ""
     fallback_count = 0
+    overall_timeout_seconds = _resolve_overall_timeout_seconds(client, config)
+    deadline = time.monotonic() + overall_timeout_seconds
 
     async def _streaming_with_fallback() -> AsyncGenerator[str, None]:
         nonlocal actual_target, fallback_count
@@ -314,9 +372,22 @@ async def execute_virtual_completion_streaming(
             modified_data = {**request_data, "model": target_model}
 
             try:
+                attempt_timeout = _compute_target_timeout(
+                    deadline,
+                    config.timeout_seconds,
+                    target_model,
+                )
+            except TimeoutError as e:
+                logger.warning(
+                    f"[VirtualModel] Streaming aggregate budget exhausted before "
+                    f"target {target_model} could start: {e}"
+                )
+                break
+
+            try:
                 stream = _iter_stream_with_initial_timeout(
                     client.acompletion(request=request, **modified_data),
-                    config.timeout_seconds,
+                    attempt_timeout,
                     target_model,
                 )
 
@@ -440,6 +511,17 @@ async def execute_virtual_completion_streaming(
                 continue
 
         # All targets exhausted
+        if not failures:
+            failures.append(
+                TargetFailure(
+                    target=virtual_model_name,
+                    reason=(
+                        f"Virtual model request exhausted its shared "
+                        f"{overall_timeout_seconds:.2f}s budget before any target started"
+                    ),
+                    error_type="timeout",
+                )
+            )
         logger.error(
             f"[VirtualModel] Streaming: all {len(failures)} target(s) failed "
             f"for '{virtual_model_name}'"

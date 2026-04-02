@@ -636,18 +636,12 @@ async def rebuild_runtime_client(app: FastAPI) -> Dict[str, Any]:
         "credential_provider_count": len(new_client.all_credentials),
     }
 
-
-api_keys = discover_api_keys_from_env()
-provider_runtime_types = discover_provider_types_from_env()
-ignore_models = discover_ignore_models_from_env()
-whitelist_models = discover_whitelist_models_from_env()
-max_concurrent_requests_per_key = discover_max_concurrent_requests_per_key_from_env()
-
-
 # --- Lifespan Management ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage the RotatingClient's lifecycle with the app's lifespan."""
+    _prime_runtime_from_admin_config()
+
     # [MODIFIED] Perform skippable OAuth initialization at startup
     skip_oauth_init = os.getenv("SKIP_OAUTH_INIT_CHECK", "false").lower() == "true"
 
@@ -805,27 +799,9 @@ async def lifespan(app: FastAPI):
         logging.info("OAuth credential processing complete.")
         oauth_credentials = final_oauth_credentials
 
-    # [NEW] Load provider-specific params
-    litellm_provider_params = {
-        "gemini_cli": {"project_id": os.getenv("GEMINI_CLI_PROJECT_ID")}
-    }
-
-    # Load global timeout from environment (default 30 seconds)
-    global_timeout = int(os.getenv("GLOBAL_TIMEOUT", "30"))
-
-    # The client now uses the root logger configuration
-    client = RotatingClient(
-        api_keys=api_keys,
-        oauth_credentials=oauth_credentials,  # Pass OAuth config
-        configure_logging=True,
-        global_timeout=global_timeout,
-        litellm_provider_params=litellm_provider_params,
-        ignore_models=ignore_models,
-        whitelist_models=whitelist_models,
-        enable_request_logging=ENABLE_REQUEST_LOGGING,
-        max_concurrent_requests_per_key=max_concurrent_requests_per_key,
-        provider_runtime_types=provider_runtime_types,
-    )
+    # Build the runtime client from the fully merged environment so startup
+    # matches the admin-config-driven runtime reload path.
+    client = build_rotating_client_from_env(oauth_credentials=oauth_credentials)
 
     # Log loaded credentials summary (compact, always visible for deployment verification)
     # _api_summary = ', '.join([f"{p}:{len(c)}" for p, c in api_keys.items()]) if api_keys else "none"
@@ -936,8 +912,9 @@ if _webui_dir.is_dir():
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
 
-def get_rotating_client(request: Request) -> RotatingClient:
+async def get_rotating_client(request: Request) -> RotatingClient:
     """Dependency to get the rotating client instance from the app state."""
+    await _ensure_runtime_synced(request.app)
     return request.app.state.rotating_client
 
 
@@ -945,6 +922,44 @@ def get_rotating_client(request: Request) -> RotatingClient:
 _last_synced_admin_version: Optional[int] = None
 _managed_overlay_keys: set = set()
 _runtime_sync_lock = asyncio.Lock()
+
+
+def _apply_managed_runtime_overlay(overlay: Dict[str, str]) -> Dict[str, Any]:
+    """Apply the admin-managed env overlay and clear stale managed keys."""
+    global _managed_overlay_keys
+
+    next_keys = set(overlay.keys())
+    removed_stale_keys = sorted(_managed_overlay_keys - next_keys)
+    for key in removed_stale_keys:
+        os.environ.pop(key, None)
+
+    for key, value in overlay.items():
+        os.environ[key] = value
+
+    _managed_overlay_keys = next_keys
+    return {
+        "overlay_keys": sorted(next_keys),
+        "removed_stale_keys": removed_stale_keys,
+    }
+
+
+def _prime_runtime_from_admin_config() -> Optional[int]:
+    """Seed process env from admin_config before the first runtime client exists."""
+    global _last_synced_admin_version
+
+    try:
+        cfg = admin_service.get_config()
+        overlay = admin_service.build_runtime_env_overlay()
+        apply_result = _apply_managed_runtime_overlay(overlay)
+        _last_synced_admin_version = cfg.metadata.version
+        logging.info(
+            f"[AutoSync] Primed startup runtime from admin config v{cfg.metadata.version} "
+            f"(overlay={len(apply_result['overlay_keys'])} key(s))"
+        )
+        return cfg.metadata.version
+    except Exception as e:
+        logging.warning(f"[AutoSync] Failed to prime startup runtime from admin config: {e}")
+        return None
 
 
 async def _ensure_runtime_synced(app: FastAPI) -> Dict[str, Any]:
@@ -985,16 +1000,8 @@ async def _ensure_runtime_synced(app: FastAPI) -> Dict[str, Any]:
 
             # 1) Build and apply FULL env overlay (channels + virtual models + policies)
             overlay = admin_service.build_runtime_env_overlay()
+            _apply_managed_runtime_overlay(overlay)
             next_keys = set(overlay.keys())
-
-            # Clean stale env keys from previous overlay
-            for key in (_managed_overlay_keys - next_keys):
-                os.environ.pop(key, None)
-
-            # Apply new overlay
-            for k, v in overlay.items():
-                os.environ[k] = v
-            _managed_overlay_keys = next_keys
 
             # 2) Reload virtual model registry
             vm = load_virtual_models()
@@ -1071,8 +1078,9 @@ def _key_status_from_cred_entry(cred: Dict[str, Any]) -> str:
     return "active" if status == "active" else "exhausted"
 
 
-def get_embedding_batcher(request: Request) -> EmbeddingBatcher:
+async def get_embedding_batcher(request: Request) -> Optional[EmbeddingBatcher]:
     """Dependency to get the embedding batcher instance from the app state."""
+    await _ensure_runtime_synced(request.app)
     return request.app.state.embedding_batcher
 
 
@@ -1368,7 +1376,6 @@ async def chat_completions(
             execute_virtual_completion, execute_virtual_completion_streaming,
         )
 
-        await _ensure_runtime_synced(request.app)
         # Read and parse the request body only once at the beginning.
         try:
             request_data = await request.json()

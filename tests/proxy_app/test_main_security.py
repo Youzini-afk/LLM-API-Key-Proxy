@@ -2,6 +2,7 @@ import importlib
 import sys
 import types
 import importlib.util
+import os
 
 import pytest
 from fastapi import HTTPException
@@ -192,3 +193,56 @@ async def test_streaming_response_wrapper_closes_underlying_stream_on_disconnect
 
     assert collected == []
     assert stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_get_rotating_client_returns_runtime_synced_instance(monkeypatch):
+    main_mod = _reload_main(monkeypatch)
+    original_client = object()
+    refreshed_client = object()
+
+    class _State:
+        rotating_client = original_client
+
+    class _App:
+        state = _State()
+
+    class _Request:
+        app = _App()
+
+    async def _fake_sync(app):
+        app.state.rotating_client = refreshed_client
+        return {}
+
+    monkeypatch.setattr(main_mod, "_ensure_runtime_synced", _fake_sync)
+
+    client = await main_mod.get_rotating_client(_Request())
+
+    assert client is refreshed_client
+
+
+def test_prime_runtime_from_admin_config_applies_overlay(monkeypatch):
+    main_mod = _reload_main(monkeypatch)
+    cfg = types.SimpleNamespace(metadata=types.SimpleNamespace(version=7))
+
+    monkeypatch.setattr(main_mod.admin_service, "get_config", lambda: cfg)
+    monkeypatch.setattr(
+        main_mod.admin_service,
+        "build_runtime_env_overlay",
+        lambda: {
+            "GLOBAL_TIMEOUT": "20",
+            "TEST_PROVIDER_API_KEY_1": "sk-test",
+        },
+    )
+
+    main_mod._managed_overlay_keys = {"STALE_KEY"}
+    main_mod._last_synced_admin_version = None
+    monkeypatch.setenv("STALE_KEY", "obsolete")
+
+    version = main_mod._prime_runtime_from_admin_config()
+
+    assert version == 7
+    assert main_mod._last_synced_admin_version == 7
+    assert os.getenv("GLOBAL_TIMEOUT") == "20"
+    assert os.getenv("TEST_PROVIDER_API_KEY_1") == "sk-test"
+    assert os.getenv("STALE_KEY") is None

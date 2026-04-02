@@ -305,6 +305,8 @@ class TestAggregateRouterTimeouts:
     @pytest.mark.asyncio
     async def test_non_streaming_target_timeout_falls_back(self, monkeypatch):
         class FakeClient:
+            global_timeout = 5
+
             async def acompletion(self, request=None, **kwargs):
                 if kwargs["model"] == "slow/model":
                     await asyncio.sleep(1.05)
@@ -335,3 +337,56 @@ class TestAggregateRouterTimeouts:
         assert result == {"id": "fast"}
         assert actual_target == "fast/model"
         assert fallback_count == 1
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_shared_budget_prevents_latency_multiplication(
+        self, monkeypatch
+    ):
+        attempted_models = []
+
+        class FakeClient:
+            global_timeout = 0.2
+
+            async def acompletion(self, request=None, **kwargs):
+                model = kwargs["model"]
+                attempted_models.append(model)
+                if model == "slow-err/model":
+                    await asyncio.sleep(0.15)
+                    return {
+                        "error": {
+                            "type": "rate_limit",
+                            "message": "provider busy",
+                        }
+                    }
+                if model == "slow-success/model":
+                    await asyncio.sleep(0.15)
+                    return {"id": "late-success"}
+                return {"id": "fast-success"}
+
+        config = VirtualModelConfig(
+            strategy="sequential",
+            timeout_seconds=1,
+            targets=[
+                RouteTarget(model="slow-err/model"),
+                RouteTarget(model="slow-success/model"),
+                RouteTarget(model="fast/model"),
+            ],
+        )
+
+        monkeypatch.setattr(
+            "proxy_app.aggregate_router.get_virtual_model",
+            lambda _: config,
+        )
+
+        result, actual_target, fallback_count = await execute_virtual_completion(
+            FakeClient(),
+            request=None,
+            request_data={"model": "virtual/test"},
+            virtual_model_name="virtual/test",
+        )
+
+        assert result["error"]["type"] == "virtual_model_exhausted"
+        assert result["error"]["details"]["targets_tried"] == 2
+        assert actual_target == ""
+        assert fallback_count == 1
+        assert attempted_models == ["slow-err/model", "slow-success/model"]
