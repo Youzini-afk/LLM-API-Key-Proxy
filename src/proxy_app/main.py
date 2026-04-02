@@ -150,7 +150,7 @@ with _console.status("[dim]Loading core dependencies...", spinner="dots"):
     from dotenv import load_dotenv
     import colorlog
     import json
-    from typing import AsyncGenerator, Any, Dict, List, Optional, Union
+    from typing import AsyncGenerator, Any, Dict, List, Optional, Tuple, Union
     from pydantic import BaseModel, ConfigDict, Field
     from proxy_app.admin_schemas import (
         AdminPoliciesUpdateRequest,
@@ -1200,6 +1200,52 @@ def _status_code_for_proxy_error(error: dict) -> int:
     return 502
 
 
+def _extract_sse_error_from_chunk(chunk_str: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse a single SSE chunk and return an OpenAI-style error object if present.
+    """
+    if not isinstance(chunk_str, str):
+        return None
+    stripped = chunk_str.strip()
+    if not stripped.startswith("data:"):
+        return None
+
+    payload = stripped[len("data:") :].strip()
+    if not payload or payload == "[DONE]":
+        return None
+
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+
+    error = parsed.get("error") if isinstance(parsed, dict) else None
+    if isinstance(error, dict):
+        return error
+    return None
+
+
+async def _prime_stream_first_chunk(
+    response_stream: AsyncGenerator[str, None],
+) -> Tuple[Optional[str], AsyncGenerator[str, None]]:
+    """
+    Consume one chunk and return a replay generator that re-yields it.
+    """
+    iterator = response_stream.__aiter__()
+    try:
+        first_chunk = await iterator.__anext__()
+    except StopAsyncIteration:
+        first_chunk = None
+
+    async def _replay() -> AsyncGenerator[str, None]:
+        if first_chunk is not None:
+            yield first_chunk
+        async for chunk in iterator:
+            yield chunk
+
+    return first_chunk, _replay()
+
+
 async def streaming_response_wrapper(
     request: Request,
     request_data: dict,
@@ -1468,10 +1514,20 @@ async def chat_completions(
                         client, request, request_data, model
                     )
                 )
+                first_chunk, primed_stream = await _prime_stream_first_chunk(stream_gen)
+
+                # If virtual routing fails before any real stream content, return a
+                # standard JSON error instead of a 200 SSE error event so external
+                # OpenAI relays can surface the failure reason consistently.
+                first_error = (
+                    _extract_sse_error_from_chunk(first_chunk)
+                    if first_chunk is not None
+                    else None
+                )
 
                 async def _wrap_stream():
                     async for chunk in streaming_response_wrapper(
-                        request, request_data, stream_gen, raw_logger
+                        request, request_data, primed_stream, raw_logger
                     ):
                         yield chunk
 
@@ -1481,6 +1537,14 @@ async def chat_completions(
                 if actual_target:
                     resp_headers["X-Proxy-Actual-Target"] = actual_target
                     resp_headers["X-Proxy-Fallback-Count"] = str(fallback_count)
+
+                if first_error:
+                    status_code = _status_code_for_proxy_error(first_error)
+                    return JSONResponse(
+                        content={"error": first_error},
+                        status_code=status_code,
+                        headers=resp_headers,
+                    )
 
                 return StreamingResponse(
                     _wrap_stream(),

@@ -3,6 +3,7 @@ import sys
 import types
 import importlib.util
 import os
+import json
 
 import pytest
 from fastapi import HTTPException
@@ -157,6 +158,35 @@ def test_status_code_for_proxy_error_credentials_exhausted(monkeypatch):
     assert status == 503
 
 
+def test_extract_sse_error_from_chunk(monkeypatch):
+    main_mod = _reload_main(monkeypatch)
+
+    chunk = 'data: {"error":{"message":"all targets failed","type":"virtual_model_exhausted"}}\n\n'
+    parsed = main_mod._extract_sse_error_from_chunk(chunk)
+
+    assert parsed is not None
+    assert parsed["type"] == "virtual_model_exhausted"
+    assert parsed["message"] == "all targets failed"
+
+
+@pytest.mark.asyncio
+async def test_prime_stream_first_chunk_replays(monkeypatch):
+    main_mod = _reload_main(monkeypatch)
+
+    async def _gen():
+        yield "data: first\n\n"
+        yield "data: second\n\n"
+
+    first, replay = await main_mod._prime_stream_first_chunk(_gen())
+    assert first == "data: first\n\n"
+
+    collected = []
+    async for item in replay:
+        collected.append(item)
+
+    assert collected == ["data: first\n\n", "data: second\n\n"]
+
+
 @pytest.mark.asyncio
 async def test_streaming_response_wrapper_closes_underlying_stream_on_disconnect(
     monkeypatch,
@@ -193,6 +223,54 @@ async def test_streaming_response_wrapper_closes_underlying_stream_on_disconnect
 
     assert collected == []
     assert stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_streaming_virtual_first_error_returns_json(monkeypatch):
+    main_mod = _reload_main(monkeypatch)
+
+    class _DummyReqClient:
+        host = "127.0.0.1"
+        port = 12345
+
+    class _DummyRequest:
+        headers = {}
+        url = "http://test/v1/chat/completions"
+        client = _DummyReqClient()
+
+        async def json(self):
+            return {"model": "vm-test", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+
+        async def is_disconnected(self):
+            return False
+
+    async def _error_stream():
+        yield 'data: {"error":{"message":"all failed","type":"virtual_model_exhausted"}}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def _fake_execute_virtual_completion_streaming(client, request, request_data, virtual_model_name):
+        return (_error_stream(), "", 0)
+
+    monkeypatch.setattr(main_mod, "log_request_to_console", lambda **kwargs: None)
+
+    import proxy_app.virtual_models as vm_mod
+    import proxy_app.aggregate_router as ar_mod
+
+    monkeypatch.setattr(vm_mod, "is_virtual_model", lambda model: model == "vm-test")
+    monkeypatch.setattr(vm_mod, "get_virtual_model", lambda model: object() if model == "vm-test" else None)
+    monkeypatch.setattr(ar_mod, "execute_virtual_completion_streaming", _fake_execute_virtual_completion_streaming)
+
+    response = await main_mod.chat_completions(
+        request=_DummyRequest(),
+        client=object(),
+        _=None,
+    )
+
+    assert isinstance(response, main_mod.JSONResponse)
+    assert response.status_code == 503
+    body = json.loads(response.body.decode("utf-8"))
+    assert body["error"]["type"] == "virtual_model_exhausted"
+    assert body["error"]["message"] == "all failed"
 
 
 @pytest.mark.asyncio
