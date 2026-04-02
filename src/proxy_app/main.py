@@ -2339,28 +2339,53 @@ async def admin_test_channel(
     success_count = 0
     try:
         def _extract_result_error(resp: Any):
-            """Return (has_error, message, status_code) for RotatingClient-like responses."""
+            """Return (has_error, message, status_code, error_type) for RotatingClient-like responses."""
             if not isinstance(resp, dict):
-                return (False, "", None)
+                return (False, "", None, None)
             err = resp.get("error")
             if not isinstance(err, dict):
-                return (False, "", None)
+                return (False, "", None, None)
 
-            message = str(err.get("message") or "")
+            message = str(err.get("message") or "").strip()
+            error_type = str(err.get("type") or "").strip() or None
             status_code = None
             details = err.get("details")
-            if isinstance(details, dict):
-                raw_status = details.get("status_code")
-                try:
-                    status_code = int(raw_status) if raw_status is not None else None
-                except Exception:
-                    status_code = None
-            return (True, message, status_code)
+            if not isinstance(details, dict):
+                details = {}
+            raw_status = details.get("status_code")
+            try:
+                status_code = int(raw_status) if raw_status is not None else None
+            except Exception:
+                status_code = None
+
+            if not message:
+                sample_errors = details.get("sample_errors")
+                hint = details.get("hint")
+                normal_summary = details.get("normal_error_summary")
+
+                if isinstance(hint, str) and hint.strip():
+                    message = hint.strip()
+                elif isinstance(sample_errors, list) and sample_errors:
+                    first = sample_errors[0] if isinstance(sample_errors[0], dict) else None
+                    if first:
+                        sample_msg = str(first.get("message") or "").strip()
+                        sample_type = str(first.get("error_type") or "").strip()
+                        if sample_msg:
+                            message = sample_msg
+                        elif sample_type:
+                            message = sample_type
+                elif isinstance(normal_summary, str) and normal_summary.strip():
+                    message = normal_summary.strip()
+                elif error_type:
+                    message = error_type
+
+            return (True, message, status_code, error_type)
 
         for m in selected_models:
             started = time.perf_counter()
             status = "failed"
             err_msg = ""
+            err_type = ""
             try:
                 result = await isolated_client.acompletion(
                     request=request,
@@ -2371,18 +2396,20 @@ async def admin_test_channel(
                     timeout=20,
                 )
 
-                has_error, result_err_msg, status_code = _extract_result_error(result)
+                has_error, result_err_msg, status_code, result_err_type = _extract_result_error(result)
                 if has_error:
                     status = "failed"
                     code_part = f"HTTP {status_code}: " if status_code else ""
                     err_msg = f"{code_part}{result_err_msg or 'unknown upstream error'}"
+                    err_type = result_err_type or ""
                 else:
                     status = "success"
                     success_count += 1
 
             except Exception as e:
                 status = "failed"
-                err_msg = str(e)
+                err_msg = str(e) or e.__class__.__name__
+                err_type = e.__class__.__name__
 
             elapsed = round(time.perf_counter() - started, 3)
             model_results.append(
@@ -2391,6 +2418,7 @@ async def admin_test_channel(
                     "status": status,
                     "latency_seconds": elapsed,
                     "error": err_msg,
+                    "error_type": err_type,
                 }
             )
     finally:

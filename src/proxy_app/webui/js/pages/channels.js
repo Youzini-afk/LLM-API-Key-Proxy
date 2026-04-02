@@ -690,11 +690,14 @@ function createChannelModelTestModal({ channel, onBatchTest }) {
       h('tbody', {},
         ...filtered.map((m) => {
           const r = resultMap[m] || null;
+          const failureReason = r
+            ? (r.error || r.error_type || '')
+            : '';
           const statusText = !r
             ? '-'
             : (r.status === 'success'
               ? `成功 请求时长: ${r.latency_seconds}s`
-              : `失败 ${r.error || ''}`);
+              : `失败 ${failureReason}`);
           return h('tr', {},
             h('td', {}, h('input', {
               type: 'checkbox',
@@ -705,7 +708,7 @@ function createChannelModelTestModal({ channel, onBatchTest }) {
               }
             })),
             h('td', { className: 'text-mono' }, m),
-            h('td', {}, statusText),
+            h('td', { title: statusText }, statusText),
             h('td', {}, h('button', {
               className: 'btn btn-ghost btn-sm',
               onClick: async () => {
