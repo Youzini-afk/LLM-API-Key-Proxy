@@ -302,6 +302,15 @@ class TestAggregateErrorClassification:
     def test_invalid_request_no_fallback(self):
         assert not _should_fallback("invalid_request")
 
+    def test_invalid_request_model_not_found_fallback(self):
+        assert _should_fallback("invalid_request", "model not found for provider")
+
+    def test_invalid_request_unsupported_parameter_fallback(self):
+        assert _should_fallback(
+            "invalid_request",
+            "unsupported parameter: reasoning_effort",
+        )
+
     def test_context_window_no_fallback(self):
         assert not _should_fallback("context_window_exceeded")
 
@@ -327,6 +336,46 @@ class TestAggregateErrorClassification:
 
 
 class TestAggregateRouterTimeouts:
+    @pytest.mark.asyncio
+    async def test_invalid_request_model_not_found_falls_back(self, monkeypatch):
+        class FakeClient:
+            global_timeout = 5
+
+            async def acompletion(self, request=None, **kwargs):
+                if kwargs["model"] == "first/model":
+                    return {
+                        "error": {
+                            "type": "invalid_request",
+                            "message": "model not found for provider",
+                        }
+                    }
+                return {"id": "ok"}
+
+        config = VirtualModelConfig(
+            strategy="sequential",
+            timeout_seconds=1,
+            targets=[
+                RouteTarget(model="first/model"),
+                RouteTarget(model="second/model"),
+            ],
+        )
+
+        monkeypatch.setattr(
+            "proxy_app.aggregate_router.get_virtual_model",
+            lambda _: config,
+        )
+
+        result, actual_target, fallback_count = await execute_virtual_completion(
+            FakeClient(),
+            request=None,
+            request_data={"model": "virtual/test"},
+            virtual_model_name="virtual/test",
+        )
+
+        assert result == {"id": "ok"}
+        assert actual_target == "second/model"
+        assert fallback_count == 1
+
     @pytest.mark.asyncio
     async def test_non_streaming_target_timeout_falls_back(self, monkeypatch):
         class FakeClient:

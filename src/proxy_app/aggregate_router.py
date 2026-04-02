@@ -83,8 +83,40 @@ def _extract_error_info(result: Any) -> Tuple[str, str, Optional[int]]:
     return ("unknown", str(result), None)
 
 
-def _should_fallback(error_type: str) -> bool:
+def _looks_provider_specific_invalid_request(message: str) -> bool:
+    """
+    Decide whether an invalid_request is likely provider-specific.
+
+    These errors often recover by trying a different target/provider:
+    - model not found / not available on this provider
+    - provider-specific unsupported request fields
+    """
+    msg = (message or "").strip().lower()
+    if not msg:
+        return False
+
+    patterns = [
+        "model not found",
+        "no such model",
+        "model does not exist",
+        "model is not available",
+        "not available for your account",
+        "unsupported model",
+        "unsupported parameter",
+        "parameter is not supported",
+        "unrecognized request argument",
+        "unknown field",
+        "invalid model",
+    ]
+    return any(p in msg for p in patterns)
+
+
+def _should_fallback(error_type: str, message: str = "") -> bool:
     """Decide whether to try the next target for this error type."""
+    if error_type == "invalid_request" and _looks_provider_specific_invalid_request(
+        message
+    ):
+        return True
     return error_type not in NON_FALLBACK_ERROR_TYPES
 
 
@@ -371,7 +403,7 @@ async def execute_virtual_completion(
                             status_code=status_code,
                         )
                     )
-                    if not _should_fallback(error_type):
+                    if not _should_fallback(error_type, message):
                         return (result, target_model, len(failures) - 1)
                     continue
 
@@ -392,7 +424,7 @@ async def execute_virtual_completion(
                         status_code=getattr(e, "status_code", None),
                     )
                 )
-                if not _should_fallback(error_type):
+                if not _should_fallback(error_type, message):
                     raise
                 continue
 
@@ -447,7 +479,7 @@ async def execute_virtual_completion(
                 )
                 failures.append(failure)
 
-                if not _should_fallback(error_type):
+                if not _should_fallback(error_type, message):
                     logger.error(
                         f"[VirtualModel] Non-fallbackable error '{error_type}' "
                         f"from {target_model}. Stopping."
@@ -483,7 +515,7 @@ async def execute_virtual_completion(
             )
             failures.append(failure)
 
-            if not _should_fallback(error_type):
+            if not _should_fallback(error_type, message):
                 logger.error(
                     f"[VirtualModel] Non-fallbackable exception from "
                     f"{target_model}. Propagating."
@@ -654,7 +686,7 @@ async def execute_virtual_completion_streaming(
                                     err = parsed.get("error", {})
                                     error_type = err.get("type", "unknown")
                                     error_message = err.get("message", str(err))
-                                    if not _should_fallback(error_type):
+                                    if not _should_fallback(error_type, error_message):
                                         yield chunk
                                         actual_target = target_model
                                         fallback_count = len(failures)
@@ -708,7 +740,7 @@ async def execute_virtual_completion_streaming(
                             status_code=getattr(e, "status_code", None),
                         )
                     )
-                    if not _should_fallback(exc_error_type):
+                    if not _should_fallback(exc_error_type, str(e)):
                         raise
                     continue
 
@@ -795,7 +827,7 @@ async def execute_virtual_completion_streaming(
                                     error_type = err.get("type", "unknown")
                                     error_message = err.get("message", str(err))
 
-                                    if not _should_fallback(error_type):
+                                    if not _should_fallback(error_type, error_message):
                                         # Non-fallbackable – forward to client
                                         logger.error(
                                             f"[VirtualModel] Streaming: non-fallbackable "
@@ -875,7 +907,7 @@ async def execute_virtual_completion_streaming(
                     )
                 )
 
-                if not _should_fallback(exc_error_type):
+                if not _should_fallback(exc_error_type, message):
                     raise
 
                 continue
