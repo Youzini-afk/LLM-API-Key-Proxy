@@ -1200,6 +1200,62 @@ def _status_code_for_proxy_error(error: dict) -> int:
     return 502
 
 
+def _error_type_for_http_status(status_code: int) -> str:
+    """Map HTTP status codes to OpenAI-compatible error types."""
+    if status_code == 400:
+        return "invalid_request"
+    if status_code == 401:
+        return "authentication"
+    if status_code == 403:
+        return "forbidden"
+    if status_code == 404:
+        return "not_found"
+    if status_code == 408:
+        return "timeout"
+    if status_code == 409:
+        return "conflict"
+    if status_code == 422:
+        return "invalid_request"
+    if status_code == 429:
+        return "rate_limit"
+    if status_code == 502:
+        return "server_error"
+    if status_code == 503:
+        return "proxy_busy"
+    if status_code == 504:
+        return "proxy_timeout"
+    if status_code >= 500:
+        return "proxy_internal_error"
+    return "invalid_request"
+
+
+@app.exception_handler(HTTPException)
+async def v1_openai_error_handler(request: Request, exc: HTTPException):
+    """
+    Ensure /v1/* errors are returned in OpenAI-compatible shape.
+    """
+    path = request.url.path or ""
+    if not path.startswith("/v1/"):
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+    if isinstance(exc.detail, dict) and isinstance(exc.detail.get("error"), dict):
+        payload = exc.detail
+    else:
+        if isinstance(exc.detail, str):
+            message = exc.detail
+        else:
+            message = json.dumps(exc.detail, ensure_ascii=False, default=str)
+        payload = {
+            "error": {
+                "message": message,
+                "type": _error_type_for_http_status(exc.status_code),
+                "code": exc.status_code,
+            }
+        }
+
+    return JSONResponse(status_code=exc.status_code, content=payload)
+
+
 def _extract_sse_error_from_chunk(chunk_str: str) -> Optional[Dict[str, Any]]:
     """
     Parse a single SSE chunk and return an OpenAI-style error object if present.
@@ -1514,7 +1570,22 @@ async def chat_completions(
                         client, request, request_data, model
                     )
                 )
-                first_chunk, primed_stream = await _prime_stream_first_chunk(stream_gen)
+                first_chunk = None
+                primed_stream = stream_gen
+                # Do a short non-blocking prime so we can convert immediate SSE
+                # errors into JSON for relays that don't expose SSE error frames.
+                try:
+                    prime_timeout_seconds = min(
+                        2.0,
+                        max(0.2, float(getattr(client, "global_timeout", 20)) * 0.1),
+                    )
+                    first_chunk, primed_stream = await asyncio.wait_for(
+                        _prime_stream_first_chunk(stream_gen),
+                        timeout=prime_timeout_seconds,
+                    )
+                except TimeoutError:
+                    # No first chunk yet; continue with normal streaming path.
+                    pass
 
                 # If virtual routing fails before any real stream content, return a
                 # standard JSON error instead of a 200 SSE error event so external

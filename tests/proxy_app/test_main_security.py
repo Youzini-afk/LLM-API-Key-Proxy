@@ -158,6 +158,27 @@ def test_status_code_for_proxy_error_credentials_exhausted(monkeypatch):
     assert status == 503
 
 
+@pytest.mark.asyncio
+async def test_v1_http_exception_is_wrapped_to_openai_error(monkeypatch):
+    main_mod = _reload_main(monkeypatch)
+
+    class _Req:
+        class _URL:
+            path = "/v1/chat/completions"
+
+        url = _URL()
+
+    resp = await main_mod.v1_openai_error_handler(
+        _Req(),
+        HTTPException(status_code=401, detail="Invalid or missing API Key"),
+    )
+
+    assert resp.status_code == 401
+    body = json.loads(resp.body.decode("utf-8"))
+    assert body["error"]["type"] == "authentication"
+    assert "Invalid or missing API Key" in body["error"]["message"]
+
+
 def test_extract_sse_error_from_chunk(monkeypatch):
     main_mod = _reload_main(monkeypatch)
 

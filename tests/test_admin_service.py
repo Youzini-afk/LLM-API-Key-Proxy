@@ -1,4 +1,5 @@
 import importlib
+import json
 
 
 
@@ -36,6 +37,46 @@ def test_admin_store_save_load_mask(monkeypatch, tmp_path):
     masked = admin_store.masked_config_dict(loaded)
     assert masked["channels"][0]["api_keys"][0]["value"] != "sk-1234567890"
     assert "..." in masked["channels"][0]["api_keys"][0]["value"]
+
+
+def test_admin_store_migrates_legacy_root_admin_config(monkeypatch, tmp_path):
+    admin_store, _ = _reload_modules(monkeypatch, tmp_path)
+
+    legacy_path = admin_store.get_default_root() / "admin_config.json"
+    legacy_payload = {
+        "channels": [
+            {
+                "id": "legacy",
+                "provider_type": "openai_compatible",
+                "enabled": True,
+                "api_base": "https://legacy.example.com/v1",
+                "api_keys": [],
+                "provided_models": ["m1"],
+                "models": {},
+                "settings": {
+                    "rotation_mode": "balanced",
+                    "max_concurrent_requests_per_key": 1,
+                    "auto_disable_long_unavailable": True,
+                    "auto_disable_unavailable_hours": 8,
+                    "ignore_models": [],
+                    "whitelist_models": [],
+                },
+            }
+        ],
+        "virtual_models": {},
+        "policies": {},
+        "metadata": {"version": 1, "updated_at": "2026-01-01T00:00:00Z"},
+    }
+    legacy_path.write_text(
+        json.dumps(legacy_payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    cfg = admin_store.load_admin_config()
+
+    migrated_path = admin_store.get_default_root() / "data" / "admin_config.json"
+    assert migrated_path.exists()
+    assert cfg.channels[0].id == "legacy"
 
 
 def test_admin_service_auto_channel_id_and_runtime_api_base_normalize(monkeypatch, tmp_path):

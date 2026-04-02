@@ -46,7 +46,20 @@ def _capture_corrupt_evidence(path: Path) -> Optional[str]:
         return None
 
 
+def _legacy_config_path() -> Path:
+    """Backward-compatible legacy location: <root>/admin_config.json."""
+    return get_default_root() / "admin_config.json"
+
+
 def _config_path() -> Path:
+    configured_path = (os.getenv("ADMIN_CONFIG_PATH") or "").strip()
+    if configured_path:
+        candidate = Path(configured_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = (get_default_root() / candidate).resolve()
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        return candidate
+
     root = get_default_root()
     data_dir = root / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -65,6 +78,22 @@ def get_admin_store_health() -> Dict[str, Optional[str] | bool]:
 
 def load_admin_config() -> AdminConfig:
     p = _config_path()
+    # Backward-compatible migration: if admin_config is only present in the
+    # old root location, copy it into the new default data path.
+    if (
+        not (os.getenv("ADMIN_CONFIG_PATH") or "").strip()
+        and not p.exists()
+        and str(p).endswith(str(Path("data") / "admin_config.json"))
+    ):
+        legacy = _legacy_config_path()
+        if legacy.exists() and legacy.is_file():
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(legacy, p)
+            except Exception:
+                # If migration fails, continue with normal load logic.
+                pass
+
     if not p.exists():
         _set_store_health(None, None)
         return AdminConfig()
