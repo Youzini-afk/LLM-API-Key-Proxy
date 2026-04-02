@@ -24,6 +24,71 @@ from litellm.exceptions import (
 lib_logger = logging.getLogger("rotator_library")
 
 
+def _extract_error_message(e: Exception) -> str:
+    """Best-effort normalized error message extraction."""
+    try:
+        if hasattr(e, "response") and hasattr(e.response, "text"):
+            text = e.response.text
+            if isinstance(text, str) and text.strip():
+                return text.lower()
+    except Exception:
+        pass
+
+    try:
+        body = getattr(e, "body", None)
+        if body:
+            return str(body).lower()
+    except Exception:
+        pass
+
+    try:
+        return str(e).lower()
+    except Exception:
+        return ""
+
+
+def _looks_like_auth_error_message(message: str) -> bool:
+    """Detect providers that incorrectly surface auth failures as 400/BadRequest."""
+    if not message:
+        return False
+
+    auth_patterns = [
+        "invalid access token",
+        "token expired",
+        "access token expired",
+        "invalid token",
+        "expired token",
+        "authentication failed",
+        "auth failed",
+        "invalid api key",
+        "api key is invalid",
+        "api key invalid",
+        "incorrect api key",
+        "unauthorized",
+        "invalid authorization",
+        "authorization failed",
+        "authorization header",
+        "bearer token",
+    ]
+    return any(pattern in message for pattern in auth_patterns)
+
+
+def _looks_like_forbidden_error_message(message: str) -> bool:
+    """Detect access-denied cases even when providers mislabel them as 400."""
+    if not message:
+        return False
+
+    forbidden_patterns = [
+        "permission denied",
+        "access denied",
+        "forbidden",
+        "not allowed to access",
+        "no access to model",
+        "model not available for your account",
+    ]
+    return any(pattern in message for pattern in forbidden_patterns)
+
+
 def _parse_duration_string(duration_str: str) -> Optional[int]:
     """
     Parse duration strings in various formats to total seconds.
@@ -695,6 +760,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
 
     # Generic classification logic
     status_code = getattr(e, "status_code", None)
+    error_message = _extract_error_message(e)
 
     if isinstance(e, httpx.HTTPStatusError):  # [NEW] Handle httpx errors first
         status_code = e.response.status_code
@@ -736,6 +802,18 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                 retry_after=retry_after,
             )
         if status_code == 400:
+            if _looks_like_auth_error_message(error_body):
+                return ClassifiedError(
+                    error_type="authentication",
+                    original_exception=e,
+                    status_code=401,
+                )
+            if _looks_like_forbidden_error_message(error_body):
+                return ClassifiedError(
+                    error_type="forbidden",
+                    original_exception=e,
+                    status_code=403,
+                )
             # Check for context window / token limit errors with more specific patterns
             if any(
                 pattern in error_body
@@ -841,6 +919,18 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
         )
 
     if isinstance(e, (InvalidRequestError, BadRequestError)):
+        if _looks_like_auth_error_message(error_message):
+            return ClassifiedError(
+                error_type="authentication",
+                original_exception=e,
+                status_code=401,
+            )
+        if _looks_like_forbidden_error_message(error_message):
+            return ClassifiedError(
+                error_type="forbidden",
+                original_exception=e,
+                status_code=403,
+            )
         return ClassifiedError(
             error_type="invalid_request",
             original_exception=e,
