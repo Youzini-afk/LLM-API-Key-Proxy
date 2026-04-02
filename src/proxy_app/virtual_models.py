@@ -3,6 +3,7 @@
 
 import os
 import logging
+import re
 from typing import Dict, List, Optional
 
 from proxy_app.schemas_virtual import (
@@ -17,6 +18,7 @@ logger = logging.getLogger("proxy_app.virtual_models")
 # Module-level singleton registry
 # ---------------------------------------------------------------------------
 _registry: Dict[str, VirtualModelConfig] = {}
+_normalized_lookup: Dict[str, Optional[str]] = {}
 _loaded: bool = False
 
 
@@ -27,16 +29,18 @@ def load_virtual_models() -> Dict[str, VirtualModelConfig]:
     Can be called multiple times – will reload each time.
     Returns the loaded registry dict.
     """
-    global _registry, _loaded
+    global _registry, _normalized_lookup, _loaded
 
     raw = os.getenv("VIRTUAL_MODELS", "").strip()
     if not raw:
         _registry = {}
+        _normalized_lookup = {}
         _loaded = True
         logger.debug("No VIRTUAL_MODELS configured.")
         return _registry
 
     _registry = parse_virtual_models_config(raw)
+    _normalized_lookup = _build_normalized_lookup(_registry)
     _loaded = True
 
     if _registry:
@@ -60,7 +64,11 @@ def is_virtual_model(model_name: str) -> bool:
     if not _loaded:
         load_virtual_models()
     name = _strip_virtual_prefix(model_name)
-    return name in _registry
+    if name in _registry:
+        return True
+    normalized_name = _normalize_lookup_name(name)
+    mapped_name = _normalized_lookup.get(normalized_name)
+    return bool(mapped_name and mapped_name in _registry)
 
 
 def get_virtual_model(model_name: str) -> Optional[VirtualModelConfig]:
@@ -70,7 +78,15 @@ def get_virtual_model(model_name: str) -> Optional[VirtualModelConfig]:
     if not _loaded:
         load_virtual_models()
     name = _strip_virtual_prefix(model_name)
-    return _registry.get(name)
+    direct = _registry.get(name)
+    if direct is not None:
+        return direct
+
+    normalized_name = _normalize_lookup_name(name)
+    mapped_name = _normalized_lookup.get(normalized_name)
+    if mapped_name:
+        return _registry.get(mapped_name)
+    return None
 
 
 def get_all_virtual_model_names() -> List[str]:
@@ -99,3 +115,45 @@ def _strip_virtual_prefix(model_name: str) -> str:
     if model_name.startswith("virtual/"):
         return model_name[len("virtual/"):]
     return model_name
+
+
+def _normalize_lookup_name(model_name: str) -> str:
+    """
+    Normalize model name for tolerant virtual-model lookup.
+
+    Rules:
+    - strip optional virtual/ prefix
+    - remove leading [tag] prefixes (e.g. [喵喵] kimi-k2.5)
+    - lowercase and remove common separators (- _ . space)
+    """
+    raw = _strip_virtual_prefix(model_name or "").strip().lower()
+    if not raw:
+        return ""
+
+    raw = re.sub(r"^\[[^\]]+\]\s*", "", raw)
+    raw = re.sub(r"[-_\.\s]+", "", raw)
+    return raw
+
+
+def _build_normalized_lookup(
+    registry: Dict[str, VirtualModelConfig],
+) -> Dict[str, Optional[str]]:
+    """
+    Build normalized-name -> canonical-name lookup.
+
+    If multiple model names collapse to the same normalized key, mark it as
+    ambiguous (None) so callers must use exact name.
+    """
+    normalized: Dict[str, Optional[str]] = {}
+    for model_name in registry.keys():
+        norm = _normalize_lookup_name(model_name)
+        if not norm:
+            continue
+        existing = normalized.get(norm)
+        if existing is None and norm in normalized:
+            continue
+        if existing and existing != model_name:
+            normalized[norm] = None
+        elif norm not in normalized:
+            normalized[norm] = model_name
+    return normalized

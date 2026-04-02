@@ -156,6 +156,7 @@ class TestVirtualModelRegistry:
     def setup_method(self):
         # Reset module state
         virtual_models._registry = {}
+        virtual_models._normalized_lookup = {}
         virtual_models._loaded = False
 
     def test_no_env_var(self, monkeypatch):
@@ -190,6 +191,30 @@ class TestVirtualModelRegistry:
 
         assert virtual_models.is_virtual_model("virtual/test_model") is True
         assert virtual_models.get_virtual_model("virtual/test_model") is not None
+
+    def test_lookup_allows_alias_tag_prefix(self, monkeypatch):
+        config = json.dumps({"[喵喵] kimi-k2.5": {"targets": ["ali/kimi-k2.5"]}})
+        monkeypatch.setenv("VIRTUAL_MODELS", config)
+        virtual_models.load_virtual_models()
+
+        assert virtual_models.is_virtual_model("kimi-k2.5") is True
+        assert virtual_models.get_virtual_model("kimi-k2.5") is not None
+
+    def test_ambiguous_normalized_name_requires_exact_match(self, monkeypatch):
+        config = json.dumps(
+            {
+                "ab": {"targets": ["p/a"]},
+                "a-b": {"targets": ["q/b"]},
+            }
+        )
+        monkeypatch.setenv("VIRTUAL_MODELS", config)
+        virtual_models.load_virtual_models()
+
+        # exact names still work
+        assert virtual_models.is_virtual_model("ab") is True
+        assert virtual_models.is_virtual_model("a-b") is True
+        # ambiguous normalized key should not resolve fuzzy lookup
+        assert virtual_models.is_virtual_model("a b") is False
 
 
 # ---------------------------------------------------------------------------
