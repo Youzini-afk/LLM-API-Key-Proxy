@@ -231,7 +231,7 @@ class App {
                 </label>
               </div>
               <div class="text-muted" style="margin-top:10px">
-                `global_pool` 会启用跨 provider 全局 key 候选池；probe 预算越低，恢复试探越保守。
+                <code>global_pool</code> 会启用跨 provider 全局 key 候选池；probe 预算越低，恢复试探越保守。
               </div>
             </div>
 
