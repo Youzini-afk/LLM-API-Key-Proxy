@@ -144,6 +144,10 @@ def _response_has_meaningful_completion(result: Any) -> bool:
                 return True
             if message.get("tool_calls") or message.get("function_call"):
                 return True
+            if _has_nonempty_content(message.get("reasoning")) or _has_nonempty_content(
+                message.get("reasoning_content")
+            ):
+                return True
 
         delta = choice.get("delta")
         if isinstance(delta, dict):
@@ -155,6 +159,10 @@ def _response_has_meaningful_completion(result: Any) -> bool:
                 delta.get("reasoning_content")
             ):
                 return True
+        if _has_nonempty_content(choice.get("reasoning")) or _has_nonempty_content(
+            choice.get("reasoning_content")
+        ):
+            return True
 
         if choice.get("finish_reason") == "tool_calls":
             return True
@@ -188,6 +196,14 @@ def _stream_chunk_has_meaningful_output(parsed: Dict[str, Any]) -> bool:
                 return True
             if message.get("tool_calls") or message.get("function_call"):
                 return True
+            if _has_nonempty_content(message.get("reasoning")) or _has_nonempty_content(
+                message.get("reasoning_content")
+            ):
+                return True
+        if _has_nonempty_content(choice.get("reasoning")) or _has_nonempty_content(
+            choice.get("reasoning_content")
+        ):
+            return True
 
         if choice.get("finish_reason") == "tool_calls":
             return True
@@ -468,11 +484,13 @@ def _should_use_global_pool(client: Any, config: VirtualModelConfig) -> bool:
     scheduler_mode = (
         getattr(client, "virtual_scheduler_mode", "legacy") or "legacy"
     ).strip().lower()
-    enabled_target_count = len(config.enabled_targets or [])
+    enabled_targets = list(config.enabled_targets or [])
+    enabled_target_count = len(enabled_targets)
+    enabled_provider_count = len({target.provider for target in enabled_targets})
     return scheduler_mode == "global_pool" and config.strategy in {
         "balanced",
         "weighted_random",
-    } and enabled_target_count > 1
+    } and enabled_target_count > 1 and enabled_provider_count > 1
 
 
 def _monotonic_to_wall_deadline(deadline: float) -> float:

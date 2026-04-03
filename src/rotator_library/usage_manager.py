@@ -3367,8 +3367,16 @@ class UsageManager:
                     [r for r in records if r["bucket"] == 2],
                     key=self._virtual_candidate_sort_key,
                 )
-                if warm_due and self._consume_probe_token():
-                    selected = warm_due[0]
+                if warm_due:
+                    if self._consume_probe_token():
+                        selected = warm_due[0]
+                    elif not hot_candidates:
+                        # Last-resort self-healing probe: avoid complete starvation when
+                        # all candidates are warm-due and probe budget is temporarily empty.
+                        selected = warm_due[0]
+                        lib_logger.debug(
+                            "Probe budget exhausted with no hot virtual candidates; forcing one warm-due probe."
+                        )
 
             if selected is not None:
                 state = self.key_states[selected["key"]]
@@ -3538,9 +3546,18 @@ class UsageManager:
                         rotation_mode=rotation_mode,
                         credential_priorities=credential_priorities,
                     )
-                    if warm_due_candidates and self._consume_probe_token():
-                        selected = warm_due_candidates[0]
-                        break
+                    if warm_due_candidates:
+                        if self._consume_probe_token():
+                            selected = warm_due_candidates[0]
+                            break
+                        if not hot_candidates:
+                            # Last-resort self-healing probe: do not hard-fail a model just
+                            # because probe tokens are temporarily depleted.
+                            selected = warm_due_candidates[0]
+                            lib_logger.debug(
+                                "Probe budget exhausted with no hot provider candidates; forcing one warm-due probe."
+                            )
+                            break
 
             if selected is not None:
                 state = self.key_states[selected["key"]]

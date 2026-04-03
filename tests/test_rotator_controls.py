@@ -133,6 +133,90 @@ async def test_acquire_key_wakes_when_any_key_is_released(
 
 
 @pytest.mark.asyncio
+async def test_acquire_key_forces_warm_due_probe_when_hot_pool_is_empty(
+    monkeypatch, tmp_path, usage_manager_modules
+):
+    _, UsageManager = usage_manager_modules
+    monkeypatch.setenv("KEY_BUSY_WAIT_INTERVAL_SECONDS", "0.1")
+    monkeypatch.setenv("KEY_BUSY_WAIT_MAX_ATTEMPTS", "1")
+
+    usage_manager = UsageManager(file_path=tmp_path / "usage.json")
+    key = "env://relay/1"
+    model = "relay/model"
+    usage_manager._usage_data = {key: _make_usage_entry(model, success_count=1)}
+    usage_manager._initialized.set()
+
+    key_data = usage_manager._usage_data[key]
+    scheduler_bundle = usage_manager._ensure_scheduler_bundle_for_key_data(key_data)
+    tracking_key = usage_manager._get_scheduler_tracking_key(key, model)
+    tracking_state = usage_manager._ensure_tracking_scheduler_state(key_data, tracking_key)
+
+    now_ts = time.time()
+    scheduler_bundle["credential_global"]["scheduler_state"] = "hot"
+    scheduler_bundle["credential_global"]["next_eligible_at"] = 0.0
+    tracking_state["scheduler_state"] = "warm"
+    tracking_state["next_eligible_at"] = now_ts - 1
+    tracking_state["next_probe_at"] = now_ts - 1
+    usage_manager._probe_tokens = 0.0
+
+    selected = await usage_manager.acquire_key(
+        available_keys=[key],
+        model=model,
+        deadline=time.time() + 1.0,
+        max_concurrent=1,
+    )
+
+    assert selected == key
+
+
+@pytest.mark.asyncio
+async def test_acquire_virtual_candidate_forces_warm_due_probe_when_hot_pool_is_empty(
+    monkeypatch, tmp_path, usage_manager_modules
+):
+    _, UsageManager = usage_manager_modules
+    monkeypatch.setenv("KEY_BUSY_WAIT_INTERVAL_SECONDS", "0.1")
+    monkeypatch.setenv("KEY_BUSY_WAIT_MAX_ATTEMPTS", "1")
+
+    usage_manager = UsageManager(file_path=tmp_path / "usage.json")
+    key = "env://relay/1"
+    model = "relay/model"
+    usage_manager._usage_data = {key: _make_usage_entry(model, success_count=1)}
+    usage_manager._initialized.set()
+
+    key_data = usage_manager._usage_data[key]
+    scheduler_bundle = usage_manager._ensure_scheduler_bundle_for_key_data(key_data)
+    tracking_key = usage_manager._get_scheduler_tracking_key(key, model)
+    tracking_state = usage_manager._ensure_tracking_scheduler_state(key_data, tracking_key)
+
+    now_ts = time.time()
+    scheduler_bundle["credential_global"]["scheduler_state"] = "hot"
+    scheduler_bundle["credential_global"]["next_eligible_at"] = 0.0
+    tracking_state["scheduler_state"] = "warm"
+    tracking_state["next_eligible_at"] = now_ts - 1
+    tracking_state["next_probe_at"] = now_ts - 1
+    usage_manager._probe_tokens = 0.0
+
+    selected = await usage_manager.acquire_virtual_candidate(
+        candidate_specs=[
+            {
+                "provider": "relay",
+                "model": model,
+                "route_model": "relay/virtual-model",
+                "key": key,
+                "hard_cap": 1,
+                "route_weight_factor": 1.0,
+            }
+        ],
+        deadline=time.time() + 1.0,
+        strategy="balanced",
+        top_n=5,
+    )
+
+    assert selected["key"] == key
+    assert selected["request_model"] == model
+
+
+@pytest.mark.asyncio
 async def test_save_usage_is_deferred_off_request_path(
     monkeypatch, tmp_path, usage_manager_modules
 ):
