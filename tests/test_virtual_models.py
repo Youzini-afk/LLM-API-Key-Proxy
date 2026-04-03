@@ -837,6 +837,57 @@ class TestAggregateRouterTimeouts:
         assert FakeClient.usage_manager.calls >= 2
 
     @pytest.mark.asyncio
+    async def test_global_pool_falls_back_to_legacy_when_no_candidate_reached_upstream(
+        self, monkeypatch
+    ):
+        class FakeUsageManager:
+            def note_real_request(self):
+                pass
+
+            async def acquire_virtual_candidate(self, specs, *, deadline, strategy, top_n):
+                raise RuntimeError("All virtual hot candidates stayed busy after 5 attempts.")
+
+        class FakeClient:
+            global_timeout = 1
+            virtual_scheduler_mode = "global_pool"
+            all_credentials = {"prov_a": ["cred-a"]}
+            max_concurrent_requests_per_key = {"prov_a": 1}
+            usage_manager = FakeUsageManager()
+
+            def _build_provider_credential_context(self, provider, model, credentials_override=None):
+                return {
+                    "provider_plugin": None,
+                    "credentials": ["cred-a"],
+                    "credential_priorities": None,
+                    "credential_tier_names": None,
+                }
+
+            async def acompletion(self, request=None, **kwargs):
+                return {"id": "legacy-path-ok"}
+
+        config = VirtualModelConfig(
+            strategy="balanced",
+            timeout_seconds=1,
+            targets=[RouteTarget(model="prov_a/model", weight=100)],
+        )
+
+        monkeypatch.setattr(
+            "proxy_app.aggregate_router.get_virtual_model",
+            lambda _: config,
+        )
+
+        result, actual_target, fallback_count = await execute_virtual_completion(
+            FakeClient(),
+            request=None,
+            request_data={"model": "virtual/test"},
+            virtual_model_name="virtual/test",
+        )
+
+        assert result == {"id": "legacy-path-ok"}
+        assert actual_target == "prov_a/model"
+        assert fallback_count == 0
+
+    @pytest.mark.asyncio
     async def test_stream_initial_timeout_closes_underlying_stream(self):
         closed = False
 

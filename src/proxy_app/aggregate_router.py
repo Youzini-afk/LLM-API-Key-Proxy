@@ -577,12 +577,19 @@ async def execute_virtual_completion(
     if _should_use_global_pool(client, config):
         attempted_candidates: set[Tuple[str, str]] = set()
         candidate_specs = _build_global_candidate_specs(client, config.enabled_targets)
+        global_pool_made_upstream_attempt = False
+        global_pool_fallback_reserve = min(
+            2.0, max(0.2, float(overall_timeout_seconds) * 0.2)
+        )
+        global_pool_deadline = max(
+            time.monotonic(), deadline - global_pool_fallback_reserve
+        )
         if not candidate_specs:
             raise ValueError(
                 f"Virtual model '{virtual_model_name}' has no enabled targets with usable credentials"
             )
 
-        while time.monotonic() < deadline:
+        while time.monotonic() < global_pool_deadline:
             remaining_specs = [
                 spec
                 for spec in candidate_specs
@@ -641,6 +648,7 @@ async def execute_virtual_completion(
             }
 
             try:
+                global_pool_made_upstream_attempt = True
                 result = await client.acompletion(request=request, **modified_data)
 
                 if _is_error_response(result):
@@ -690,19 +698,27 @@ async def execute_virtual_completion(
                     raise
                 continue
 
-        if not failures:
-            failures.append(
-                TargetFailure(
-                    target=virtual_model_name,
-                    reason=(
-                        f"Virtual model request exhausted its shared "
-                        f"{overall_timeout_seconds:.2f}s budget before any target started"
-                    ),
-                    error_type="timeout",
-                )
+        if not global_pool_made_upstream_attempt and time.monotonic() < deadline:
+            logger.warning(
+                f"[VirtualModel] Global pool did not reach upstream for '{virtual_model_name}'. "
+                "Falling back to legacy target routing."
             )
-        error_response = _build_aggregate_error(virtual_model_name, failures)
-        return (error_response, "", len(failures) - 1)
+        else:
+            if not failures:
+                failures.append(
+                    TargetFailure(
+                        target=virtual_model_name,
+                        reason=(
+                            f"Virtual model request exhausted its shared "
+                            f"{overall_timeout_seconds:.2f}s budget before any target started"
+                        ),
+                        error_type="timeout",
+                    )
+                )
+            error_response = _build_aggregate_error(virtual_model_name, failures)
+            return (error_response, "", len(failures) - 1)
+
+    legacy_fallback_base_failures = len(failures)
 
     for idx, target in enumerate(targets):
         target_model = target.model
@@ -761,7 +777,12 @@ async def execute_virtual_completion(
                         f"from {target_model}. Stopping."
                     )
                     # Return the error result directly, don't try more targets
-                    return (result, target_model, idx)
+                    fallback_count = (
+                        len(failures) - 1
+                        if legacy_fallback_base_failures > 0
+                        else idx
+                    )
+                    return (result, target_model, fallback_count)
 
                 continue  # Try next target
 
@@ -780,7 +801,12 @@ async def execute_virtual_completion(
                 f"[VirtualModel] Target {target_model} succeeded "
                 f"(fallback_count={idx})"
             )
-            return (result, target_model, idx)
+            fallback_count = (
+                len(failures)
+                if legacy_fallback_base_failures > 0
+                else idx
+            )
+            return (result, target_model, fallback_count)
 
         except Exception as e:
             # Exceptions from RotatingClient that propagated
@@ -880,6 +906,13 @@ async def execute_virtual_completion_streaming(
 
         if use_global_pool:
             attempted_candidates: set[Tuple[str, str]] = set()
+            global_pool_made_upstream_attempt = False
+            global_pool_fallback_reserve = min(
+                2.0, max(0.2, float(overall_timeout_seconds) * 0.2)
+            )
+            global_pool_deadline = max(
+                time.monotonic(), deadline - global_pool_fallback_reserve
+            )
             if not candidate_specs:
                 failures.append(
                     TargetFailure(
@@ -888,7 +921,7 @@ async def execute_virtual_completion_streaming(
                         error_type="virtual_model_exhausted",
                     )
                 )
-            while time.monotonic() < deadline and candidate_specs:
+            while time.monotonic() < global_pool_deadline and candidate_specs:
                 remaining_specs = [
                     spec
                     for spec in candidate_specs
@@ -949,6 +982,7 @@ async def execute_virtual_completion_streaming(
                 }
 
                 try:
+                    global_pool_made_upstream_attempt = True
                     stream = _iter_stream_with_initial_timeout(
                         client.acompletion(request=request, **modified_data),
                         attempt_timeout,
@@ -1063,21 +1097,29 @@ async def execute_virtual_completion_streaming(
                         raise
                     continue
 
-            if not failures:
-                failures.append(
-                    TargetFailure(
-                        target=virtual_model_name,
-                        reason=(
-                            f"Virtual model request exhausted its shared "
-                            f"{overall_timeout_seconds:.2f}s budget before any target started"
-                        ),
-                        error_type="timeout",
-                    )
+            if not global_pool_made_upstream_attempt and time.monotonic() < deadline:
+                logger.warning(
+                    f"[VirtualModel] Streaming global pool did not reach upstream for "
+                    f"'{virtual_model_name}'. Falling back to legacy target routing."
                 )
-            error_response = _build_aggregate_error(virtual_model_name, failures)
-            yield f"data: {json.dumps(error_response)}\n\n"
-            yield "data: [DONE]\n\n"
-            return
+            else:
+                if not failures:
+                    failures.append(
+                        TargetFailure(
+                            target=virtual_model_name,
+                            reason=(
+                                f"Virtual model request exhausted its shared "
+                                f"{overall_timeout_seconds:.2f}s budget before any target started"
+                            ),
+                            error_type="timeout",
+                        )
+                    )
+                error_response = _build_aggregate_error(virtual_model_name, failures)
+                yield f"data: {json.dumps(error_response)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+        legacy_fallback_base_failures = len(failures)
 
         for idx, target in enumerate(targets):
             target_model = target.model
@@ -1142,7 +1184,11 @@ async def execute_virtual_completion_streaming(
                                 pending_chunks.clear()
                                 yield chunk
                                 actual_target = target_model
-                                fallback_count = idx
+                                fallback_count = (
+                                    len(failures)
+                                    if legacy_fallback_base_failures > 0
+                                    else idx
+                                )
                                 return
                         else:
                             try:
@@ -1169,7 +1215,11 @@ async def execute_virtual_completion_streaming(
                                         )
                                         yield chunk
                                         actual_target = target_model
-                                        fallback_count = idx
+                                        fallback_count = (
+                                            len(failures)
+                                            if legacy_fallback_base_failures > 0
+                                            else idx
+                                        )
                                         return
 
                                     # Record failure, will try next target
@@ -1184,7 +1234,11 @@ async def execute_virtual_completion_streaming(
                                         async for remaining in stream:
                                             yield remaining
                                         actual_target = target_model
-                                        fallback_count = idx
+                                        fallback_count = (
+                                            len(failures)
+                                            if legacy_fallback_base_failures > 0
+                                            else idx
+                                        )
                                         return
                             except json.JSONDecodeError:
                                 # Not valid JSON, treat as content
@@ -1196,7 +1250,11 @@ async def execute_virtual_completion_streaming(
                                 async for remaining in stream:
                                     yield remaining
                                 actual_target = target_model
-                                fallback_count = idx
+                                fallback_count = (
+                                    len(failures)
+                                    if legacy_fallback_base_failures > 0
+                                    else idx
+                                )
                                 return
                     else:
                         # Non-data line (empty, comments) – buffer it
