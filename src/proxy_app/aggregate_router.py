@@ -339,6 +339,13 @@ def _build_aggregate_error(
     message = f"All route targets failed for virtual model '{virtual_model}'"
     if hint:
         message = f"{message}. Hint: {hint}"
+    elif failures:
+        first = failures[0]
+        first_reason = (first.reason or "").strip()
+        first_piece = first.error_type
+        if first_reason:
+            first_piece = f"{first_piece}: {first_reason[:120]}"
+        message = f"{message}. First failure: {first_piece}"
 
     details: Dict[str, Any] = {
         "virtual_model": virtual_model,

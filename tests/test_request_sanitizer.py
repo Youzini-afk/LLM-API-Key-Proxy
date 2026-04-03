@@ -83,3 +83,21 @@ def test_sanitizer_keeps_internal_keys_for_openai_compatible():
     assert sanitized.get("_forced_credential") == "test-key"
     assert sanitized.get("_request_deadline") == 123.4
     assert "unknown_external_flag" not in sanitized
+
+
+def test_sanitizer_drops_stream_options_for_openai_compatible():
+    payload = {
+        "model": "channel_a/glm-5.1",
+        "messages": [{"role": "user", "content": "ping"}],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+
+    sanitized = sanitize_request_payload(
+        payload,
+        model="channel_a/glm-5.1",
+        runtime_provider="openai_compatible",
+    )
+
+    assert sanitized.get("stream") is True
+    assert "stream_options" not in sanitized

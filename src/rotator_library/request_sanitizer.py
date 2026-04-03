@@ -118,6 +118,9 @@ def sanitize_request_payload(
                 continue
             if key not in _OPENAI_CHAT_ALLOWED_KEYS:
                 sanitized.pop(key, None)
+        # Many custom OpenAI-compatible endpoints reject stream_options/include_usage.
+        # Keep streaming payload minimal for maximum compatibility.
+        sanitized.pop("stream_options", None)
         for key in _OPENAI_COMPAT_DROP_KEYS:
             sanitized.pop(key, None)
 

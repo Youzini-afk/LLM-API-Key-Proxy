@@ -3145,16 +3145,27 @@ class RotatingClient:
         # Handle iflow provider: remove stream_options to avoid HTTP 406
         model = kwargs.get("model", "")
         provider = model.split("/")[0] if "/" in model else ""
+        runtime_provider = self.provider_config.get_runtime_provider(provider)
+        stream_options_supported = (
+            provider != "iflow"
+            and runtime_provider not in {"openai_compatible", "custom"}
+        )
 
         if provider == "iflow" and "stream_options" in kwargs:
             lib_logger.debug(
                 "Removing stream_options for iflow provider to avoid HTTP 406"
             )
             kwargs.pop("stream_options", None)
+        elif not stream_options_supported and "stream_options" in kwargs:
+            lib_logger.debug(
+                f"Removing stream_options for provider '{provider}' "
+                f"(runtime={runtime_provider}) to avoid upstream incompatibility"
+            )
+            kwargs.pop("stream_options", None)
 
         if kwargs.get("stream"):
             # Only add stream_options for providers that support it (excluding iflow)
-            if provider != "iflow":
+            if stream_options_supported:
                 if "stream_options" not in kwargs:
                     kwargs["stream_options"] = {}
                 if "include_usage" not in kwargs["stream_options"]:
