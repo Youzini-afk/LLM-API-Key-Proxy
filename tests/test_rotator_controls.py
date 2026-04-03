@@ -464,9 +464,47 @@ async def test_quota_stats_include_scheduler_fields(
     assert "scheduler_state" in credential
     assert "health_score" in credential
     assert "next_probe_at" in credential
+    assert "probe_due" in credential
+    assert "eligible_due" in credential
     assert credential["recovery_hypothesis"].keys() == {
         "short",
         "weekly",
         "monthly",
         "expired",
     }
+
+
+@pytest.mark.asyncio
+async def test_quota_stats_clamps_past_scheduler_timestamps_and_marks_due_flags(
+    monkeypatch, tmp_path, usage_manager_modules
+):
+    _, UsageManager = usage_manager_modules
+    usage_manager = UsageManager(file_path=tmp_path / "usage.json")
+    key = "env://relay/1"
+    model = "relay/model"
+    now_ts = time.time()
+    usage_manager._usage_data = {
+        key: {
+            "models": {model: {"success_count": 1}},
+            "global": {"models": {}},
+            "model_cooldowns": {},
+            "failures": {},
+        }
+    }
+    usage_manager._initialized.set()
+
+    key_data = usage_manager._usage_data[key]
+    tracking_key = usage_manager._get_scheduler_tracking_key(key, model)
+    tracking_state = usage_manager._ensure_tracking_scheduler_state(key_data, tracking_key)
+    tracking_state["scheduler_state"] = "warm"
+    tracking_state["next_probe_at"] = now_ts - 60
+    tracking_state["next_eligible_at"] = now_ts - 30
+
+    stats = await usage_manager.get_stats_for_endpoint()
+    credential = stats["providers"]["relay"]["credentials"][0]
+
+    assert credential["scheduler_state"] == "warm"
+    assert credential["next_probe_at"] == 0.0
+    assert credential["next_eligible_at"] == 0.0
+    assert credential["probe_due"] is True
+    assert credential["eligible_due"] is True

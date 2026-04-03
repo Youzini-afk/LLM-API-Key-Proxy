@@ -665,6 +665,44 @@ class UsageManager:
         normalized = self._normalize_recovery_hypothesis(state)
         return {key: round(value, 4) for key, value in normalized.items()}
 
+    def _build_public_scheduler_timeline(
+        self, state: Dict[str, Any], now_ts: float
+    ) -> Dict[str, Any]:
+        """
+        Return UI-friendly scheduler timing metadata.
+
+        Internal timestamps represent the earliest time a probe/candidate *may* be
+        attempted. They can be in the past when the key is due but not currently
+        selected (e.g., probe budget gating). Exposing raw past timestamps as
+        "next probe" is confusing, so we clamp past values to 0 and surface explicit
+        due flags.
+        """
+        scheduler_state = self._normalize_scheduler_state(state.get("scheduler_state"))
+        raw_next_eligible = float(state.get("next_eligible_at") or 0.0)
+        raw_next_probe = float(state.get("next_probe_at") or 0.0)
+
+        eligible_due = raw_next_eligible > 0.0 and raw_next_eligible <= now_ts
+        probe_due = (
+            scheduler_state in {SCHEDULER_STATE_WARM, SCHEDULER_STATE_SUSPECT_EXPIRED}
+            and raw_next_probe > 0.0
+            and raw_next_probe <= now_ts
+        )
+
+        if scheduler_state == SCHEDULER_STATE_HOT:
+            return {
+                "next_eligible_at": 0.0,
+                "next_probe_at": 0.0,
+                "eligible_due": False,
+                "probe_due": False,
+            }
+
+        return {
+            "next_eligible_at": raw_next_eligible if raw_next_eligible > now_ts else 0.0,
+            "next_probe_at": raw_next_probe if raw_next_probe > now_ts else 0.0,
+            "eligible_due": eligible_due,
+            "probe_due": probe_due,
+        }
+
     def _prune_scheduler_state(self, state: Dict[str, Any], now_ts: float) -> None:
         self._ensure_scheduler_fields(state)
         state["auth_failure_timestamps"] = [
@@ -4967,6 +5005,9 @@ class UsageManager:
                 identifier = self._build_public_credential_identifier(provider, credential)
                 public_full_path = self._build_public_full_path(credential)
                 public_scheduler = self._pick_public_scheduler_state(cred_data, now_ts)
+                public_timeline = self._build_public_scheduler_timeline(
+                    public_scheduler, now_ts
+                )
 
                 cred_entry = {
                     "identifier": identifier,
@@ -4981,8 +5022,10 @@ class UsageManager:
                     "health_score": round(
                         float(public_scheduler.get("health_score") or 0.0), 4
                     ),
-                    "next_eligible_at": public_scheduler.get("next_eligible_at"),
-                    "next_probe_at": public_scheduler.get("next_probe_at"),
+                    "next_eligible_at": public_timeline.get("next_eligible_at"),
+                    "next_probe_at": public_timeline.get("next_probe_at"),
+                    "eligible_due": bool(public_timeline.get("eligible_due")),
+                    "probe_due": bool(public_timeline.get("probe_due")),
                     "last_error_type": public_scheduler.get("last_error_type"),
                     "expired_confidence": round(
                         float(public_scheduler.get("expired_confidence") or 0.0), 4

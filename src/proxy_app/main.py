@@ -2291,6 +2291,8 @@ async def admin_list_channels(_=Depends(verify_admin_api_key)):
                     "health_score": cred.get("health_score"),
                     "next_eligible_at": cred.get("next_eligible_at"),
                     "next_probe_at": cred.get("next_probe_at"),
+                    "eligible_due": bool(cred.get("eligible_due")),
+                    "probe_due": bool(cred.get("probe_due")),
                 }
 
             if provider_states:
@@ -2319,6 +2321,8 @@ async def admin_list_channels(_=Depends(verify_admin_api_key)):
                 merged_key["health_score"] = state.get("health_score")
                 merged_key["next_eligible_at"] = state.get("next_eligible_at")
                 merged_key["next_probe_at"] = state.get("next_probe_at")
+                merged_key["eligible_due"] = bool(state.get("eligible_due"))
+                merged_key["probe_due"] = bool(state.get("probe_due"))
             else:
                 merged_key["runtime_status"] = (
                     "disabled"

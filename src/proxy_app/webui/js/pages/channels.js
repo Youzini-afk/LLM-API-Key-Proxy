@@ -118,8 +118,10 @@ function mapHealthScore(score) {
 
 function toLocaleTime(tsSeconds) {
   if (!tsSeconds) return '';
-  const ms = Number(tsSeconds) * 1000;
-  if (!Number.isFinite(ms) || ms <= 0) return '';
+  const sec = Number(tsSeconds);
+  const nowSec = Date.now() / 1000;
+  if (!Number.isFinite(sec) || sec <= nowSec) return '';
+  const ms = sec * 1000;
   return new Date(ms).toLocaleString('zh-CN');
 }
 
@@ -996,6 +998,8 @@ export async function renderChannels(container) {
                 const healthMeta = mapHealthScore(k.health_score);
                 const nextProbeAt = toLocaleTime(k.next_probe_at);
                 const nextEligibleAt = toLocaleTime(k.next_eligible_at);
+                const probeDue = !!k.probe_due;
+                const eligibleDue = !!k.eligible_due;
 
                 return h('div', {
                   className: 'text-muted text-body-sm mb-xs',
@@ -1012,10 +1016,14 @@ export async function renderChannels(container) {
                   h('span', { className: `badge badge-sm ${healthMeta.badgeClass}` }, healthMeta.label),
                   nextEligibleAt
                     ? h('span', { className: 'text-muted' }, `预计恢复可试: ${nextEligibleAt}`)
-                    : null,
+                    : (eligibleDue
+                      ? h('span', { className: 'text-muted' }, '预计恢复可试: 已到期（等待调度触发）')
+                      : null),
                   nextProbeAt
-                    ? h('span', { className: 'text-muted' }, `下次探活: ${nextProbeAt}`)
-                    : null,
+                    ? h('span', { className: 'text-muted' }, `最早探活: ${nextProbeAt}`)
+                    : (probeDue
+                      ? h('span', { className: 'text-muted' }, '最早探活: 已到期（等待稀缺态/预算触发）')
+                      : null),
                   autoDisabled
                     ? h('span', { style: 'color: var(--error); margin-left: 8px;' },
                       `自动禁用（${reason || 'long_unavailable'}）${at ? ` @ ${at}` : ''}`
