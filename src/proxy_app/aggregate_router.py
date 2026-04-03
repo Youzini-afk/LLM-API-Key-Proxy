@@ -96,7 +96,7 @@ def _has_nonempty_content(content: Any) -> bool:
             if isinstance(item, str) and item.strip():
                 return True
             if isinstance(item, dict):
-                for key in ("text", "value", "content"):
+                for key in ("text", "value", "content", "reasoning", "reasoning_content", "refusal"):
                     val = item.get(key)
                     if isinstance(val, str) and val.strip():
                         return True
@@ -148,6 +148,8 @@ def _response_has_meaningful_completion(result: Any) -> bool:
                 message.get("reasoning_content")
             ):
                 return True
+            if _has_nonempty_content(message.get("refusal")):
+                return True
 
         delta = choice.get("delta")
         if isinstance(delta, dict):
@@ -159,9 +161,13 @@ def _response_has_meaningful_completion(result: Any) -> bool:
                 delta.get("reasoning_content")
             ):
                 return True
+            if _has_nonempty_content(delta.get("refusal")):
+                return True
         if _has_nonempty_content(choice.get("reasoning")) or _has_nonempty_content(
             choice.get("reasoning_content")
         ):
+            return True
+        if _has_nonempty_content(choice.get("refusal")):
             return True
 
         if choice.get("finish_reason") == "tool_calls":
@@ -189,6 +195,8 @@ def _stream_chunk_has_meaningful_output(parsed: Dict[str, Any]) -> bool:
                 delta.get("reasoning_content")
             ):
                 return True
+            if _has_nonempty_content(delta.get("refusal")):
+                return True
 
         message = choice.get("message")
         if isinstance(message, dict):
@@ -200,9 +208,13 @@ def _stream_chunk_has_meaningful_output(parsed: Dict[str, Any]) -> bool:
                 message.get("reasoning_content")
             ):
                 return True
+            if _has_nonempty_content(message.get("refusal")):
+                return True
         if _has_nonempty_content(choice.get("reasoning")) or _has_nonempty_content(
             choice.get("reasoning_content")
         ):
+            return True
+        if _has_nonempty_content(choice.get("refusal")):
             return True
 
         if choice.get("finish_reason") == "tool_calls":

@@ -28,6 +28,7 @@ from .failure_logger import log_failure, configure_failure_logger
 from .error_handler import (
     PreRequestCallbackError,
     CredentialNeedsReauthError,
+    EmptyResponseError,
     classify_error,
     NoAvailableKeysError,
     should_rotate_on_error,
@@ -65,6 +66,103 @@ class StreamedAPIError(Exception):
     def __init__(self, message, data=None):
         super().__init__(message)
         self.data = data
+
+
+def _has_nonempty_content(content: Any) -> bool:
+    if content is None:
+        return False
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, str) and item.strip():
+                return True
+            if isinstance(item, dict):
+                for key in ("text", "value", "content", "reasoning", "reasoning_content", "refusal"):
+                    val = item.get(key)
+                    if isinstance(val, str) and val.strip():
+                        return True
+        return False
+    return bool(content)
+
+
+def _choice_has_meaningful_output(choice: Dict[str, Any]) -> bool:
+    if not isinstance(choice, dict):
+        return False
+
+    message = choice.get("message")
+    if isinstance(message, dict):
+        if _has_nonempty_content(message.get("content")):
+            return True
+        if _has_nonempty_content(message.get("reasoning")) or _has_nonempty_content(
+            message.get("reasoning_content")
+        ):
+            return True
+        if _has_nonempty_content(message.get("refusal")):
+            return True
+        if message.get("tool_calls") or message.get("function_call"):
+            return True
+
+    delta = choice.get("delta")
+    if isinstance(delta, dict):
+        if _has_nonempty_content(delta.get("content")):
+            return True
+        if _has_nonempty_content(delta.get("reasoning")) or _has_nonempty_content(
+            delta.get("reasoning_content")
+        ):
+            return True
+        if _has_nonempty_content(delta.get("refusal")):
+            return True
+        if delta.get("tool_calls") or delta.get("function_call"):
+            return True
+
+    if _has_nonempty_content(choice.get("reasoning")) or _has_nonempty_content(
+        choice.get("reasoning_content")
+    ):
+        return True
+    if _has_nonempty_content(choice.get("refusal")):
+        return True
+    if choice.get("finish_reason") == "tool_calls":
+        return True
+    return False
+
+
+def _response_has_meaningful_completion(response: Any) -> bool:
+    if response is None:
+        return False
+
+    data: Any = response
+    if not isinstance(data, dict):
+        for method_name in ("model_dump", "dict"):
+            method = getattr(response, method_name, None)
+            if callable(method):
+                try:
+                    data = method()
+                    break
+                except Exception:
+                    continue
+
+    if not isinstance(data, dict):
+        return True
+
+    # Non-chat payloads may not include choices (e.g., some provider custom responses).
+    if "choices" not in data:
+        return True
+
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+
+    return any(_choice_has_meaningful_output(choice) for choice in choices)
+
+
+def _stream_chunk_has_meaningful_output(chunk_dict: Dict[str, Any]) -> bool:
+    if not isinstance(chunk_dict, dict):
+        return False
+    choices = chunk_dict.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+    return any(_choice_has_meaningful_output(choice) for choice in choices)
 
 
 class RotatingClient:
@@ -1233,6 +1331,8 @@ class RotatingClient:
         accumulated_finish_reason = None  # Track strongest finish_reason across chunks
         has_tool_calls = False  # Track if ANY tool calls were seen in stream
         waiting_for_first_chunk = True
+        has_meaningful_output = False
+        pending_chunks: List[str] = []
         provider = model.split("/")[0] if "/" in model else ""
 
         try:
@@ -1348,12 +1448,38 @@ class RotatingClient:
                             # (litellm.ModelResponse defaults to "stop" which is wrong)
                             choice["finish_reason"] = None
 
-                    yield f"data: {json.dumps(chunk_dict)}\n\n"
+                    chunk_sse = f"data: {json.dumps(chunk_dict)}\n\n"
+                    chunk_has_meaningful_output = _stream_chunk_has_meaningful_output(
+                        chunk_dict
+                    )
+                    if chunk_has_meaningful_output and not has_meaningful_output:
+                        has_meaningful_output = True
+                        for buffered in pending_chunks:
+                            yield buffered
+                        pending_chunks.clear()
+
+                    if has_meaningful_output:
+                        yield chunk_sse
+                    else:
+                        pending_chunks.append(chunk_sse)
 
                     if hasattr(chunk, "usage") and chunk.usage:
                         last_usage = chunk.usage
 
                 except StopAsyncIteration:
+                    if not has_meaningful_output:
+                        raise StreamedAPIError(
+                            "Provider returned empty streaming completion",
+                            data=EmptyResponseError(
+                                provider or "unknown",
+                                model,
+                                message=(
+                                    f"Empty streaming completion from {model} "
+                                    "without any assistant content/tool call/refusal."
+                                ),
+                            ),
+                        )
+
                     stream_completed = True
                     if json_buffer:
                         lib_logger.info(
@@ -1742,6 +1868,15 @@ class RotatingClient:
                                 streaming=False,
                                 operation=f"{provider}/{model} request",
                             )
+                            if not _response_has_meaningful_completion(response):
+                                raise EmptyResponseError(
+                                    provider=provider,
+                                    model=model,
+                                    message=(
+                                        f"Empty completion response from {model} "
+                                        "without assistant content/tool call/refusal."
+                                    ),
+                                )
 
                             # For non-streaming, success is immediate
                             await self.usage_manager.record_success(
@@ -2018,6 +2153,15 @@ class RotatingClient:
                                 streaming=False,
                                 operation=f"{provider}/{model} request",
                             )
+                            if not _response_has_meaningful_completion(response):
+                                raise EmptyResponseError(
+                                    provider=provider,
+                                    model=model,
+                                    message=(
+                                        f"Empty completion response from {model} "
+                                        "without assistant content/tool call/refusal."
+                                    ),
+                                )
 
                             await self.usage_manager.record_success(
                                 current_cred,
