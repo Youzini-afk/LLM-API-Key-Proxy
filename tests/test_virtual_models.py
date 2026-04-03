@@ -295,6 +295,7 @@ from proxy_app.aggregate_router import (
     TargetFailure,
     _build_aggregate_error,
     _classify_exception_type,
+    _iter_stream_with_initial_timeout,
     _should_fallback,
     execute_virtual_completion,
     execute_virtual_completion_streaming,
@@ -771,6 +772,92 @@ class TestAggregateRouterTimeouts:
         assert actual_target == ""
         assert fallback_count == 0
         assert releases == [("cred-a", "prov_a/model")]
+
+    @pytest.mark.asyncio
+    async def test_global_pool_retries_busy_candidate_acquire_then_succeeds(
+        self, monkeypatch
+    ):
+        class FakeUsageManager:
+            def __init__(self):
+                self.calls = 0
+
+            def note_real_request(self):
+                pass
+
+            async def acquire_virtual_candidate(self, specs, *, deadline, strategy, top_n):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("All virtual hot candidates stayed busy after 5 attempts.")
+                selected = specs[0]
+                return {
+                    **selected,
+                    "request_model": selected["model"],
+                    "target_model": selected["route_model"],
+                }
+
+        class FakeClient:
+            global_timeout = 2
+            virtual_scheduler_mode = "global_pool"
+            all_credentials = {"prov_a": ["cred-a"]}
+            max_concurrent_requests_per_key = {"prov_a": 1}
+            usage_manager = FakeUsageManager()
+
+            def _build_provider_credential_context(self, provider, model, credentials_override=None):
+                return {
+                    "provider_plugin": None,
+                    "credentials": ["cred-a"],
+                    "credential_priorities": None,
+                    "credential_tier_names": None,
+                }
+
+            async def acompletion(self, request=None, **kwargs):
+                return {"id": "ok-after-busy"}
+
+        config = VirtualModelConfig(
+            strategy="balanced",
+            timeout_seconds=1,
+            targets=[RouteTarget(model="prov_a/model", weight=100)],
+        )
+
+        monkeypatch.setattr(
+            "proxy_app.aggregate_router.get_virtual_model",
+            lambda _: config,
+        )
+
+        result, actual_target, fallback_count = await execute_virtual_completion(
+            FakeClient(),
+            request=None,
+            request_data={"model": "virtual/test"},
+            virtual_model_name="virtual/test",
+        )
+
+        assert result == {"id": "ok-after-busy"}
+        assert actual_target == "prov_a/model"
+        assert fallback_count == 0
+        assert FakeClient.usage_manager.calls >= 2
+
+    @pytest.mark.asyncio
+    async def test_stream_initial_timeout_closes_underlying_stream(self):
+        closed = False
+
+        async def _slow_stream():
+            nonlocal closed
+            try:
+                await asyncio.sleep(0.2)
+                yield 'data: {"choices":[{"delta":{"content":"late"}}]}\n\n'
+            finally:
+                closed = True
+
+        wrapped = _iter_stream_with_initial_timeout(
+            _slow_stream(),
+            timeout_seconds=0.01,
+            target_model="prov_a/model",
+        )
+
+        with pytest.raises(TimeoutError):
+            await wrapped.__anext__()
+
+        assert closed is True
 
     @pytest.mark.asyncio
     async def test_streaming_role_only_then_done_falls_back(self, monkeypatch):

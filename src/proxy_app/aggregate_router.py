@@ -290,18 +290,44 @@ async def _iter_stream_with_initial_timeout(
 ) -> AsyncGenerator[str, None]:
     """Fail over if a target does not produce its first streaming chunk in time."""
     iterator = stream.__aiter__()
+    close_stream = getattr(stream, "aclose", None)
     try:
         first_chunk = await asyncio.wait_for(iterator.__anext__(), timeout=timeout_seconds)
     except StopAsyncIteration:
+        if callable(close_stream):
+            try:
+                await close_stream()
+            except Exception:
+                pass
         return
     except TimeoutError as exc:
+        if callable(close_stream):
+            try:
+                await close_stream()
+            except Exception:
+                pass
         raise TimeoutError(
             f"Virtual model target '{target_model}' produced no stream data within {timeout_seconds:.2f}s"
         ) from exc
 
-    yield first_chunk
-    async for chunk in iterator:
-        yield chunk
+    try:
+        yield first_chunk
+        async for chunk in iterator:
+            yield chunk
+    finally:
+        if callable(close_stream):
+            try:
+                await close_stream()
+            except Exception:
+                pass
+
+
+def _should_retry_candidate_acquire_error(exc: Exception, *, deadline: float) -> bool:
+    """Retry candidate acquisition when hot pool is temporarily busy and budget remains."""
+    if time.monotonic() >= deadline:
+        return False
+    msg = (str(exc) or "").lower()
+    return "stayed busy" in msg or "stayed unavailable" in msg
 
 
 def _build_aggregate_error(
@@ -573,6 +599,9 @@ async def execute_virtual_completion(
                     top_n=5,
                 )
             except Exception as e:
+                if _should_retry_candidate_acquire_error(e, deadline=deadline):
+                    await asyncio.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                    continue
                 failures.append(
                     TargetFailure(
                         target=virtual_model_name,
@@ -876,6 +905,11 @@ async def execute_virtual_completion_streaming(
                         top_n=5,
                     )
                 except Exception as e:
+                    if _should_retry_candidate_acquire_error(e, deadline=deadline):
+                        await asyncio.sleep(
+                            min(0.05, max(0.0, deadline - time.monotonic()))
+                        )
+                        continue
                     failures.append(
                         TargetFailure(
                             target=virtual_model_name,
