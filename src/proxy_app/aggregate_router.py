@@ -461,10 +461,11 @@ def _should_use_global_pool(client: Any, config: VirtualModelConfig) -> bool:
     scheduler_mode = (
         getattr(client, "virtual_scheduler_mode", "legacy") or "legacy"
     ).strip().lower()
+    enabled_target_count = len(config.enabled_targets or [])
     return scheduler_mode == "global_pool" and config.strategy in {
         "balanced",
         "weighted_random",
-    }
+    } and enabled_target_count > 1
 
 
 def _monotonic_to_wall_deadline(deadline: float) -> float:

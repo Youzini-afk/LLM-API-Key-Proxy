@@ -686,7 +686,10 @@ class TestAggregateRouterTimeouts:
         config = VirtualModelConfig(
             strategy="balanced",
             timeout_seconds=1,
-            targets=[RouteTarget(model="prov_a/alias", weight=100)],
+            targets=[
+                RouteTarget(model="prov_a/alias", weight=100),
+                RouteTarget(model="prov_b/other", weight=100),
+            ],
         )
 
         monkeypatch.setattr(
@@ -749,7 +752,10 @@ class TestAggregateRouterTimeouts:
         config = VirtualModelConfig(
             strategy="balanced",
             timeout_seconds=1,
-            targets=[RouteTarget(model="prov_a/model", weight=100)],
+            targets=[
+                RouteTarget(model="prov_a/model", weight=100),
+                RouteTarget(model="prov_b/other", weight=100),
+            ],
         )
 
         monkeypatch.setattr(
@@ -816,7 +822,10 @@ class TestAggregateRouterTimeouts:
         config = VirtualModelConfig(
             strategy="balanced",
             timeout_seconds=1,
-            targets=[RouteTarget(model="prov_a/model", weight=100)],
+            targets=[
+                RouteTarget(model="prov_a/model", weight=100),
+                RouteTarget(model="prov_b/other", weight=100),
+            ],
         )
 
         monkeypatch.setattr(
@@ -884,6 +893,50 @@ class TestAggregateRouterTimeouts:
         )
 
         assert result == {"id": "legacy-path-ok"}
+        assert actual_target == "prov_a/model"
+        assert fallback_count == 0
+
+    @pytest.mark.asyncio
+    async def test_single_target_virtual_does_not_use_global_pool_scheduler(
+        self, monkeypatch
+    ):
+        class FakeUsageManager:
+            def note_real_request(self):
+                pass
+
+            async def acquire_virtual_candidate(self, specs, *, deadline, strategy, top_n):
+                raise AssertionError("single-target virtual model should bypass global_pool")
+
+        class FakeClient:
+            global_timeout = 2
+            virtual_scheduler_mode = "global_pool"
+            all_credentials = {"prov_a": ["cred-a"]}
+            max_concurrent_requests_per_key = {"prov_a": 1}
+            usage_manager = FakeUsageManager()
+
+            async def acompletion(self, request=None, **kwargs):
+                assert kwargs["model"] == "prov_a/model"
+                return {"id": "single-target-ok"}
+
+        config = VirtualModelConfig(
+            strategy="balanced",
+            timeout_seconds=1,
+            targets=[RouteTarget(model="prov_a/model", weight=100)],
+        )
+
+        monkeypatch.setattr(
+            "proxy_app.aggregate_router.get_virtual_model",
+            lambda _: config,
+        )
+
+        result, actual_target, fallback_count = await execute_virtual_completion(
+            FakeClient(),
+            request=None,
+            request_data={"model": "virtual/test"},
+            virtual_model_name="virtual/test",
+        )
+
+        assert result == {"id": "single-target-ok"}
         assert actual_target == "prov_a/model"
         assert fallback_count == 0
 
