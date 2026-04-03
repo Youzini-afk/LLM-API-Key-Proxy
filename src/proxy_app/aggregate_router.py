@@ -698,12 +698,7 @@ async def execute_virtual_completion(
                     raise
                 continue
 
-        if not global_pool_made_upstream_attempt and time.monotonic() < deadline:
-            logger.warning(
-                f"[VirtualModel] Global pool did not reach upstream for '{virtual_model_name}'. "
-                "Falling back to legacy target routing."
-            )
-        else:
+        if time.monotonic() >= deadline:
             if not failures:
                 failures.append(
                     TargetFailure(
@@ -717,6 +712,16 @@ async def execute_virtual_completion(
                 )
             error_response = _build_aggregate_error(virtual_model_name, failures)
             return (error_response, "", len(failures) - 1)
+        if not global_pool_made_upstream_attempt:
+            logger.warning(
+                f"[VirtualModel] Global pool did not reach upstream for '{virtual_model_name}'. "
+                "Falling back to legacy target routing."
+            )
+        else:
+            logger.warning(
+                f"[VirtualModel] Global pool failed for '{virtual_model_name}' after "
+                f"{len(failures)} attempt(s); falling back to legacy target routing."
+            )
 
     legacy_fallback_base_failures = len(failures)
 
@@ -1097,12 +1102,7 @@ async def execute_virtual_completion_streaming(
                         raise
                     continue
 
-            if not global_pool_made_upstream_attempt and time.monotonic() < deadline:
-                logger.warning(
-                    f"[VirtualModel] Streaming global pool did not reach upstream for "
-                    f"'{virtual_model_name}'. Falling back to legacy target routing."
-                )
-            else:
+            if time.monotonic() >= deadline:
                 if not failures:
                     failures.append(
                         TargetFailure(
@@ -1118,6 +1118,16 @@ async def execute_virtual_completion_streaming(
                 yield f"data: {json.dumps(error_response)}\n\n"
                 yield "data: [DONE]\n\n"
                 return
+            if not global_pool_made_upstream_attempt:
+                logger.warning(
+                    f"[VirtualModel] Streaming global pool did not reach upstream for "
+                    f"'{virtual_model_name}'. Falling back to legacy target routing."
+                )
+            else:
+                logger.warning(
+                    f"[VirtualModel] Streaming global pool failed for '{virtual_model_name}' "
+                    f"after {len(failures)} attempt(s); falling back to legacy target routing."
+                )
 
         legacy_fallback_base_failures = len(failures)
 

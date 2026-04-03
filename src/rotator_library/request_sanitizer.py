@@ -22,6 +22,52 @@ _RELAY_META_KEYS = frozenset(
 # Parameters that frequently break strict OpenAI-compatible upstreams.
 _OPENAI_COMPAT_DROP_KEYS = frozenset({"reasoning", "reasoning_effort", "prediction"})
 
+# Safe request keys for OpenAI-compatible chat-completions style payloads.
+# Unknown keys from external relays are stripped to avoid upstream 400 errors.
+_OPENAI_CHAT_ALLOWED_KEYS = frozenset(
+    {
+        "model",
+        "messages",
+        "max_tokens",
+        "max_completion_tokens",
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "n",
+        "stop",
+        "stream",
+        "stream_options",
+        "presence_penalty",
+        "frequency_penalty",
+        "logit_bias",
+        "logprobs",
+        "top_logprobs",
+        "seed",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "functions",
+        "function_call",
+        "response_format",
+        "user",
+        "metadata",
+        "service_tier",
+        "modalities",
+        "audio",
+        "thinking",
+        "timeout",
+        "extra_body",
+        "safety_settings",
+        "litellm_params",
+        "api_key",
+        "api_base",
+        "api_version",
+        "custom_llm_provider",
+        "headers",
+    }
+)
+
 
 def _is_empty(value: Any) -> bool:
     return value is None or value == "" or value == [] or value == {}
@@ -67,6 +113,11 @@ def sanitize_request_payload(
             sanitized.pop("response_format", None)
 
     if runtime in {"openai_compatible", "custom"}:
+        for key in list(sanitized.keys()):
+            if key.startswith("_"):
+                continue
+            if key not in _OPENAI_CHAT_ALLOWED_KEYS:
+                sanitized.pop(key, None)
         for key in _OPENAI_COMPAT_DROP_KEYS:
             sanitized.pop(key, None)
 

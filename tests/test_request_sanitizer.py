@@ -7,6 +7,7 @@ def test_sanitizer_drops_relay_meta_null_and_openai_compat_params():
         "messages": [{"role": "user", "content": "ping"}],
         "route": "glm-5.1",
         "provider": "newapi",
+        "vendor_trace_id": "abc-123",
         "user": None,
         "tools": [],
         "tool_choice": "auto",
@@ -23,6 +24,7 @@ def test_sanitizer_drops_relay_meta_null_and_openai_compat_params():
 
     assert "route" not in sanitized
     assert "provider" not in sanitized
+    assert "vendor_trace_id" not in sanitized
     assert "user" not in sanitized
     assert "tools" not in sanitized
     assert "tool_choice" not in sanitized
@@ -61,3 +63,23 @@ def test_sanitizer_removes_thinking_for_non_supported_model():
     )
 
     assert "thinking" not in sanitized
+
+
+def test_sanitizer_keeps_internal_keys_for_openai_compatible():
+    payload = {
+        "model": "channel_a/glm-5.1",
+        "messages": [{"role": "user", "content": "ping"}],
+        "_forced_credential": "test-key",
+        "_request_deadline": 123.4,
+        "unknown_external_flag": True,
+    }
+
+    sanitized = sanitize_request_payload(
+        payload,
+        model="channel_a/glm-5.1",
+        runtime_provider="openai_compatible",
+    )
+
+    assert sanitized.get("_forced_credential") == "test-key"
+    assert sanitized.get("_request_deadline") == 123.4
+    assert "unknown_external_flag" not in sanitized
